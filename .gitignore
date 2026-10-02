@@ -1,0 +1,124 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/__pycache__/
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Build output
+frontend/build/
+frontend/dist/
+backend/dist/
+*.egg-info/
+
+# Documentation site (Astro Starlight, docs/)
+docs/node_modules/
+docs/dist/
+docs/.astro/
+
+
+# Database files (keep for development, exclude for production)
+*.db
+*.sqlite
+*.sqlite3
+# SQLite's side-car files. *.db does not match these, so a pytest run caught
+# mid-transaction left an untracked *.db-journal behind every time.
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.cloud
+.env.self-hosted
+backend/.env
+*secret*.key
+
+# Local Compose override (copied from deployment/docker/docker-compose.cloud.override.example.yml)
+docker-compose.override.yml
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+*.tmp
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+frontend/coverage/
+
+# ESLint report written by the frontend-lint CI job and uploaded as an artifact
+frontend/eslint-report.json
+
+# Playwright
+frontend/playwright-report/
+frontend/test-results/
+frontend/playwright/.cache/
+
+# docs:screenshots video output — generated locally/in CI, copied to
+# runner-local storage rather than committed (unlike the PNG screenshots)
+docs/assets/videos/
+
+# Testing
+.tox/
+.pytest_cache/
+test_deployment_env.html
+
+# Docker
+backend/coverage.lcov
+test.db
+backend/python-packages/
+
+# Prevent Copilot/AI-generated documentation spam
+# Generated docs should go through review process
+**/COPILOT_*.md
+**/copilot-*.md
+**/*-copilot-*.md
+**/*_SUMMARY.md
+!internal-docs/DOCUMENTATION_CLEANUP_SUMMARY.md
+**/*_COMPLETE.md
+**/*_COMPLETION.md
+**/*_FIX_*.md
+docs/archive/
+docs/temp/
+docs/scratch/
+test_pr_workflow_update_ui.md
+failure.log
+
+# Claude Code agent worktrees (scratch clones, never part of the repo)
+.claude/worktrees/
+
+# Frontend dev-deployment env: real hostnames, kept out of the tree
+# (copy from frontend/.env.dev.example)
+frontend/.env.dev
+
+# Release records written by the /release skill (local convenience copies of a
+# promotion's outcome). GitHub is the source of truth - these are deliberately
+# never committed, so ignore them rather than letting each release leave the
+# tree dirty.
+release-record-*.html

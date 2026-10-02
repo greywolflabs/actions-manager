@@ -1,0 +1,1439 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { FileText, FilePlus2, Upload, Maximize2, X } from 'lucide-react';
+import { Button } from './ui/button';
+import YAMLEditor from './YAMLEditor';
+import type { WorkflowDiagnostic, YamlEditorHandle } from './YAMLEditor';
+import WorkflowResourcePicker from './WorkflowResourcePicker';
+import { WorkflowResourcesProvider, useWorkflowResources } from './WorkflowResourcesContext';
+import ValidationPanel from './ValidationPanel';
+import GUIWorkflowEditor from './GUIWorkflowEditor';
+import VersionHistoryPanel from './VersionHistoryPanel';
+import OpenInGitHubModal from './OpenInGitHubModal';
+import EditableNameField from './EditableNameField';
+import WorkflowStatusBadge, { WorkflowStatus } from './WorkflowStatusBadge';
+import ConfirmDialog from './ConfirmDialog';
+import RemovalScopeDialog, { RemovalDelivery, RemovalScope } from './RemovalScopeDialog';
+import RenameImpactDialog from './RenameImpactDialog';
+import { useRenameConfirmation, collectRenames } from '../hooks/useRenameConfirmation';
+import { Dialog, DialogContent, DialogTitle } from './ui/dialog';
+import { WorkflowGUI, guiToYaml } from '../utils/workflowGuiConversion';
+import { UnifiedWorkflowItem, ProjectPRState } from '../types/workflow';
+import { ActionsProject } from '../api/actionsProjects';
+import { ActionGroup } from '../api/actionGroups';
+import {
+  normalizeWorkflowStem,
+  validateWorkflowName,
+  workflowDisplayFilename,
+} from '../utils/workflowFilename';
+import { getDocsUrl } from '../help/helpLinks';
+
+/**
+ * Builds a GitHub URL pointing directly to the workflow file inside a repository.
+ *
+ * The filename is constructed to match what the backend's `format_workflow_name()`
+ * function produces when it pushes workflows to GitHub:
+ *
+ *  - **Secure Mode** (`usePrefix=true`):  `AM_{PROJECT_CODE}_{name}.yml`
+ *    Resources use the `AM_PROJECT_CODE_` prefix so all managed files are
+ *    clearly namespaced in the repository.
+ *  - **Less Secure / no-prefix Mode** (`usePrefix=false`):  `{name}.yml`
+ *    (or `{name}` unchanged when the name already ends in `.yml`/`.yaml`).
+ *
+ * The `HEAD` ref is used so GitHub automatically resolves to the repository's
+ * default branch without requiring branch information in the application state.
+ *
+ * @param repo          - Full repository name in `"owner/repo"` format.
+ * @param workflowName  - Workflow name as stored in the database (stem, possibly
+ *                        already containing an extension for some legacy entries).
+ * @param projectCode   - Project code used for the prefix (e.g. `"REG1"`).
+ *                        Required when `usePrefix` is `true`; ignored otherwise.
+ * @param usePrefix     - When `true` (Secure Mode), the `AM_{projectCode}_` prefix
+ *                        is prepended and `.yml` is appended.  Defaults to `false`.
+ * @returns A GitHub blob URL for the workflow file, or `null` when inputs are
+ *          invalid (bad repo format, missing project code in Secure Mode, or
+ *          workflow name contains unsafe characters).
+ */
+function buildGithubWorkflowUrl(
+  repo: string,
+  workflowName: string,
+  projectCode: string | null = null,
+  usePrefix: boolean = false
+): string | null {
+  // Validate repo is in "owner/repo" format to avoid constructing invalid URLs.
+  if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    return null;
+  }
+
+  // Validate workflowName: must not be empty and must not contain path separators
+  // or path-traversal sequences.  All other characters are passed through
+  // encodeURIComponent so names with spaces, dashes, etc. still produce valid URLs.
+  if (!workflowName) {
+    return null;
+  }
+  if (workflowName.includes('/') || workflowName.includes('\\') || workflowName.includes('..')) {
+    return null;
+  }
+
+  let fileName: string;
+  if (usePrefix) {
+    // Secure Mode: mirror the server-side format_workflow_name() logic.
+    // Requires a non-empty project code — return null rather than silently
+    // producing an incorrect no-prefix URL.
+    if (!projectCode) {
+      return null;
+    }
+    // Strip any existing .yml/.yaml suffix before applying the AM_ prefix so that
+    // a name stored as "build.yml" doesn't become "AM_CODE_build.yml.yml".
+    const stem = workflowName.replace(/\.(yml|yaml)$/i, '');
+    fileName = `AM_${projectCode.toUpperCase()}_${stem}.yml`;
+  } else {
+    // Less Secure / no-prefix Mode (also used for linked workflows whose names
+    // belong to a separate RWX project and must not carry the current prefix).
+    // Add .yml only when the name doesn't already carry an extension so that
+    // names like "rtx-1.yml" stored with their extension don't become "rtx-1.yml.yml".
+    if (workflowName.endsWith('.yml') || workflowName.endsWith('.yaml')) {
+      fileName = workflowName;
+    } else {
+      fileName = `${workflowName}.yml`;
+    }
+  }
+
+  return `https://github.com/${repo}/blob/HEAD/.github/workflows/${encodeURIComponent(fileName)}`;
+}
+
+/**
+ * Builds a GitHub URL pointing to a repository.
+ *
+ * @param repo - Full repository name in `"owner/repo"` format.
+ * @returns A GitHub repository URL, or `null` when repo format is invalid.
+ */
+function buildGithubRepoUrl(repo: string): string | null {
+  // Validate repo is in "owner/repo" format
+  if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    return null;
+  }
+  return `https://github.com/${repo}`;
+}
+
+/**
+ * The on-GitHub filename to show for a workflow row.
+ *
+ * Linked reusable workflows are named by the project that owns them, so the
+ * consumer's prefix never applies to one. Lives at module scope rather than
+ * inline in the editor: that component is already at the cognitive-complexity
+ * budget (S3776, 15), and one more inline condition pushed it to 16.
+ */
+function displayFilenameFor(
+  workflow: { name: string; type?: string },
+  projectCode: string | undefined | null,
+  usePrefix: boolean,
+): string {
+  const linked = workflow.type === 'linked';
+  return workflowDisplayFilename(workflow.name, projectCode, usePrefix && !linked);
+}
+
+interface UnifiedWorkflowEditorProps {
+  selectedWorkflow: UnifiedWorkflowItem | null | undefined;
+  editMode: 'yaml' | 'gui';
+  regularGuiWorkflow: WorkflowGUI;
+  guiWorkflow: WorkflowGUI;
+  projectCode: string | null;
+  projectPRState?: ProjectPRState;
+  usePrefix?: boolean;
+  isReadOnly?: boolean;
+  user: string;
+  projectName: string;
+  /** Repositories linked to this project (format: "owner/repo"). Used for "Open in GitHub" links. */
+  selectedRepos?: string[];
+  importedActions: ActionsProject[];
+  actionGroups: ActionGroup[];
+  /** Project secrets — names only; values are never carried into the editor. */
+  secrets?: Array<{ secret_key?: string; name?: string; repo?: string }>;
+  /** Project variables — names only. */
+  envVars?: Array<{ env_key?: string; repo?: string }>;
+  setEditMode: (mode: 'yaml' | 'gui') => void;
+  setRegularGuiWorkflow: (workflow: WorkflowGUI) => void;
+  setGuiWorkflow: (workflow: WorkflowGUI) => void;
+  handleWorkflowChange: (field: string, value: string) => void;
+  saveDraftWorkflow: (index: number | null, type: 'regular' | 'reusable', renamedTo?: string) => void;
+  /** Draft save for linked reusable workflows – persists content to the RWX project DB. */
+  saveDraftLinkedWorkflow?: (index: number) => Promise<void>;
+  commitAndUpdatePR?: (index: number | null, type: 'regular' | 'reusable') => Promise<boolean>;
+  /** Separate callback for linked reusable workflows – routes save to RWX project. */
+  commitAndUpdatePRLinked?: (index: number) => Promise<boolean>;
+  deleteWorkflow: (index: number, type: 'regular' | 'reusable', scope: RemovalScope, delivery: RemovalDelivery) => void;
+  /** Unlink a linked reusable workflow from this project (removes association only). */
+  unlinkWorkflow?: (workflowId: number) => Promise<void>;
+  /** Opens the workflow-creation dialog — surfaced in the empty state when nothing is selected. */
+  addWorkflowFn?: () => void;
+  /** Opens the existing-workflow import panel — surfaced in the empty state when nothing is selected. */
+  onImportExisting?: () => void;
+  /** Project type, so a reusable workflow inside a caller project can be flagged. */
+  projectType?: 'standard' | 'rwx';
+}
+
+/**
+ * Why a reusable workflow in a caller project is worth moving.
+ *
+ * A component rather than an inline conditional so UnifiedWorkflowEditor stays
+ * under SonarQube's cognitive-complexity ceiling - the same reason EditorSurface
+ * is one. A linked workflow already lives in the RWX project that owns it, so
+ * only one this project owns outright prompts the suggestion.
+ */
+const ReusableInCallerNotice: React.FC<{
+  workflow: UnifiedWorkflowItem;
+  projectType?: 'standard' | 'rwx';
+}> = ({ workflow, projectType }) => {
+  if (projectType === 'rwx' || workflow.type !== 'reusable') return null;
+
+  return (
+    <div className="workflow-reusable-notice" data-testid="reusable-in-caller-notice">
+      <span className="workflow-reusable-notice-dot" aria-hidden="true" />
+      <span>
+        This is a reusable workflow — it is triggered by{' '}
+        <code>workflow_call</code>, not by an event of its own. It works here, but a
+        Reusable Workflow Project versions it once and lets every caller project link
+        to it instead of keeping a copy.
+      </span>
+    </div>
+  );
+};
+
+interface WorkflowEditorHeaderProps {
+  selectedWorkflow: UnifiedWorkflowItem;
+  projectCode: string | null;
+  /** Needed to ask the backend what a rename typed into the name field would do. */
+  projectName: string;
+  /** Names the caller on that request; it answers 401 unidentified. */
+  user: string;
+  editMode: 'yaml' | 'gui';
+  projectPRState?: ProjectPRState;
+  usePrefix?: boolean;
+  isReadOnly?: boolean;
+  isUnlockedPR?: boolean;
+  /** When true the workflow is soft-locked (under_review, not yet unlocked) — hides the save button */
+  isLocked?: boolean;
+  /** Repositories linked to this project (format: "owner/repo"). Used for "Open in GitHub" links. */
+  selectedRepos?: string[];
+  handleWorkflowChange: (field: string, value: string) => void;
+  saveDraftWorkflow: (index: number | null, type: 'regular' | 'reusable', renamedTo?: string) => void;
+  /** Draft save for linked reusable workflows – persists content to the RWX project DB. */
+  onSaveDraftLinked?: () => void;
+  onCommitAndUpdatePR?: () => void;
+  deleteWorkflow: (index: number, type: 'regular' | 'reusable', scope: RemovalScope, delivery: RemovalDelivery) => void;
+  onRequestDelete?: (index: number, type: 'regular' | 'reusable', name: string) => void;
+  /** Called when user confirms unlinking a linked reusable workflow. */
+  onUnlinkWorkflow?: (workflowId: number) => void;
+  setEditMode: (mode: 'yaml' | 'gui') => void;
+  onShowVersionHistory: () => void;
+  /** Inserts a resource reference at the YAML editor's caret. */
+  onInsertResource?: (text: string) => void;
+  /** Opens the full-screen GUI editing surface. */
+  onExpand?: () => void;
+}
+
+interface WorkflowEditorContentProps {
+  selectedWorkflow: UnifiedWorkflowItem;
+  editMode: 'yaml' | 'gui';
+  disableEditing?: boolean;
+  yamlEditorRef?: React.Ref<YamlEditorHandle>;
+  /** Passed through to YAMLEditor; omit to keep its own default. */
+  height?: string;
+  regularGuiWorkflow: WorkflowGUI;
+  guiWorkflow: WorkflowGUI;
+  handleWorkflowChange: (field: string, value: string) => void;
+  setRegularGuiWorkflow: (workflow: WorkflowGUI) => void;
+  setGuiWorkflow: (workflow: WorkflowGUI) => void;
+  importedActions: ActionsProject[];
+  actionGroups: ActionGroup[];
+}
+
+const WorkflowEditorHeader: React.FC<WorkflowEditorHeaderProps> = ({
+  selectedWorkflow,
+  projectCode,
+  projectName,
+  user,
+  editMode,
+  projectPRState = "new",
+  usePrefix = true,
+  isReadOnly = false,
+  isUnlockedPR = false,
+  isLocked = false,
+  selectedRepos = [],
+  handleWorkflowChange,
+  saveDraftWorkflow,
+  onSaveDraftLinked,
+  onCommitAndUpdatePR,
+  deleteWorkflow,
+  onRequestDelete,
+  onUnlinkWorkflow,
+  setEditMode,
+  onShowVersionHistory,
+  onInsertResource,
+  onExpand
+}) => {
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [githubModalOpen, setGithubModalOpen] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (moreMenuRef.current && !moreMenuRef.current.contains(event.target as Node)) {
+        setMoreMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Close More menu on Escape key
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && moreMenuOpen) {
+        setMoreMenuOpen(false);
+      }
+    };
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [moreMenuOpen]);
+
+  // Close More menu whenever the selected workflow changes
+  useEffect(() => {
+    setMoreMenuOpen(false);
+  }, [selectedWorkflow?.id]);
+
+  const workflowType = selectedWorkflow.type;
+  const isReusable = workflowType === 'reusable';
+  const isLinked = workflowType === 'linked';
+  // Safe: only used inside !isLinked blocks where type is guaranteed regular or reusable
+  const editableType: 'regular' | 'reusable' = isReusable ? 'reusable' : 'regular';
+  const placeholder = isReusable || isLinked ? "Enter reusable workflow name" : "Enter workflow name";
+  const badge = isLinked ? "Linked Workflow" : isReusable ? "Reusable Workflow" : "Regular Workflow";
+  const badgeClass = isLinked ? "linked" : isReusable ? "reusable" : "regular";
+
+  // Determine workflow state badge.
+  //
+  // The badge MUST be derived purely from the per-workflow state
+  // (`selectedWorkflow.workflowStatus` + `selectedWorkflow.isModified`).  It must
+  // NOT fall back to the project-wide `projectPRState`, because that value is
+  // shared across every workflow in the project; using it here causes editing or
+  // committing one workflow to incorrectly relabel every other workflow as
+  // "Draft" / "Synced" (see issue: "Editing One Synced Workflow Incorrectly
+  // Marks All Workflows as Draft").
+  const getWorkflowStateBadge = (): { text: string; status: WorkflowStatus } | null => {
+    const status = selectedWorkflow.workflowStatus;
+
+    // 1. Workflow has an open PR — locked state takes precedence.
+    if (status === 'under_review') {
+      return { text: 'Under Review', status: 'under_review' };
+    }
+    // 2. Any unsaved editor edits — covers both "new and not saved" and
+    //    "existing edited but not yet committed locally".
+    if (selectedWorkflow.isModified) {
+      return { text: 'Unsaved', status: 'unsaved' };
+    }
+    // 3. New workflow committed locally but not in GitHub yet.
+    if (status === 'new') {
+      return { text: 'New Local', status: 'new' };
+    }
+    // 4. Existing workflow committed locally, not pushed via PR/merge.
+    if (status === 'committed_locally') {
+      return { text: 'Draft', status: 'committed_locally' };
+    }
+    // 5. Workflow matches GitHub.
+    if (status === 'synced_with_github') {
+      return { text: 'Synced', status: 'synced_with_github' };
+    }
+    return null;
+  };
+
+  const stateBadge = getWorkflowStateBadge();
+
+  // Determine primary action button
+  const getPrimaryAction = (): { text: string; onClick: () => void; disabled: boolean; title: string; className: string } | null => {
+    if (isReadOnly) {
+      return {
+        text: '💾 Commit Locally',
+        onClick: () => {},
+        disabled: true,
+        title: "You have read-only access to this project",
+        className: 'btn btn-primary'
+      };
+    }
+
+    if (isUnlockedPR && onCommitAndUpdatePR) {
+      return {
+        text: '🔄 Commit and Update PR',
+        onClick: onCommitAndUpdatePR,
+        disabled: !selectedWorkflow.name || !selectedWorkflow.content,
+        title: "Commit changes and update the existing open pull request",
+        className: 'btn btn-pr-update'
+      };
+    }
+
+    if (isLocked) {
+      return {
+        text: '🔒 Unlock to Commit',
+        onClick: () => {},
+        disabled: true,
+        title: "Unlock the workflow below to commit changes",
+        className: 'btn btn-primary'
+      };
+    }
+
+    if (isLinked && onSaveDraftLinked) {
+      return {
+        text: '💾 Save to RWX Project',
+        onClick: onSaveDraftLinked,
+        disabled: !selectedWorkflow.content,
+        title: `Save changes to the source RWX project '${selectedWorkflow.rwxProjectName || ''}'`,
+        className: 'btn btn-primary'
+      };
+    }
+
+    if (!isLinked) {
+      const saveButtonText = projectPRState === "open" ? "💾 Commit Locally (Update PR)" : "💾 Commit Locally";
+      const saveButtonTitle = projectPRState === "open"
+        ? "Commit this workflow to local database (will update open PRs when pushed to GitHub)"
+        : "Commit this workflow to local database";
+
+      return {
+        text: saveButtonText,
+        onClick: () => {
+          saveDraftWorkflow(selectedWorkflow.originalIndex, editableType);
+        },
+        disabled: !selectedWorkflow.name || !selectedWorkflow.content,
+        title: saveButtonTitle,
+        className: 'btn btn-primary'
+      };
+    }
+
+    return null;
+  };
+
+  const primaryAction = getPrimaryAction();
+  const readOnlyTooltip = "You have read-only access to this project";
+
+  const securePrefix =
+    !isLinked && usePrefix && projectCode ? `AM_${projectCode.toUpperCase()}_` : '';
+
+  // The editable input always exposes only the workflow stem.  The `.yml`
+  // suffix is rendered as a locked, non-editable segment to the right of the
+  // input in both prefix and no-prefix modes so the two UIs share the same
+  // visual pattern.  In prefix mode the project-managed `AM_{code}_` prefix
+  // is additionally rendered as a locked segment to the left of the input.
+  // For linked workflows (whose names belong to a different RWX project) the
+  // input is disabled below; we still strip the extension so the suffix chip
+  // and read-only display continue to render the canonical name.
+  const editableNameValue = normalizeWorkflowStem(selectedWorkflow.name || '');
+
+  const editableNamePrefix = securePrefix || undefined;
+  const editableNameSuffix = '.yml';
+
+  // Full canonical filename used for display in non-edit contexts (e.g. the
+  // "Open in GitHub" modal).  Re-applies the locked prefix (when in prefix
+  // mode) and the `.yml` suffix that surround the editable input.
+  const displayedWorkflowFilename = `${securePrefix}${editableNameValue}.yml`;
+
+  // Renaming is verified here, at the moment the user commits the new name —
+  // not later, at the save that persists it. Renaming changes the delivered
+  // filename: the old file stays in every repository under its old name and a
+  // caller's `uses:` line still points at it. The save enforces the same
+  // refusals, but a 409 arriving after the user has moved on is not a
+  // verification, and prompting again at every later save is just noise.
+  const renameGuard = useRenameConfirmation(user, projectName);
+
+  // Drop a pending confirmation whenever the workflow under it changes.
+  //
+  // Keyed on the persisted name and kind, NOT on selectedWorkflow.id: that id is
+  // positional (`regular-${index}`), so a refetch that leaves a DIFFERENT
+  // workflow at the same index never changed it and this never fired — the
+  // exact hazard the guard exists for. The dialog then described one workflow
+  // while confirming renamed whichever now occupied the slot, and handed the
+  // backend that one's savedName as original_name: a rename the user never
+  // previewed, on a workflow they never chose.
+  const renameSubject = `${selectedWorkflow.type}:${selectedWorkflow.savedName ?? selectedWorkflow.name}`;
+  useEffect(() => { renameGuard.cancel(); }, [renameSubject, renameGuard.cancel]);
+
+  const handleNameSave = (newValue: string) => {
+    // In prefix mode the value already excludes the locked prefix and ".yml"
+    // suffix; in no-prefix mode the user may have typed the extension, which
+    // normalizeWorkflowStem strips.
+    const newName = normalizeWorkflowStem(newValue);
+    const renames = collectRenames(
+      [{ name: newName, savedName: selectedWorkflow.savedName }], isReusable
+    );
+    void renameGuard.confirmThen(renames, async () => {
+      handleWorkflowChange('name', newName);
+      // Confirming the rename *is* the commit. Having agreed to a dialog that
+      // spells out what the rename does, nobody expects to then have to press
+      // Commit Locally for it to be saved at all.
+      //
+      // Only for a real rename: naming a workflow that was never saved shows no
+      // dialog, and there is nothing to agree to. It also may have no content
+      // yet, which this save rejects.
+      if (renames.length > 0) {
+        saveDraftWorkflow(selectedWorkflow.originalIndex, editableType, newName);
+      }
+    });
+  };
+
+  const validateWorkflowFilenameDraft = (draftValue: string) => {
+    const trimmed = (draftValue ?? '').trim();
+    if (!trimmed) return 'Workflow name cannot be empty.';
+
+    // In prefix mode the input only contains the editable suffix.  Reject any
+    // attempt to re-include the project-managed prefix to avoid producing
+    // duplicated prefixes like `AM_CODE_AM_CODE_name.yml` after concatenation.
+    // Use case-insensitive comparison to match the backend's case-insensitive strip.
+    if (securePrefix && trimmed.toLowerCase().startsWith(securePrefix.toLowerCase())) {
+      return 'Do not include the project prefix; it is added automatically.';
+    }
+
+    return validateWorkflowName(trimmed);
+  };
+
+  // Helper functions for GitHub URLs
+  const githubRepos = isLinked
+    ? (selectedWorkflow.rwxRepo ? [selectedWorkflow.rwxRepo] : [])
+    : selectedRepos.filter(r => r?.includes('/'));
+
+  const workflowFileName = selectedWorkflow.name || '';
+  const applyPrefix = !isLinked && !!usePrefix;
+
+  const buildWorkflowUrlForRepo = (repo: string) => {
+    return buildGithubWorkflowUrl(repo, workflowFileName, projectCode, applyPrefix);
+  };
+
+  const buildRepoUrlForRepo = (repo: string) => {
+    return buildGithubRepoUrl(repo);
+  };
+
+  // Mirrors the condition under which WorkflowEditorContent renders the YAML
+  // editor, minus the states where that editor is read-only.
+  const showResourcePicker =
+    !!onInsertResource && !isReadOnly && !isLocked && (editMode === 'yaml' || isLinked);
+
+  return (
+    <>
+      <div className="workflow-editor-header-new">
+        {/* Top Row */}
+        <div className="workflow-toolbar-top">
+          {/* Left side: filename, type badge, state badge */}
+          <div className="workflow-identity">
+            <EditableNameField
+              value={editableNameValue}
+              prefix={editableNamePrefix}
+              suffix={editableNameSuffix}
+              onSave={handleNameSave}
+              validate={validateWorkflowFilenameDraft}
+              ariaLabel="workflow filename"
+              inputId="workflow-filename"
+              placeholder={placeholder}
+              disabled={isLinked || isReadOnly || isLocked}
+              className="workflow-filename-input"
+              displayClassName="text-lg font-medium"
+              inputClassName="workflow-filename-rename-input"
+            />
+            <span className={`workflow-type-badge-new ${badgeClass}`}>{badge}</span>
+            {isLinked && selectedWorkflow.rwxProjectName && (
+              <span className="workflow-linked-source">
+                from <strong>{selectedWorkflow.rwxProjectName}</strong>
+              </span>
+            )}
+            {stateBadge && (
+              <WorkflowStatusBadge
+                status={stateBadge.status}
+                label={stateBadge.text}
+                data-testid="workflow-status-badge"
+              />
+            )}
+          </div>
+
+          {/* Right side: primary action, More dropdown */}
+          <div className="workflow-primary-actions">
+            {primaryAction && (
+              <button
+                className={primaryAction.className}
+                onClick={primaryAction.onClick}
+                disabled={primaryAction.disabled}
+                title={primaryAction.title}
+                data-testid={isUnlockedPR ? "update-pr-button" : "commit-locally-button"}
+              >
+                {primaryAction.text}
+              </button>
+            )}
+
+            {!isLinked && (
+              <div className="more-menu-dropdown" ref={moreMenuRef}>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => !isReadOnly && setMoreMenuOpen(prev => !prev)}
+                  disabled={isReadOnly}
+                  title={isReadOnly ? readOnlyTooltip : "More options"}
+                  aria-haspopup="true"
+                  aria-expanded={moreMenuOpen}
+                  aria-label="More options"
+                >
+                  More ▾
+                </button>
+                {moreMenuOpen && (
+                  <div className="more-menu-content" role="menu">
+                    <button
+                      className="more-menu-item"
+                      role="menuitem"
+                      onClick={() => { setGithubModalOpen(true); setMoreMenuOpen(false); }}
+                      disabled={githubRepos.length === 0}
+                      title={githubRepos.length === 0 ? "No repositories available" : "Open this workflow in GitHub"}
+                    >
+                      ⤴ Open in GitHub
+                    </button>
+                    <button
+                      className="more-menu-item"
+                      role="menuitem"
+                      onClick={() => { onShowVersionHistory(); setMoreMenuOpen(false); }}
+                      title="View version history for this workflow"
+                    >
+                      📜 History
+                    </button>
+                    <button
+                      className="more-menu-item"
+                      role="menuitem"
+                      disabled
+                      title="Duplicate workflow — coming soon"
+                    >
+                      📋 Duplicate workflow
+                    </button>
+                    <button
+                      className="more-menu-item"
+                      role="menuitem"
+                      disabled
+                      title="Rename workflow — coming soon"
+                    >
+                      ✏️ Rename workflow
+                    </button>
+                    <hr className="more-menu-divider" />
+                    <button
+                      className="more-menu-item more-menu-item--danger"
+                      role="menuitem"
+                      onClick={() => {
+                        if (onRequestDelete) {
+                          onRequestDelete(selectedWorkflow.originalIndex, editableType, selectedWorkflow.name);
+                        } else {
+                          // Fallback for a caller that wired no dialog, so the
+                          // user picked nothing: take the reviewable delivery.
+                          deleteWorkflow(selectedWorkflow.originalIndex, editableType, 'project_and_github', 'campaign');
+                        }
+                        setMoreMenuOpen(false);
+                      }}
+                      title="Delete this workflow"
+                    >
+                      🗑️ Delete workflow
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {isLinked && onUnlinkWorkflow && (
+              <div className="more-menu-dropdown" ref={moreMenuRef}>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => !isReadOnly && setMoreMenuOpen(prev => !prev)}
+                  disabled={isReadOnly}
+                  title={isReadOnly ? readOnlyTooltip : "More options"}
+                  aria-haspopup="true"
+                  aria-expanded={moreMenuOpen}
+                  aria-label="More options"
+                  data-testid="linked-workflow-more-button"
+                >
+                  More ▾
+                </button>
+                {moreMenuOpen && (
+                  <div className="more-menu-content" role="menu">
+                    {selectedWorkflow.rwxRepo && (
+                      <button
+                        className="more-menu-item"
+                        role="menuitem"
+                        onClick={() => { setGithubModalOpen(true); setMoreMenuOpen(false); }}
+                        title="Open this workflow in GitHub"
+                      >
+                        ⤴ Open in GitHub
+                      </button>
+                    )}
+                    <hr className="more-menu-divider" />
+                    <button
+                      className="more-menu-item more-menu-item--danger"
+                      role="menuitem"
+                      onClick={() => {
+                        const workflowId = Number.parseInt(selectedWorkflow.id.replace('linked-', ''), 10);
+                        onUnlinkWorkflow(workflowId);
+                        setMoreMenuOpen(false);
+                      }}
+                      title="Remove this linked workflow from the project"
+                      data-testid="unlink-workflow-button"
+                    >
+                      🔗✂ Unlink Workflow
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Second Row: Status/Context */}
+        <div className="workflow-toolbar-status">
+          {/* Repository context */}
+          {selectedRepos.length > 0 && (
+            <div className="status-item">
+              <span className="status-label">Repos:</span>
+              <span className="status-value">{selectedRepos.join(', ')}</span>
+            </div>
+          )}
+          {isLinked && selectedWorkflow.rwxRepo && (
+            <div className="status-item">
+              <span className="status-label">Repo:</span>
+              <span className="status-value">{selectedWorkflow.rwxRepo}</span>
+            </div>
+          )}
+
+          {/* Drift/sync status — derived from workflow state */}
+          {stateBadge?.text === 'Synced' && (
+            <div className="status-item">
+              <span className="status-value">No drift detected</span>
+            </div>
+          )}
+
+          {/* One right-aligned cluster for everything interactive in this row.
+              Previously the mode selector and the Help link each carried their
+              own margin-left:auto; flex splits free space across every auto
+              margin, so the selector ended up stranded mid-row rather than
+              grouped with the other controls. */}
+          <div className="workflow-editor-controls">
+            {/* Editor mode toggle */}
+            {!isLinked && (
+              <div className="editor-mode-selector">
+                <span className="mode-label" aria-hidden="true">Editor:</span>
+                {/* role=group + aria-pressed rather than a bare pair of
+                    buttons: selection used to be conveyed by colour alone, so
+                    assistive tech heard two identical unlabelled buttons. */}
+                {/* fieldset + sr-only legend, not role="group": a native
+                    grouping element (same pattern as StepFields). */}
+                <fieldset className="mode-switch">
+                  <legend className="sr-only">Editor mode</legend>
+                  <button
+                    type="button"
+                    aria-pressed={editMode === 'yaml'}
+                    className={`mode-btn ${editMode === 'yaml' ? 'mode-btn-active' : ''}`}
+                    onClick={() => setEditMode('yaml')}
+                    disabled={isReadOnly || isLocked}
+                    title={isReadOnly ? readOnlyTooltip : 'YAML editor'}
+                  >
+                    YAML
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={editMode === 'gui'}
+                    className={`mode-btn ${editMode === 'gui' ? 'mode-btn-active' : ''}`}
+                    onClick={() => setEditMode('gui')}
+                    disabled={isReadOnly || isLocked}
+                    title={isReadOnly ? readOnlyTooltip : 'GUI editor'}
+                  >
+                    GUI
+                  </button>
+                </fieldset>
+              </div>
+            )}
+
+            {/* Expand the editor into a full-screen surface. Offered in both
+                modes so the control keeps its place when switching between
+                them. Styled to match WorkflowResourcePicker's toolbar
+                variant, its neighbour. Not offered while locked: the lock
+                overlay's "Unlock to Edit" opens a non-Radix modal rendered
+                outside the dialog, below its z-index and behind
+                body{pointer-events:none}, so it would be a dead control.
+                Read-only is fine - that overlay is static. */}
+            {!isLinked && !isLocked && (
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-text-secondary hover:bg-hover-bg disabled:opacity-50 dark:border-border-dark dark:text-text-secondary-dark dark:hover:bg-hover-dark-bg"
+                onClick={onExpand}
+                title="Expand the editor to full screen"
+              >
+                <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
+                Expand
+              </button>
+            )}
+
+            {/* Insert an existing project secret, variable or environment at the
+                caret. Only offered while the YAML editor is actually editable. */}
+            {showResourcePicker && (
+              <WorkflowResourcePicker onInsert={onInsertResource!} variant="toolbar" />
+            )}
+
+            {/* Docs link */}
+            <a
+              className="docs-help-link"
+              href={getDocsUrl("workflows")}
+              rel="noreferrer"
+              target="_blank"
+              title="Open workflow editor documentation"
+            >
+              Help
+            </a>
+          </div>
+        </div>
+      </div>
+
+      {/* What renaming this workflow would do, before the new name is taken. */}
+      <RenameImpactDialog
+        open={renameGuard.renameOpen}
+        items={renameGuard.renameItems}
+        loading={renameGuard.renameLoading}
+        onConfirm={() => { void renameGuard.confirm(); }}
+        onCancel={renameGuard.cancel}
+      />
+
+      {/* Open in GitHub Modal */}
+      <OpenInGitHubModal
+        isOpen={githubModalOpen}
+        onClose={() => setGithubModalOpen(false)}
+        workflowName={displayedWorkflowFilename}
+        repositories={githubRepos}
+        buildWorkflowUrl={buildWorkflowUrlForRepo}
+        buildRepoUrl={buildRepoUrlForRepo}
+      />
+    </>
+  );
+};
+
+const WorkflowEditorContent: React.FC<WorkflowEditorContentProps> = ({
+  selectedWorkflow,
+  editMode,
+  disableEditing = false,
+  yamlEditorRef,
+  height,
+  regularGuiWorkflow,
+  guiWorkflow,
+  handleWorkflowChange,
+  setRegularGuiWorkflow,
+  setGuiWorkflow,
+  importedActions,
+  actionGroups
+}) => {
+  const [yamlDiagnostics, setYamlDiagnostics] = useState<WorkflowDiagnostic[]>([]);
+  const { resources } = useWorkflowResources();
+  const isRegular = selectedWorkflow.type === 'regular';
+  const isLinked = selectedWorkflow.type === 'linked';
+  const yamlPlaceholder = isRegular 
+    ? "# GitHub Actions workflow YAML content"
+    : "# Reusable workflow YAML content";
+
+  useEffect(() => {
+    setYamlDiagnostics([]);
+  }, [selectedWorkflow.id]);
+
+  if (editMode === 'yaml' || isLinked || disableEditing) {
+    return (
+      <>
+        <YAMLEditor
+          key={selectedWorkflow.id}
+          ref={yamlEditorRef}
+          {...(height ? { height } : {})}
+          resources={resources}
+          value={selectedWorkflow.content || ''}
+          onChange={(value: string) => {
+            if (!disableEditing) {
+              handleWorkflowChange('content', value);
+            }
+          }}
+          onStructuralDiagnostics={setYamlDiagnostics}
+          placeholder={yamlPlaceholder}
+          readOnly={disableEditing}
+        />
+        <ValidationPanel diagnostics={yamlDiagnostics} />
+      </>
+    );
+  }
+
+  const handleGUIChange = (newWorkflow: WorkflowGUI) => {
+    // Always update the GUI workflow state
+    if (isRegular) {
+      setRegularGuiWorkflow(newWorkflow);
+    } else {
+      setGuiWorkflow(newWorkflow);
+    }
+
+    // The GUI's name box edits the workflow's YAML `name:` label, which
+    // guiToYaml writes into the content below. It used to be copied into the
+    // workflow's `name` as well — and that field IS the delivered filename, so
+    // editing a label silently renamed the file: no impact dialog, no blocked
+    // reasons, and once a save carries original_name the old file is queued for
+    // deletion from every repository. Renaming is the name field above, which
+    // validates the value and asks first.
+
+    try {
+      const yamlContent = guiToYaml(newWorkflow);
+      handleWorkflowChange('content', yamlContent);
+    } catch (error) {
+      console.error('Failed to convert GUI to YAML:', error);
+    }
+  };
+
+  // Keyed on kind as well as id: regular and reusable workflows number their
+  // ids separately, so id alone no longer forces a remount when switching
+  // between the two now that both render the same component.
+  return (
+    <GUIWorkflowEditor
+      key={`${isRegular ? 'regular' : 'reusable'}-${selectedWorkflow.id}`}
+      variant={isRegular ? 'regular' : 'reusable'}
+      workflow={isRegular ? regularGuiWorkflow : guiWorkflow}
+      onChange={handleGUIChange}
+      importedActions={importedActions}
+      actionGroups={actionGroups}
+    />
+  );
+};
+
+interface EditorSurfaceProps {
+  selectedWorkflow: UnifiedWorkflowItem;
+  editMode: 'yaml' | 'gui';
+  isReadOnly: boolean;
+  showLockOverlay: boolean;
+  /** Drives the YAML editor's height; see the note on the height prop below. */
+  expanded: boolean;
+  yamlEditorRef: React.Ref<YamlEditorHandle>;
+  regularGuiWorkflow: WorkflowGUI;
+  guiWorkflow: WorkflowGUI;
+  handleWorkflowChange: (field: string, value: string) => void;
+  setRegularGuiWorkflow: (workflow: WorkflowGUI) => void;
+  setGuiWorkflow: (workflow: WorkflowGUI) => void;
+  importedActions: ActionsProject[];
+  actionGroups: ActionGroup[];
+  onRequestUnlock: () => void;
+}
+
+/**
+ * The editor plus its lock/read-only overlays.
+ *
+ * Rendered either inline or inside the expanded dialog - never both, or the
+ * step-row DOM ids collide. A component rather than inline JSX so that
+ * UnifiedWorkflowEditor stays under SonarQube's cognitive-complexity ceiling.
+ */
+const EditorSurface: React.FC<EditorSurfaceProps> = ({
+  selectedWorkflow,
+  editMode,
+  isReadOnly,
+  showLockOverlay,
+  expanded,
+  yamlEditorRef,
+  regularGuiWorkflow,
+  guiWorkflow,
+  handleWorkflowChange,
+  setRegularGuiWorkflow,
+  setGuiWorkflow,
+  importedActions,
+  actionGroups,
+  onRequestUnlock,
+}) => (
+    <div className="workflow-editor-content workflow-editor-content--lockable">
+      <WorkflowEditorContent
+        selectedWorkflow={selectedWorkflow}
+        editMode={editMode}
+        disableEditing={isReadOnly || showLockOverlay}
+        yamlEditorRef={yamlEditorRef}
+        // The default 400px is an inline style and would strand a short
+        // editor in a 100vh dialog; percentage resolves against h-screen.
+        height={expanded ? '100%' : undefined}
+        regularGuiWorkflow={regularGuiWorkflow}
+        guiWorkflow={guiWorkflow}
+        handleWorkflowChange={handleWorkflowChange}
+        setRegularGuiWorkflow={setRegularGuiWorkflow}
+        setGuiWorkflow={setGuiWorkflow}
+        importedActions={importedActions}
+        actionGroups={actionGroups}
+      />
+      {showLockOverlay && (
+        <div className="workflow-lock-overlay" data-testid="workflow-lock-overlay">
+          <button
+            className="workflow-lock-btn"
+            onClick={onRequestUnlock}
+            title="This workflow has an open pull request. Click to unlock editing."
+            data-testid="unlock-workflow-button"
+          >
+            <span className="workflow-lock-icon">🔒</span>
+            <span className="workflow-lock-label">Unlock to Edit</span>
+          </button>
+        </div>
+      )}
+      {isReadOnly && !showLockOverlay && (
+        <div className="workflow-lock-overlay">
+          <div className="workflow-lock-btn workflow-lock-btn-static" role="status" aria-live="polite">
+            <span className="workflow-lock-icon">🔒</span>
+            <span className="workflow-lock-label workflow-lock-label-strong">Read Only Mode</span>
+            <span className="workflow-lock-label">You can view workflows but cannot make changes.</span>
+          </div>
+        </div>
+      )}
+    </div>
+);
+
+interface ExpandedEditorDialogProps {
+  open: boolean;
+  title: string;
+  onRequestCollapse: () => void;
+  showResourcePicker: boolean;
+  onInsertResource: (text: string) => void;
+  children: React.ReactNode;
+}
+
+/**
+ * Full-screen editing surface.
+ *
+ * Extracted from UnifiedWorkflowEditor to keep that component under
+ * SonarQube's cognitive-complexity ceiling; it owns no state, it is the
+ * dialog's markup and its deliberate refusal to self-dismiss.
+ */
+const ExpandedEditorDialog: React.FC<ExpandedEditorDialogProps> = ({
+  open,
+  title,
+  onRequestCollapse,
+  showResourcePicker,
+  onInsertResource,
+  children,
+}) => (
+  <Dialog open={open} onOpenChange={(next) => { if (!next) onRequestCollapse(); }}>
+    <DialogContent
+      hideClose
+      // Deliberately undismissable. Radix closes on outside pointer-down
+      // and Escape by default; both are cancelled here so the only way out
+      // is the explicit control below, which runs the unsaved-work check.
+      onPointerDownOutside={(e) => e.preventDefault()}
+      onInteractOutside={(e) => e.preventDefault()}
+      onEscapeKeyDown={(e) => {
+        e.preventDefault();
+        // The step panel owns Escape while a step is selected. Radix runs at
+        // document capture, before the panel's own bubble listener, so the
+        // panel cannot stop us - we stand down instead.
+        if (document.querySelector('[data-step-selected="true"]')) return;
+        onRequestCollapse();
+      }}
+      aria-label="Expanded workflow editor"
+      className="flex h-screen w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 inset-0 left-0 top-0 rounded-none p-0"
+    >
+      <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-2 dark:border-border-dark">
+        <DialogTitle className="text-sm font-semibold text-text-primary dark:text-text-primary-dark">
+          {title}
+        </DialogTitle>
+        <div className="flex items-center gap-2">
+          {/* The toolbar's own copy is behind the overlay while expanded.
+              Without this, deployment environments become unreachable -
+              they are picker-only, unlike secrets and variables which the
+              editor also offers as ${{ }} autocomplete. */}
+          {showResourcePicker && (
+            <WorkflowResourcePicker onInsert={onInsertResource} variant="toolbar" />
+          )}
+          <button
+            type="button"
+            onClick={onRequestCollapse}
+            aria-label="Collapse editor"
+            className="rounded-md p-1 text-text-secondary hover:bg-hover-bg dark:text-text-secondary-dark dark:hover:bg-hover-dark-bg"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+      {/* The portal escapes .workflow-editor-content, which supplied the
+          scrolling for the inline layout - so it has to be re-supplied. */}
+      <div
+        // Capped and centred: the point of expanding is a wider step
+        // panel, not 2000px-wide text inputs, which are harder to read
+        // than the cramped ones this replaces. flex column + min-h-0 so a
+        // percentage-height YAML editor resolves against the dialog.
+        // --step-panel-max-h is set as an arbitrary-property utility rather
+        // than an inline style, which the Tailwind-only policy forbids. Dialog
+        // chrome is its own header plus this padding, not the page header the
+        // panel's default assumes. See StepDetailPanel.
+        className="mx-auto flex min-h-0 w-full max-w-[1600px] flex-1 flex-col overflow-y-auto p-4 [--step-panel-max-h:calc(100vh-6rem)]"
+      >
+        {children}
+      </div>
+    </DialogContent>
+  </Dialog>
+);
+
+type PendingWorkflowDelete = { index: number; type: 'regular' | 'reusable'; name: string };
+
+const REUSABLE_NOT_OURS_REASON =
+  "This reusable workflow lives in its Reusable Workflow Project's repository, not this " +
+  "project's, so it cannot be deleted from GitHub here. Delete it from the project that owns it.";
+
+/**
+ * The removal-scope dialog for a workflow. Renders nothing until one is pending,
+ * so the editor does not carry the decision itself.
+ */
+const WorkflowRemovalDialog: React.FC<{
+  pending: PendingWorkflowDelete | null;
+  // Widened to match displayFilenameFor, which the editor may hand either.
+  projectCode?: string | null;
+  usePrefix: boolean;
+  projectType?: 'standard' | 'rwx';
+  onConfirm: (index: number, type: 'regular' | 'reusable', scope: RemovalScope, delivery: RemovalDelivery) => void;
+  onClose: () => void;
+}> = ({ pending, projectCode, usePrefix, projectType, onConfirm, onClose }) => {
+  if (!pending) return null;
+
+  // A reusable workflow in a caller project lives in the Reusable Workflow
+  // Project's repository, not one of this project's. Deleting it there would
+  // remove the copy every other caller linking that project depends on, so the
+  // server refuses — say so rather than offering an option that cannot work.
+  const notOurRepo = pending.type === 'reusable' && projectType !== 'rwx';
+
+  return (
+    <RemovalScopeDialog
+      open={true}
+      // The delete control is rendered only for a workflow this project owns
+      // (linked ones offer Unlink instead), so the project's prefix always
+      // applies to the file this removes.
+      title={`Remove workflow "${displayFilenameFor({ name: pending.name }, projectCode, usePrefix)}"?`}
+      githubLocation="your project's repositories"
+      githubScopeDisabledReason={notOurRepo ? REUSABLE_NOT_OURS_REASON : undefined}
+      // Reusable workflows keep the single-question dialog: their GitHub option
+      // is disabled, so there is no delivery to choose.
+      offerDelivery={pending.type === 'regular'}
+      // Workflows have no Restore button — custom files do. Closing the pull
+      // request is what cancels the removal, and the server unmarks the
+      // workflow when it does.
+      campaignReversal="closing that pull request cancels the removal"
+      onConfirm={(scope, delivery) => { onConfirm(pending.index, pending.type, scope, delivery); onClose(); }}
+      onCancel={onClose}
+    />
+  );
+};
+
+const UnifiedWorkflowEditor: React.FC<UnifiedWorkflowEditorProps> = ({
+  selectedWorkflow,
+  editMode,
+  regularGuiWorkflow,
+  guiWorkflow,
+  projectCode,
+  projectPRState = "new",
+  usePrefix = true,
+  isReadOnly = false,
+  user,
+  projectName,
+  selectedRepos = [],
+  importedActions,
+  actionGroups,
+  secrets,
+  envVars,
+  setEditMode,
+  setRegularGuiWorkflow,
+  setGuiWorkflow,
+  handleWorkflowChange,
+  saveDraftWorkflow,
+  saveDraftLinkedWorkflow,
+  commitAndUpdatePR,
+  commitAndUpdatePRLinked,
+  deleteWorkflow,
+  unlinkWorkflow,
+  addWorkflowFn,
+  onImportExisting,
+  projectType = 'standard'
+}) => {
+  const [showVersionHistory, setShowVersionHistory] = useState(false);
+  const [isUnlocked, setIsUnlocked] = useState(false);
+  const [showUnlockModal, setShowUnlockModal] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<PendingWorkflowDelete | null>(null);
+  const [pendingUnlink, setPendingUnlink] = useState<{ workflowId: number; name: string } | null>(null);
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [pendingCollapse, setPendingCollapse] = useState(false);
+
+  // Every close path funnels through here. Nothing dismisses the expanded
+  // editor implicitly - no backdrop click, no focus loss - because the work in
+  // it is unsaved by definition and people have lost drafts to that pattern.
+  const requestCollapse = () => {
+    if (selectedWorkflow?.isModified) {
+      setPendingCollapse(true);
+      return;
+    }
+    setIsExpanded(false);
+  };
+  const yamlEditorRef = useRef<YamlEditorHandle>(null);
+
+  const handleInsertResource = React.useCallback((text: string) => {
+    yamlEditorRef.current?.insertAtCursor(text);
+  }, []);
+
+  // Reset per-workflow view state whenever the selected workflow changes.
+  // isExpanded belongs here too: ids are positional (`regular-${index}`), so a
+  // refetch or reorder can swap the workflow underneath an open dialog - which
+  // would silently change what's being edited without the unsaved-changes gate
+  // ever running for the workflow the user was actually in. If the selection
+  // goes null the dialog unmounts, and a stale `true` would make the next
+  // workflow the user picks open full-screen unasked.
+  useEffect(() => {
+    setIsUnlocked(false);
+    setShowUnlockModal(false);
+    setIsExpanded(false);
+    setPendingCollapse(false);
+  }, [selectedWorkflow?.id]);
+
+  const handleShowVersionHistory = () => {
+    setShowVersionHistory(true);
+  };
+
+  const handleCloseVersionHistory = () => {
+    setShowVersionHistory(false);
+  };
+
+  const handleRestoreVersion = (content: string) => {
+    handleWorkflowChange('content', content);
+    setShowVersionHistory(false);
+  };
+
+  // Wrapper for commit-and-update-PR: re-locks on success, stays unlocked on failure.
+  // Linked workflows use a separate code path (commitAndUpdatePRLinked) so that:
+  //   - the save step targets the RWX project (not the standard project)
+  //   - the index refers to the linkedWorkflows array, not workflows/rxworkflows
+  const handleCommitAndUpdatePR = async () => {
+    if (!selectedWorkflow) return;
+    let success = false;
+    if (selectedWorkflow.type === 'linked' && commitAndUpdatePRLinked) {
+      success = await commitAndUpdatePRLinked(selectedWorkflow.originalIndex);
+    } else if (commitAndUpdatePR) {
+      const editableType: 'regular' | 'reusable' =
+        selectedWorkflow.type === 'reusable' ? 'reusable' : 'regular';
+      success = await commitAndUpdatePR(selectedWorkflow.originalIndex, editableType);
+    }
+    if (success) {
+      setIsUnlocked(false);
+    }
+  };
+
+  // Memoized handler so WorkflowEditorHeader doesn't re-render on every render of the parent
+  const handleSaveDraftLinked = React.useCallback(() => {
+    if (saveDraftLinkedWorkflow && selectedWorkflow?.type === 'linked') {
+      saveDraftLinkedWorkflow(selectedWorkflow.originalIndex);
+    }
+  }, [saveDraftLinkedWorkflow, selectedWorkflow?.type, selectedWorkflow?.originalIndex]);
+
+  const hasSaveDraftLinked =
+    !!saveDraftLinkedWorkflow && selectedWorkflow?.type === 'linked';
+
+  const hasCommitAction =
+    selectedWorkflow?.type === 'linked' ? !!commitAndUpdatePRLinked : !!commitAndUpdatePR;
+
+  if (!selectedWorkflow) {
+    return (
+      <div className="unified-workflows-editor unified-workflows-empty-state">
+        <div className="empty-state-card">
+          <FileText className="empty-state-icon" aria-hidden="true" />
+          <h3>Select a project file</h3>
+          <p>Choose a workflow or file from the panel on the left to begin editing.</p>
+          {(addWorkflowFn || onImportExisting) && (
+            <div className="empty-state-actions">
+              {!isReadOnly && addWorkflowFn && (
+                <Button data-testid="add-workflow-button" onClick={addWorkflowFn}>
+                  <FilePlus2 className="h-4 w-4" aria-hidden="true" />
+                  Add Workflow
+                </Button>
+              )}
+              {onImportExisting && (
+                <Button variant="outline" onClick={onImportExisting}>
+                  <Upload className="h-4 w-4" aria-hidden="true" />
+                  Import Existing
+                </Button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const workflowClass = selectedWorkflow.type === 'regular' 
+    ? 'regular-workflow-editor' 
+    : selectedWorkflow.type === 'linked'
+      ? 'linked-workflow-editor'
+      : 'reusable-workflow-editor';
+
+  const showLockOverlay = selectedWorkflow?.workflowStatus === 'under_review' && !isUnlocked;
+  const isUnlockedPR = isUnlocked && selectedWorkflow?.workflowStatus === 'under_review';
+
+  // Mirrors WorkflowEditorHeader's own showResourcePicker: that one is scoped
+  // to the header, and the expanded dialog needs the same decision.
+  const showResourcePicker =
+    !isReadOnly &&
+    !showLockOverlay &&
+    (editMode === 'yaml' || selectedWorkflow?.type === 'linked');
+
+  // Single instance, rendered either inline or inside the expanded dialog.
+  // Carries its own lock/read-only overlays so the expanded view isn't an
+  // editable-looking surface with no lock affordance.
+  const editorSurface = (
+    <EditorSurface
+      selectedWorkflow={selectedWorkflow}
+      editMode={editMode}
+      isReadOnly={isReadOnly}
+      showLockOverlay={showLockOverlay}
+      expanded={isExpanded}
+      yamlEditorRef={yamlEditorRef}
+      regularGuiWorkflow={regularGuiWorkflow}
+      guiWorkflow={guiWorkflow}
+      handleWorkflowChange={handleWorkflowChange}
+      setRegularGuiWorkflow={setRegularGuiWorkflow}
+      setGuiWorkflow={setGuiWorkflow}
+      importedActions={importedActions}
+      actionGroups={actionGroups}
+      onRequestUnlock={() => setShowUnlockModal(true)}
+    />
+  );
+
+  return (
+    <WorkflowResourcesProvider
+      user={user}
+      selectedRepos={selectedRepos}
+      secrets={secrets}
+      envVars={envVars}
+    >
+    <div className="unified-workflows-editor">
+      <div className={workflowClass}>
+        <WorkflowEditorHeader
+          selectedWorkflow={selectedWorkflow}
+          projectCode={projectCode}
+          projectName={projectName}
+          user={user}
+          editMode={editMode}
+          projectPRState={projectPRState}
+          usePrefix={usePrefix}
+          isReadOnly={isReadOnly}
+          isUnlockedPR={isUnlockedPR}
+          isLocked={showLockOverlay}
+          selectedRepos={selectedRepos}
+          handleWorkflowChange={handleWorkflowChange}
+          saveDraftWorkflow={saveDraftWorkflow}
+          onSaveDraftLinked={hasSaveDraftLinked ? handleSaveDraftLinked : undefined}
+          onCommitAndUpdatePR={hasCommitAction ? handleCommitAndUpdatePR : undefined}
+          deleteWorkflow={deleteWorkflow}
+          onRequestDelete={(idx, type, name) => setPendingDelete({ index: idx, type, name })}
+          onUnlinkWorkflow={unlinkWorkflow ? (workflowId) => setPendingUnlink({ workflowId, name: selectedWorkflow.name }) : undefined}
+          setEditMode={setEditMode}
+          onShowVersionHistory={handleShowVersionHistory}
+          onInsertResource={handleInsertResource}
+          onExpand={() => setIsExpanded(true)}
+        />
+        <ReusableInCallerNotice workflow={selectedWorkflow} projectType={projectType} />
+        {/* Mounted here OR in the expanded dialog, never both. Two live
+            copies duplicated every step-row DOM id, so StepDetailPanel's
+            document.getElementById(...).focus() on close hit the hidden
+            inline row instead of the visible one, and both copies claimed
+            the same yamlEditorRef. */}
+        {isExpanded ? (
+          <div
+            className="workflow-editor-content workflow-editor-content--lockable"
+            aria-hidden="true"
+          >
+            <p className="p-4 text-sm text-text-secondary dark:text-text-secondary-dark">
+              Editing in the expanded view.
+            </p>
+          </div>
+        ) : (
+          editorSurface
+        )}
+      </div>
+
+      <ExpandedEditorDialog
+        open={isExpanded}
+        title={displayFilenameFor(selectedWorkflow, projectCode, usePrefix)}
+        onRequestCollapse={requestCollapse}
+        showResourcePicker={showResourcePicker}
+        onInsertResource={handleInsertResource}
+      >
+        {isExpanded && editorSurface}
+      </ExpandedEditorDialog>
+
+      {pendingCollapse && (
+        <ConfirmDialog
+          open
+          title="Collapse the editor?"
+          description="This workflow has unsaved changes. Collapsing keeps them - they stay in the editor, still marked Unsaved, and nothing is discarded or committed."
+          confirmLabel="Collapse"
+          onConfirm={() => { setPendingCollapse(false); setIsExpanded(false); }}
+          onCancel={() => setPendingCollapse(false)}
+        />
+      )}
+
+      {showVersionHistory && selectedWorkflow.name && (
+        <VersionHistoryPanel
+          user={user}
+          projectName={projectName}
+          workflowName={selectedWorkflow.name}
+          displayName={displayFilenameFor(selectedWorkflow, projectCode, usePrefix)}
+          currentContent={selectedWorkflow.content || ''}
+          onClose={handleCloseVersionHistory}
+          onRestore={handleRestoreVersion}
+        />
+      )}
+
+      {showUnlockModal && (
+        <div className="workflow-lock-modal-backdrop">
+          <button
+            type="button"
+            aria-label="Dismiss unlock dialog"
+            onClick={() => setShowUnlockModal(false)}
+            className="absolute inset-0 cursor-default border-0 bg-transparent p-0"
+          />
+          <div className="workflow-lock-modal relative">
+            <div className="workflow-lock-modal-header">
+              <span className="workflow-lock-modal-icon">🔒</span>
+              <h3 className="workflow-lock-modal-title">Open Pull Request Detected</h3>
+            </div>
+            <p className="workflow-lock-modal-body">
+              This workflow already has an open pull request. If you continue editing, your changes will be added to the existing pull request instead of creating a separate one.
+            </p>
+            <div className="workflow-lock-modal-actions">
+              <button
+                className="btn btn-secondary"
+                onClick={() => setShowUnlockModal(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => { setIsUnlocked(true); setShowUnlockModal(false); }}
+              >
+                Unlock and Edit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <WorkflowRemovalDialog
+        pending={pendingDelete}
+        projectCode={projectCode}
+        usePrefix={usePrefix}
+        projectType={projectType}
+        onConfirm={deleteWorkflow}
+        onClose={() => setPendingDelete(null)}
+      />
+
+      {pendingUnlink && (
+        <ConfirmDialog
+          open={true}
+          title={`Unlink workflow "${pendingUnlink.name}"?`}
+          description="This will remove the linked reusable workflow from this project only. The source reusable workflow will not be deleted and no GitHub files will be modified."
+          confirmLabel="Unlink Workflow"
+          destructive
+          onConfirm={() => { if (unlinkWorkflow) { unlinkWorkflow(pendingUnlink.workflowId); } setPendingUnlink(null); }}
+          onCancel={() => setPendingUnlink(null)}
+        />
+      )}
+    </div>
+    </WorkflowResourcesProvider>
+  );
+};
+
+export default UnifiedWorkflowEditor;

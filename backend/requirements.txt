@@ -1,0 +1,24 @@
+fastapi
+uvicorn
+requests
+httpx
+sqlalchemy>=2.0,<2.1
+pydantic
+python-dotenv
+PyJWT
+pynacl>=1.6.2
+python-multipart
+pytest
+pytest-cov
+pytest-asyncio
+pytest-xdist
+PyYAML
+cryptography>=50.0.1
+
+# Runtime deps that were previously installed only inside backend/Dockerfile,
+# so local dev and CI never had them while the image did. Declared here so
+# every environment resolves the same set. Unpinned to match this file's
+# existing style.
+psycopg2-binary
+websockets
+wsproto

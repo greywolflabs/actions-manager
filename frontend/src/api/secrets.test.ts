@@ -1,0 +1,186 @@
+import apiClient from "./apiClient";
+import { createSecrets, getSecrets, deleteSecrets, syncSecret, getSecretsCount } from "./secrets";
+
+import type { Mocked } from 'vitest';
+vi.mock("./apiClient", () => ({
+  __esModule: true,
+  default: {
+    get: vi.fn(),
+    post: vi.fn(),
+    delete: vi.fn(),
+  },
+}));
+vi.mock("../utils/toast", () => ({ toast: { error: vi.fn() } }));
+
+const mockedApiClient = apiClient as Mocked<typeof apiClient>;
+
+describe("secrets API", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  describe("createSecrets", () => {
+    it("returns error and calls toast when user is missing", async () => {
+      const { toast } = await import("../utils/toast");
+
+      const result = await createSecrets(undefined, ["org/repo1"], [], "My Project");
+
+      expect(result).toEqual({ error: "User and project name are required" });
+      expect(toast.error).toHaveBeenCalled();
+    });
+
+    it("returns error when projectName is missing", async () => {
+      const result = await createSecrets("user", ["org/repo1"], [], undefined);
+
+      expect(result).toEqual({ error: "User and project name are required" });
+    });
+
+    it("posts secrets and calls setSecrets with refreshed data", async () => {
+      const mockSetSecrets = vi.fn();
+      mockedApiClient.post.mockResolvedValueOnce({ data: { results: "ok" } });
+      mockedApiClient.get.mockResolvedValueOnce({ data: { secrets: [{ secret_key: "TOKEN" }] } });
+
+      const result = await createSecrets(
+        "testuser",
+        ["org/repo1"],
+        [{ key: "TOKEN", value: "abc" }],
+        "My Project",
+        mockSetSecrets
+      );
+
+      expect(mockedApiClient.post).toHaveBeenCalledWith(
+        expect.stringContaining("/api/create-secrets"),
+        expect.objectContaining({
+          user: "testuser",
+          repo_names: ["org/repo1"],
+          project_name: "My Project",
+        })
+      );
+      expect(mockSetSecrets).toHaveBeenCalledWith([{ secret_key: "TOKEN" }]);
+      expect(result).toEqual({ results: "ok" });
+    });
+
+    it("maps Repository objects to full_name strings", async () => {
+      mockedApiClient.post.mockResolvedValueOnce({ data: {} });
+      mockedApiClient.get.mockResolvedValueOnce({ data: { secrets: [] } });
+
+      await createSecrets("user", [{ full_name: "org/repo1", name: "repo1" }], [], "proj");
+
+      expect(mockedApiClient.post).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ repo_names: ["org/repo1"] })
+      );
+    });
+
+    it("returns error object on API failure", async () => {
+      mockedApiClient.post.mockRejectedValueOnce(new Error("network error"));
+
+      const result = await createSecrets("user", ["repo"], [], "proj");
+      expect(result).toEqual({ error: "network error" });
+    });
+
+    it("does not log the failed request, which carries the secret values", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      mockedApiClient.post.mockRejectedValueOnce({
+        message: "Request failed",
+        config: { data: JSON.stringify({ secrets: [{ secret_value: "s3cr3t-value" }] }) },
+        response: { status: 500, data: { detail: "boom" } },
+      });
+
+      try {
+        await createSecrets("user", ["repo"], [{ key: "K", value: "s3cr3t-value" }], "proj");
+
+        const logged = JSON.stringify(errorSpy.mock.calls);
+        expect(logged).not.toContain("s3cr3t-value");
+        expect(logged).toContain("500");
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("getSecrets", () => {
+    it("returns secrets array from API", async () => {
+      mockedApiClient.get.mockResolvedValueOnce({ data: { secrets: [{ secret_key: "TOKEN" }] } });
+
+      const result = await getSecrets("testuser", "org/repo1", "My Project");
+
+      expect(result).toEqual([{ secret_key: "TOKEN" }]);
+    });
+
+    it("returns empty array on API error", async () => {
+      mockedApiClient.get.mockRejectedValueOnce(new Error("network error"));
+
+      const result = await getSecrets("user", "repo", "proj");
+      expect(result).toEqual([]);
+    });
+
+    it("returns empty array when secrets is undefined in response", async () => {
+      mockedApiClient.get.mockResolvedValueOnce({ data: {} });
+
+      const result = await getSecrets("user", "repo", "proj");
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe("deleteSecrets", () => {
+    it("calls toast.error and returns early when user is missing", async () => {
+      const { toast } = await import("../utils/toast");
+
+      await deleteSecrets(undefined, "proj", ["repo"], "KEY");
+
+      expect(toast.error).toHaveBeenCalled();
+      expect(mockedApiClient.delete).not.toHaveBeenCalled();
+    });
+
+    it("deletes secret and refreshes setSecrets", async () => {
+      const mockSetSecrets = vi.fn();
+      mockedApiClient.delete.mockResolvedValueOnce({ data: { results: "ok" } });
+      mockedApiClient.get.mockResolvedValueOnce({ data: { secrets: [] } });
+
+      await deleteSecrets("testuser", "My Project", ["org/repo1"], "TOKEN", mockSetSecrets);
+
+      expect(mockedApiClient.delete).toHaveBeenCalledWith(
+        expect.stringContaining("/api/delete-secrets"),
+        expect.objectContaining({
+          data: expect.objectContaining({ user: "testuser", secret_name: "TOKEN" }),
+        })
+      );
+      expect(mockSetSecrets).toHaveBeenCalledWith([]);
+    });
+  });
+
+  describe("syncSecret", () => {
+    it("posts to sync-secret endpoint", async () => {
+      mockedApiClient.post.mockResolvedValueOnce({ data: { synced: true } });
+
+      const result = await syncSecret("user", "proj", ["org/repo1"], "TOKEN");
+
+      expect(mockedApiClient.post).toHaveBeenCalledWith(
+        expect.stringContaining("/api/sync-secret"),
+        expect.objectContaining({ secret_key: "TOKEN" })
+      );
+      expect(result).toEqual({ synced: true });
+    });
+
+    it("throws on error", async () => {
+      mockedApiClient.post.mockRejectedValueOnce(new Error("failed"));
+
+      await expect(syncSecret("user", "proj", ["repo"], "KEY")).rejects.toThrow("failed");
+    });
+  });
+
+  describe("getSecretsCount", () => {
+    it("returns the count of secrets", async () => {
+      mockedApiClient.get.mockResolvedValueOnce({ data: { count: 2 } });
+
+      const result = await getSecretsCount("user", "proj", ["org/repo1", "org/repo2"]);
+      expect(result).toBe(2);
+    });
+
+    it("returns 0 on error instead of throwing", async () => {
+      mockedApiClient.get.mockRejectedValueOnce(new Error("server error"));
+
+      const result = await getSecretsCount("user", "proj", ["repo"]);
+      expect(result).toBe(0);
+    });
+  });
+});

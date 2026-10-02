@@ -1,0 +1,149 @@
+name: Publish Public Documentation Site
+
+# This file does NOT run in this repository. promote-to-public.yml deletes
+# .github/workflows/ from the sanitized export and then installs this file as
+# .github/workflows/docs-pages.yml in greywolflabs/actions-manager, which is where it
+# runs. It is staged outside .github/workflows/ so it never executes here, where
+# it would publish a second Pages site from the same docs.
+#
+# This is the production documentation deploy: it serves actionsmanager.io. The
+# custom domain is set in the public repository's Pages settings, not by a
+# committed CNAME - promote-to-public.yml strips docs/CNAME from the export.
+# "Deploy Docs Preview" (docs-preview.yml) publishes a dev preview from the
+# private repository at its github.io address; the names must stay distinct.
+#
+# "main" below is the PUBLIC repository's branch, which is what this workflow
+# runs against. .github/scripts/check_no_main_refs.py only scans
+# .github/workflows/*.yml, so this file is correctly outside its glob - do not
+# "fix" that by widening the glob, and do not retarget this to develop: the
+# public repository has no develop branch.
+
+on:
+  # Primary trigger. Releases are created in the public repository by
+  # promote-to-public.yml, so this fires natively - no repository_dispatch.
+  release:
+    types: [published]
+  # Manual republish without cutting a release.
+  workflow_dispatch:
+  # A docs-only fix ships without waiting for a release.
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs-pages.yml'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  # Never cancel a release deploy because a docs push landed behind it.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # On a release, build the tag rather than main. promote-to-public.yml
+          # creates the release from the release/<version> commit WITHOUT waiting
+          # for the promotion PR to merge, so main can still be the previous
+          # release when this fires. The tag already carries the new docs.
+          # Empty on every other trigger, which checks out the pushed or
+          # dispatched ref as usual.
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: docs/.nvmrc
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Setup GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v6
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build with Astro
+        env:
+          # Not BASE_URL/BASE_PATH: Vite reads BASE_URL from the environment
+          # as the site base, which breaks Starlight's current-page matching
+          # (no sidebar highlight, no prev/next links).
+          PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          set -euo pipefail
+
+          # The base path is resolved here, at build time, never committed.
+          # configure-pages reports what Pages is actually serving:
+          # "/actions-manager" for a project site, and "" once a custom domain
+          # is set. So moving the docs to a domain needs no change to this
+          # workflow or to docs/astro.config.mjs - only the Pages setting
+          # itself, then a re-run of this workflow: changing the domain does
+          # not rebuild, and the old build's /actions-manager/ paths 404.
+          #
+          # The site origin is overridden as well as the base: canonicals and
+          # the sitemap are absolute URLs, and on a project site the defaults
+          # would advertise https://actionsmanager.io/actions-manager/...,
+          # which resolves nowhere.
+          PAGES_BASE_URL="${PAGES_BASE_URL%/}"
+          export DOCS_SITE="${PAGES_BASE_URL%"$PAGES_BASE_PATH"}"
+          export DOCS_BASE="${PAGES_BASE_PATH:-/}"
+          echo "Building with site=$DOCS_SITE base=$DOCS_BASE"
+
+          npm run build
+
+      - name: Verify generated site
+        run: |
+          set -euo pipefail
+
+          # Fail rather than publish an empty or broken site over a working one.
+          test -s dist/index.html
+          # Starlight matched each page to its sidebar entry (prev/next work).
+          grep -q 'aria-current="page"' dist/getting-started/quick-start.html
+          test -s dist/sitemap-index.xml
+          test -d dist/pagefind
+          # Every URL the site has published must still resolve, the way
+          # GitHub Pages resolves it: "/" -> index.html, "/x" -> x.html.
+          missing=0
+          while read -r url; do
+            case "$url" in ''|'#'*) continue ;; esac
+            path="${url#/}"
+            case "$path" in
+              '') file=index.html ;;
+              *.html) file="$path" ;;
+              *) file="$path.html" ;;
+            esac
+            if [ ! -s "dist/$file" ]; then
+              echo "::error::$url (from url-parity.txt) has no page."
+              missing=1
+            fi
+          done < url-parity.txt
+          [ "$missing" -eq 0 ]
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

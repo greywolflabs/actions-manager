@@ -1,0 +1,60 @@
+import { defineConfig, devices } from '@playwright/test';
+
+/**
+ * Playwright configuration for the Actions Manager frontend.
+ *
+ * The `webServer` block boots the React dev server on port 3000 so the e2e
+ * tests have something to hit. In CI we don't reuse an existing server.
+ */
+export default defineConfig({
+  testDir: './e2e',
+  timeout: 30_000,
+  expect: {
+    timeout: 5_000,
+  },
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 1 : 0,
+  // Specs share no server state (the backend is mocked per page), so CI runs
+  // them in parallel. Two workers, not '50%': at four, eight Firefox tests
+  // hit the 30s timeout on their first attempt.
+  workers: process.env.CI ? 2 : undefined,
+  reporter: [
+    ['list'],
+    ['html', { outputFolder: 'playwright-report', open: 'never' }],
+  ],
+  use: {
+    baseURL: 'http://localhost:3000',
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+  },
+  // chromium catches most real bugs; firefox/webkit exist to cover
+  // engine-divergent behavior (WebSocket reconnect, Clipboard API,
+  // CodeMirror/IME). All three run as the `playwright-tests` matrix in
+  // .github/workflows/docker-images.yml, once per PR against the merge commit,
+  // each selected explicitly via `--project` (issue #1551).
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'firefox',
+      use: { ...devices['Desktop Firefox'] },
+    },
+    {
+      name: 'webkit',
+      use: { ...devices['Desktop Safari'] },
+    },
+  ],
+  webServer: {
+    command: 'npm start',
+    url: 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,
+    timeout: 90_000,
+    env: {
+      BROWSER: 'none',
+    },
+  },
+});

@@ -1,0 +1,423 @@
+name: Publish Self-Hosted Image
+
+# This file does NOT run in this repository. promote-to-public.yml installs it
+# as .github/workflows/publish-self-hosted-image.yml in the public repository,
+# which is where it runs.
+#
+# Builds the self-hosted image from the public source of each release and
+# publishes it as ghcr.io/<this repository> - the image the docs, install.sh
+# and docker-compose.self-hosted.yml use:
+#
+#   base-images -> build-amd64 + build-arm64 (pushed by digest, untagged)
+#     -> merge (:sha-<commit>) -> verify (compose smoke test, /app/VERSION,
+#     Trivy) -> publish (provenance attestation, then :<tag> and :latest)
+#   test (backend pytest on the same tag) also gates publish.
+#
+# :<tag> and :latest only ever point at an image that passed every check. If a
+# run fails, the release has no :<tag> yet and :latest stays on the previous
+# release; fix the cause and run this again manually for the tag.
+#
+# The release is created from the release/<version> commit before its pull
+# request merges, so main can still be the previous release when this fires.
+# Every job builds the tag, never main.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. 1.13.0-beta.1). Choose the same tag under \"Use workflow from\" so the provenance records the tag's commit."
+        required: true
+        type: string
+      update_latest:
+        description: "Move :latest to this image once it passes verification"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-self-hosted-image-${{ github.event.release.tag_name || inputs.tag }}
+  # A cancelled run can leave a tag half-published.
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  base-images:
+    name: Base images
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/base-images.yml
+
+  test:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Run backend tests
+        working-directory: backend
+        env:
+          PYTHONPATH: .
+        run: pytest tests/ -q -n auto
+
+  build-amd64:
+    name: Build amd64
+    needs: base-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      # The frontend build and backup exports read VERSION, so an image whose
+      # VERSION is not its tag would report the wrong release.
+      - name: Check VERSION matches the release tag
+        id: source
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$version" != "$TAG" ]]; then
+            echo "::error::VERSION is '$version' but the release tag is '$TAG' - refusing to build."
+            exit 1
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push amd64 image (by digest, untagged)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile.self-hosted
+          platforms: linux/amd64
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            BUILD_DATE=${{ steps.source.outputs.commit }}
+          cache-from: type=gha,scope=self-hosted-amd64
+          cache-to: type=gha,mode=max,scope=self-hosted-amd64
+
+  build-arm64:
+    name: Build arm64
+    needs: base-images
+    # Native arm64, so nothing in the build is emulated.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Check VERSION matches the release tag
+        id: source
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$version" != "$TAG" ]]; then
+            echo "::error::VERSION is '$version' but the release tag is '$TAG' - refusing to build."
+            exit 1
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push arm64 image (by digest, untagged)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile.self-hosted
+          platforms: linux/arm64
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            BUILD_DATE=${{ steps.source.outputs.commit }}
+          cache-from: type=gha,scope=self-hosted-arm64
+          cache-to: type=gha,mode=max,scope=self-hosted-arm64
+
+  merge:
+    name: Merge amd64 + arm64 into a multi-arch manifest
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.verify.outputs.digest }}
+      sha_tag: ${{ steps.create.outputs.sha_tag }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only the commit tag here. :<tag> and :latest are added by publish, once
+      # this exact digest has passed verify and test.
+      - name: Create multi-arch manifest from amd64 + arm64 digests
+        id: create
+        env:
+          AMD64_DIGEST: ${{ needs.build-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.build-arm64.outputs.digest }}
+          AMD64_COMMIT: ${{ needs.build-amd64.outputs.commit }}
+          ARM64_COMMIT: ${{ needs.build-arm64.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [[ "$AMD64_COMMIT" != "$ARM64_COMMIT" ]]; then
+            echo "::error::amd64 built $AMD64_COMMIT but arm64 built $ARM64_COMMIT."
+            exit 1
+          fi
+          sha_tag="sha-${AMD64_COMMIT:0:7}"
+          docker buildx imagetools create --tag "$IMAGE:$sha_tag" \
+            "$IMAGE@$AMD64_DIGEST" \
+            "$IMAGE@$ARM64_DIGEST"
+          echo "sha_tag=$sha_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Verify multi-arch manifest
+        id: verify
+        env:
+          SHA_TAG: ${{ steps.create.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          inspect_output="$(docker buildx imagetools inspect "$IMAGE:$SHA_TAG")"
+          echo "$inspect_output"
+          echo "$inspect_output" | grep -q 'linux/amd64'
+          echo "$inspect_output" | grep -q 'linux/arm64'
+          # The nested per-arch manifests carry indented "Digest:" lines, so the
+          # ^ anchor picks the manifest list's own digest.
+          digest="$(awk '/^Digest:/{print $2; exit}' <<< "$inspect_output")"
+          if [[ -z "$digest" ]]; then
+            echo "::error::Could not read the manifest-list digest out of imagetools inspect."
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Smoke test and scan
+    needs: merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    env:
+      # Only the tag: the compose file's default image name is under test too.
+      ACTIONS_MANAGER_TAG: ${{ needs.merge.outputs.sha_tag }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Seed .env.self-hosted
+        run: |
+          cat > .env.self-hosted <<'EOF'
+          INSTALLATION_MODE=self-hosted
+          ENVIRONMENT=development
+          GITHUB_CLIENT_ID=ci-smoke-test-client-id
+          GITHUB_CLIENT_SECRET=ci-smoke-test-client-secret
+          ADMIN_USERNAME=ci-admin
+          ADMIN_PASSWORD=Ci-Smoke-Test-Admin-Password-1234
+          SECRET_KEY=00000000000000000000000000000000ci-smoke-test-secret-key-do-not-use
+          REACT_APP_BACKEND_URL=http://localhost:8080
+          REACT_APP_FRONTEND_URL=http://localhost:8080
+          REACT_APP_WEBSOCKET_URL=ws://localhost:8080/ws
+          EOF
+
+      - name: Pull and start the documented compose flow
+        run: |
+          docker compose -f docker-compose.self-hosted.yml pull
+          docker compose -f docker-compose.self-hosted.yml up -d
+
+      - name: Wait for HTTP 200 on http://localhost:8080/healthz
+        run: |
+          set -e
+          for attempt in $(seq 1 60); do
+            if curl -fsS --max-time 5 http://localhost:8080/healthz >/dev/null; then
+              echo "Release image healthy after ${attempt} attempts"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "::error::Release image did not become healthy within 5 minutes"
+          docker compose -f docker-compose.self-hosted.yml ps
+          docker compose -f docker-compose.self-hosted.yml logs --tail=200
+          exit 1
+
+      - name: Check the running image reports the release version
+        run: |
+          set -euo pipefail
+          reported="$(docker compose -f docker-compose.self-hosted.yml exec -T app cat /app/VERSION | tr -d '[:space:]')"
+          if [[ "$reported" != "$TAG" ]]; then
+            echo "::error::The image's /app/VERSION is '$reported', expected '$TAG'."
+            exit 1
+          fi
+          echo "/app/VERSION is $reported"
+
+      # Scans linux/amd64; both platforms install the same Debian package
+      # versions from the same base image build.
+      - name: Scan for fixable CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ needs.merge.outputs.digest }}
+          scanners: 'vuln'
+          severity: 'CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+          format: 'table'
+          output: 'trivy-results.txt'
+
+      - name: Show scan results
+        if: always()
+        run: cat trivy-results.txt 2>/dev/null || echo "No scan results were written."
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-self-hosted-results
+          path: trivy-results.txt
+          retention-days: 90
+          if-no-files-found: warn
+
+  publish:
+    name: Attest and tag
+    needs: [merge, verify, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ needs.merge.outputs.digest }}
+          push-to-registry: true
+          # A storage record needs the artifact-metadata permission and adds
+          # nothing the attestation does not already prove.
+          create-storage-record: false
+
+      - name: Tag the verified image
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+          UPDATE_LATEST: ${{ github.event_name == 'release' || inputs.update_latest }}
+        run: |
+          set -euo pipefail
+          tags=("$TAG")
+          if [[ "$UPDATE_LATEST" == "true" ]]; then
+            tags+=("latest")
+          fi
+          for tag in "${tags[@]}"; do
+            docker buildx imagetools create --tag "$IMAGE:$tag" "$IMAGE@$DIGEST"
+            # The tag must name the digest that was tested, scanned and attested.
+            tagged="$(docker buildx imagetools inspect "$IMAGE:$tag" | awk '/^Digest:/{print $2; exit}')"
+            if [[ "$tagged" != "$DIGEST" ]]; then
+              echo "::error::$IMAGE:$tag is $tagged, expected the verified $DIGEST."
+              exit 1
+            fi
+            echo "$IMAGE:$tag -> $DIGEST"
+          done
+
+      - name: Summary
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+          SHA_TAG: ${{ needs.merge.outputs.sha_tag }}
+          UPDATE_LATEST: ${{ github.event_name == 'release' || inputs.update_latest }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          tags="\`$TAG\`, \`$SHA_TAG\`"
+          if [[ "$UPDATE_LATEST" == "true" ]]; then
+            tags="$tags, \`latest\`"
+          fi
+          {
+            echo "### Published $IMAGE:$TAG"
+            echo ""
+            echo "- **Digest:** \`$DIGEST\`"
+            echo "- **Tags:** $tags"
+            echo "- **Provenance:** $ATTESTATION_URL"
+            echo ""
+            echo "Verify with: \`gh attestation verify oci://$IMAGE:$TAG --repo $GITHUB_REPOSITORY\`"
+          } >> "$GITHUB_STEP_SUMMARY"

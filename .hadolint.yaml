@@ -1,0 +1,21 @@
+# hadolint configuration
+#
+# Anything warning-or-above fails the lint (failure-threshold below).
+# Suppressions belong here, with a reason.
+
+ignored:
+  # DL3007 "Using latest is prone to errors ... pin to a release tag".
+  #
+  # Deliberate, not an oversight. The Dockerfiles build FROM
+  # ghcr.io/greywolflabs/actions-manager/base-{backend,frontend}:latest, and that
+  # tag is mutable on purpose: the base images are rebuilt and republished
+  # weekly and immediately on a CVE fix, so downstream builds pick the patch up
+  # without a commit here. Pinning would strand the images on whatever digest
+  # was current when the pin was written - the opposite of what the base-image
+  # pipeline exists to do.
+  #
+  # The staleness risk hadolint is warning about is handled instead by building
+  # with --pull, so a build host never reuses a locally cached base layer.
+  - DL3007
+
+failure-threshold: warning

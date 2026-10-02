@@ -1,0 +1,12 @@
+.git
+docs
+backend/**/__pycache__
+backend/**/*.pyc
+backend/.pytest_cache
+backend/tests
+backend/*.db
+frontend/node_modules
+frontend/dist
+# Cloud-only files. Only Dockerfile.self-hosted builds with this context, and
+# a file excluded here never reaches a layer; a `RUN rm` would only hide it.
+backend/cloud

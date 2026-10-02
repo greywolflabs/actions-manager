@@ -1,0 +1,981 @@
+"""
+Database Models for ActionsManager
+
+Defines SQLAlchemy models for:
+- Account: User accounts with GitHub OAuth
+- WorkspaceMember: Application/workspace membership and roles
+- Project: Project containers for organizing repositories
+- Repo: GitHub repositories
+- Workflow: GitHub Actions workflows
+- ProjectWorkflow: Many-to-many relationship between projects and workflows
+- ProjectRepo: Many-to-many relationship between projects and repositories
+"""
+
+import json
+import secrets
+import string
+from sqlalchemy import BigInteger, Column, Index, Integer, String, DateTime, ForeignKey, Boolean, UniqueConstraint, Text
+from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship, validates
+from database import Base
+
+_FK_ACCOUNTS_USER_ID = "accounts.user_id"
+_FK_REPOS_REPO_ID = "repos.repo_id"
+_FK_WORKFLOWS_WORKFLOW_ID = "workflows.workflow_id"
+_FK_PROJECTS_PROJECT_ID = "projects.project_id"
+_ON_DELETE_SET_NULL = "SET NULL"
+
+
+def generate_random_id():
+    """Generate a random 4-character project code"""
+    return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+
+
+def generate_project_key_from_name(project_name):
+    """Generate a project key from project name using first letters of words"""
+    if not project_name or not project_name.strip():
+        return generate_random_id()
+    
+    # Remove special characters and split into words (only alphabetic words)
+    import re
+    words = re.findall(r'\b[A-Za-z]+\b', project_name.upper())
+    
+    if not words:
+        return generate_random_id()
+    
+    # For single word, take first 3 characters (or less if word is shorter)
+    if len(words) == 1:
+        word = words[0]
+        key = word[:3] if len(word) >= 3 else word
+    else:
+        # Multiple words: use first letter of each word (up to 6 letters)
+        # This creates abbreviations like "My Cool Project" -> "MCP"
+        key = ''.join(word[0] for word in words[:6])
+    
+    # If resulting key is too short (less than 2 chars), fallback to random
+    if len(key) < 2:
+        return generate_random_id()
+    
+    return key
+
+
+# Reserved github_user for the internal account that owns seeded rows nobody
+# authored (the default Actions Projects catalog). It is not a person: it can't
+# log in, must never hold a workspace role, and must never be counted when
+# deciding who the workspace admin is. Matched on the reserved name rather than
+# account_type, which is really the billing plan column.
+SEED_ACCOUNT_GITHUB_USER = "__actionsmanager_seed__"
+
+
+class Account(Base):
+    """User accounts table with GitHub OAuth integration"""
+    __tablename__ = "accounts"
+
+    user_id = Column(Integer, primary_key=True, index=True)
+    github_user = Column(String(255), unique=True, nullable=False)
+    github_email = Column(String(255), unique=True, nullable=False)
+    account_type = Column(String(50), nullable=False)  # billing plan: free, pro, enterprise
+    github_account_type = Column(String(20), nullable=True, default="User")  # GitHub account type: User or Organization
+    connected_github_account = Column(String(255), nullable=True)  # GitHub App installation account login
+    connected_github_account_type = Column(String(20), nullable=True)  # GitHub App installation account type: User or Organization
+    avatar_url = Column(String, nullable=True)
+    last_login_at = Column(DateTime, nullable=True)  # Track last login timestamp
+    last_login_ip = Column(String(45), nullable=True)  # Track last login IP address (45 chars for IPv6)
+    github_api_calls = Column(Integer, default=0, nullable=False)  # Track total GitHub API calls made by this user
+    github_api_calls_today = Column(Integer, default=0, nullable=False)  # Track API calls in last 24 hours
+    api_calls_reset_at = Column(DateTime, nullable=True)  # Timestamp of last daily counter reset
+
+    # Marketplace billing metadata
+    marketplace_account_id = Column(Integer, nullable=True)  # GitHub Marketplace account ID
+    marketplace_plan = Column(String(50), nullable=True)  # Current marketplace plan name
+    marketplace_unit_count = Column(Integer, nullable=True)  # Number of units purchased
+    marketplace_on_free_trial = Column(Boolean, default=False)  # Free trial status
+    marketplace_next_billing_date = Column(DateTime, nullable=True)  # Next billing date
+    marketplace_updated_at = Column(DateTime, nullable=True)  # Last marketplace update timestamp
+
+    # Admin override for tier management
+    admin_override = Column(Boolean, default=False, nullable=False)  # Whether tier is manually overridden by admin
+    admin_override_until = Column(DateTime, nullable=True)  # When admin override expires (None = indefinite)
+
+    # GitHub permission tracking
+    github_permission_status = Column(String(50), nullable=True)  # Permission validation status: valid, missing_scopes, etc.
+    github_permission_checked_at = Column(DateTime, nullable=True)  # Last time permissions were checked
+    github_pat_token_encrypted = Column(Text, nullable=True)  # Encrypted personal access token / alternate GitHub token
+    github_pat_token_type = Column(String(50), nullable=True)  # oauth_token, classic_pat, fine_grained_pat
+    github_pat_status = Column(String(50), nullable=True)  # PAT validation status for UI feedback
+    github_pat_last_error = Column(Text, nullable=True)  # Last PAT validation error shown in UI
+    github_pat_checked_at = Column(DateTime, nullable=True)  # Last PAT validation timestamp
+    github_pat_updated_at = Column(DateTime, nullable=True)  # Last PAT save / replace timestamp
+
+    # First-login onboarding (welcome screen + guided tour).
+    # Set on finish AND on dismiss, so NULL means "never shown" rather than
+    # "not finished" — otherwise a user who skips the tour is prompted forever.
+    onboarding_completed_at = Column(DateTime, nullable=True)
+    onboarding_step = Column(String(40), nullable=True)  # Furthest tour step reached, for resume
+
+    projects = relationship("Project", back_populates="user")
+    workspace_membership = relationship("WorkspaceMember", back_populates="user", uselist=False)
+    actions_projects = relationship("ActionsProject", back_populates="user")
+
+
+class WorkspaceMember(Base):
+    """
+    Workspace/application membership for multi-user support.
+    
+    Tracks which users belong to the Actions Manager workspace and their role.
+    Roles:
+      - admin: Full management access (original owner)
+      - member: Sees every project in the workspace; edits the ones a
+        ProjectMembership row grants them project_editor on
+      - read_only: Sees only explicitly granted projects, and never writes
+        (WriteProtectionMiddleware refuses non-safe methods outright)
+    
+    Designed so project-level permissions can be added cleanly in Phase 2
+    via a separate ProjectMemberPermission table referencing this membership.
+    """
+    __tablename__ = "workspace_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey(_FK_ACCOUNTS_USER_ID, ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    workspace_role = Column(String(20), nullable=False, default="read_only")  # admin, member, read_only
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship("Account", back_populates="workspace_membership")
+
+
+class AuthSession(Base):
+    """Opaque server-side login sessions keyed by a hashed session token."""
+    __tablename__ = "auth_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)
+    github_user = Column(String(255), nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+
+class Repo(Base):
+    """GitHub repositories table"""
+    __tablename__ = "repos"
+
+    repo_id = Column(Integer, primary_key=True, index=True)
+    repo_name = Column(String(255), unique=True, nullable=False)
+
+
+class Workflow(Base):
+    """GitHub Actions workflows table"""
+    __tablename__ = "workflows"
+
+    workflow_id = Column(Integer, primary_key=True, index=True)
+    workflow_name = Column(String(255), nullable=False)
+    workflow_yaml = Column(String, nullable=False)
+    workflow_git_hash = Column(String(255), nullable=True)
+    reusable_workflow = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    
+    workflow_status = Column(String(30), nullable=False, default="new")  # Workflow lifecycle status: new, committed_locally, under_review, synced_with_github
+
+    # Marks the workflow for removal from GitHub on the next delivery, the way
+    # CustomFile.pending_delete does. The row is deleted once the campaign that
+    # carries the removal merges.
+    pending_delete = Column(Boolean, nullable=False, default=False)
+
+    # The name this workflow was last delivered to GitHub under, set when a
+    # rename happens on a workflow that was already delivered. A rename in Git
+    # is a remove plus an add, so delivery needs both halves: without this the
+    # old name is gone the moment workflow_name is reassigned, and the file sits
+    # in every repository under a name nothing tracks.
+    #
+    # Held until the campaign carrying the rename MERGES, not until it is
+    # committed. A campaign that is closed unmerged leaves the old file on
+    # GitHub, so the next one still has to remove it — which is why
+    # _cancel_pending_deletes has no counterpart here.
+    renamed_from = Column(String(255), nullable=True)
+
+    # Audit: track who last modified this workflow
+    last_modified_by = Column(String(255), nullable=True)  # GitHub username of last editor
+
+    # Remove unique constraints - allow multiple workflows with same name across projects
+    
+    # Relationship to versions
+    versions = relationship("WorkflowVersion", back_populates="workflow", cascade="all, delete-orphan", order_by="desc(WorkflowVersion.version_number)")
+
+
+class WorkflowVersion(Base):
+    """Version history for workflows - tracks all saved versions"""
+    __tablename__ = "workflow_versions"
+
+    version_id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(Integer, ForeignKey(_FK_WORKFLOWS_WORKFLOW_ID, ondelete="CASCADE"), nullable=False, index=True)
+    version_number = Column(Integer, nullable=False)  # Auto-incremented version number per workflow
+    content = Column(Text, nullable=False)  # Workflow YAML content at this version
+    version_metadata = Column(Text, nullable=True)  # JSON metadata: author, session info, etc.
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    
+    # Relationship to parent workflow
+    workflow = relationship("Workflow", back_populates="versions")
+    
+    # Ensure version numbers are unique per workflow
+    __table_args__ = (
+        UniqueConstraint('workflow_id', 'version_number', name='uix_workflow_version'),
+    )
+
+
+class Project(Base):
+    """Projects table for organizing repositories and workflows"""
+    __tablename__ = "projects"
+
+    project_id = Column(Integer, primary_key=True, index=True)  
+    project_code = Column(String(10), unique=True, default=generate_random_id)
+    project_name = Column(String(255), nullable=False)  
+    user_id = Column(Integer, ForeignKey(_FK_ACCOUNTS_USER_ID, ondelete="CASCADE"), nullable=False)  
+    branch_regex = Column(String(255), nullable=True) 
+    branch_option = Column(String(50), nullable=True, default="default")  # default, pattern
+    branch_max_age_days = Column(Integer, nullable=True, default=30)  # Filter branches by recency (1-30 days)
+    reusable_workflows_enabled = Column(Boolean, default=False, nullable=False)  # Per-project reusable workflow setting
+    use_prefix = Column(Boolean, default=True, nullable=False)  # Whether to use AM_{PROJECT_CODE}_ prefix for resources
+    pr_state = Column(String(20), nullable=False, default="new")  # Project state: new, draft, open, synced
+    project_type = Column(String(20), nullable=False, default="standard")  # Project type: standard, rwx
+    repository_visibility_scope = Column(String(10), nullable=False, default="public")  # Project repository visibility scope: public, private
+    project_color = Column(String(20), nullable=True)  # Project identity color key (blue, purple, etc.)
+    validation_repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete=_ON_DELETE_SET_NULL), nullable=True)
+    preflight_required = Column(Boolean, default=False, nullable=False)
+    last_preflight_status = Column(String(40), nullable=True)
+    last_preflight_run_at = Column(DateTime, nullable=True)
+    last_preflight_error = Column(String(500), nullable=True)
+    last_preflight_pr_url = Column(String(500), nullable=True)
+    last_preflight_content_hash = Column(String(64), nullable=True)
+    drift_status = Column(String(20), nullable=False, default="unknown")  # unknown, clean, drifted, check_failed
+    drift_count = Column(Integer, nullable=False, default=0)
+    last_drift_check_at = Column(DateTime, nullable=True)
+    drift_error_summary = Column(String(500), nullable=True)
+    drift_check_failure_count = Column(Integer, nullable=False, default=0)  # Consecutive check_failed results, for sweep backoff; reset on clean/drifted
+    # NULL = inherit the workspace default, 0 = never sweep this project, N = every N minutes.
+    # ponytail: one column rather than an enabled flag plus an interval, so there is no
+    # contradictory "disabled but every 30 minutes" state to validate against.
+    drift_check_interval_minutes = Column(Integer, nullable=True)
+    # Build-metrics sync cursor. Kept here rather than derived from workflow_runs
+    # because a project with no runs yet has no row to read a timestamp from, and
+    # would re-hit GitHub on every panel open.
+    last_run_sync_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now()) 
+
+    # Audit: track who last modified this project
+    last_modified_by = Column(String(255), nullable=True)  # GitHub username of last editor
+
+    user = relationship("Account", back_populates="projects")
+
+
+class ActionsProject(Base):
+    """A single custom GitHub Action imported from a repo's actions.yaml.
+
+    Unlike Project (standard/rwx), this has no branch/PR/drift state — it's
+    just a saved reference to an action plus its editable default inputs.
+    """
+    __tablename__ = "actions_projects"
+
+    actions_project_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey(_FK_ACCOUNTS_USER_ID, ondelete="CASCADE"), nullable=False)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    source_url = Column(String(500), nullable=False)  # Original pasted GitHub URL
+    owner = Column(String(255), nullable=False)
+    repo = Column(String(255), nullable=False)
+    ref = Column(String(255), nullable=False)  # branch, tag, or commit SHA
+    yaml_path = Column(String(500), nullable=False, default="actions.yaml")
+    inputs_json = Column(Text, nullable=False, default="[]")  # JSON list of {name, description, required, default}
+    branding_icon = Column(String(50), nullable=True)  # Feather icon name from action.yml branding
+    branding_color = Column(String(20), nullable=True)  # GitHub's fixed branding color enum
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    last_modified_by = Column(String(255), nullable=True)  # GitHub username of last editor
+
+    user = relationship("Account", back_populates="actions_projects")
+
+
+class SeededActionsCatalogEntry(Base):
+    """Records that a default Actions Project was once offered to this install.
+
+    Seeding is deliberately one-shot: a default the user deletes must never come
+    back on restart. The seed account's existence covers the batch that shipped
+    with the original seed migration, but a default added to SEED_ACTIONS in a
+    later release needs its own marker - without one it either never reaches an
+    install that is already seeded, or it reappears after every deletion.
+
+    One row per ``owner/repo`` slug, written when the entry is offered and never
+    removed. Deleting the ActionsProject row does not delete the marker; that is
+    the whole point.
+    """
+    __tablename__ = "seeded_actions_catalog_entries"
+
+    slug = Column(String(511), primary_key=True)
+    seeded_at = Column(DateTime, default=func.now())
+
+
+class ActionGroup(Base):
+    """A user-created, shared, workspace-wide label for organizing ActionsProjects."""
+    __tablename__ = "action_groups"
+
+    action_group_id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    last_modified_by = Column(String(255), nullable=True)  # GitHub username of last editor
+
+
+class ActionGroupMembership(Base):
+    """Many-to-many relationship table between ActionGroups and ActionsProjects"""
+    __tablename__ = "action_group_memberships"
+
+    action_group_id = Column(Integer, ForeignKey("action_groups.action_group_id", ondelete="CASCADE"), primary_key=True)
+    actions_project_id = Column(Integer, ForeignKey("actions_projects.actions_project_id", ondelete="CASCADE"), primary_key=True)
+
+
+class ProjectWorkflow(Base):
+    """Association between a Project and its Workflows.
+
+    Despite the composite key, this is **one project per workflow**: a Workflow
+    row belongs to exactly one Project, enforced by the unique index below.
+    Every code path that creates an association also creates a fresh Workflow,
+    so sharing was never reachable — the index makes that explicit rather than
+    incidental, and stops one project's changes reaching another's row.
+
+    Reusable workflows are shared through ``LinkedReusableWorkflow`` instead,
+    which does not create an association here for the borrowing project.
+    """
+    __tablename__ = "project_workflows"
+
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), primary_key=True)
+    workflow_id = Column(Integer, ForeignKey(_FK_WORKFLOWS_WORKFLOW_ID, ondelete="CASCADE"), primary_key=True)
+
+    # A unique *index* rather than a UniqueConstraint: SQLite cannot add a
+    # constraint to an existing table, so a constraint would force a full table
+    # rebuild on upgrade, while CREATE UNIQUE INDEX works on both backends.
+    __table_args__ = (
+        Index("uq_project_workflows_workflow_id", "workflow_id", unique=True),
+    )
+
+
+class ProjectRepo(Base):
+    """Many-to-many relationship table between Projects and Repositories.
+
+    Also stores optional per-repository branch configuration overrides for
+    multi-repository projects. When ``branch_config_mode`` is ``"inherit"``
+    (the default), the project-level branch settings are used for this
+    repository. When set to ``"override"``, the override columns on this
+    row take precedence for any GitHub read/write that targets this repo.
+    """
+    __tablename__ = "project_repos"
+
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), primary_key=True)
+    repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete="CASCADE"), primary_key=True)
+
+    # Per-repository branch configuration overrides. All nullable so
+    # existing rows continue to behave as "inherit project settings".
+    branch_config_mode = Column(String(20), nullable=False, default="inherit")  # "inherit" | "override"
+    branch_option = Column(String(50), nullable=True)  # "default" | "pattern"
+    branch_regex = Column(String(255), nullable=True)
+    branch_max_age_days = Column(Integer, nullable=True)
+
+
+class Ruleset(Base):
+    """GitHub repository rulesets table"""
+    __tablename__ = "rulesets"
+
+    ruleset_id = Column(Integer, primary_key=True, index=True)
+    ruleset_name = Column(String(255), nullable=False)
+    ruleset_json = Column(String, nullable=False)  # JSON data of the ruleset
+    description = Column(String(500), nullable=True)
+    user_id = Column(Integer, ForeignKey(_FK_ACCOUNTS_USER_ID, ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship("Account")
+
+
+class ProjectRuleset(Base):
+    """Many-to-many relationship table between Projects and Rulesets"""
+    __tablename__ = "project_rulesets"
+
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), primary_key=True)
+    ruleset_id = Column(Integer, ForeignKey("rulesets.ruleset_id", ondelete="CASCADE"), primary_key=True)
+
+
+class ProjectPRCampaign(Base):
+    """PR campaigns table — one row per PR campaign creation run.
+
+    Each time a user opens a PR campaign, a new unique campaign record is
+    created so newly-created PRs never get appended to a previous campaign.
+    PR rows reference their campaign via ProjectPullRequest.campaign_id.
+    """
+    __tablename__ = "project_pr_campaigns"
+
+    campaign_id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    created_by = Column(String(255), nullable=True)  # GitHub login of the user who opened the campaign
+    created_at = Column(DateTime, default=func.now())
+    # Last computed campaign_status (open/completed/partially_completed/cancelled), used to
+    # detect the one-time open -> terminal transition for campaign.completed notifications.
+    # campaign_status itself is otherwise computed live on every read, never persisted.
+    last_known_status = Column(String(20), nullable=False, default="open")
+
+    # User-chosen name and description, set when the campaign is created.
+    # NULL falls back to the name derived from the campaign's PR rows, which is
+    # how every campaign was named before this existed. Deliberately outside the
+    # snapshot guard below: these describe how the user files the campaign, not
+    # what went out, so renaming later is a legitimate change.
+    campaign_name = Column(Text, nullable=True)
+    campaign_description = Column(Text, nullable=True)
+
+    # Creation-time snapshot (JSON strings). Everything else about a campaign is
+    # derived live from the surviving PR rows, so without these a campaign silently
+    # re-reads against today's repo list, branch heads and workflow content.
+    # Nullable: campaigns created before this existed keep NULL and fall back to
+    # the derived-only rendering.
+    target_repos = Column(Text, nullable=True)     # ["owner/repo", ...] resolved targets, incl. repos that produced no PR
+    base_commits = Column(Text, nullable=True)     # {"owner/repo on main": "<sha>"} — null value where the SHA was unknown
+    policy_version = Column(Text, nullable=True)   # {"ci.yml": {"version": 7, "sha256": "..."}}
+    # {"owner/repo on main": {"status": "protected"|"none"|"unknown", ...}} — "none" and
+    # "unknown" are deliberately distinct: no protection configured is not the same fact
+    # as a token that could not read the protection settings.
+    branch_protection = Column(Text, nullable=True)
+    # {"owner/repo on main": "https://github.com/.../pull/42"}. Append-only rather than
+    # frozen: the CODEOWNERS deploy path creates the campaign before it opens the PR,
+    # so an empty slot is filled once, at the point the PR is created.
+    target_pr_urls = Column(Text, nullable=True)
+
+    # Set only on a rollback campaign — the campaign whose merged changes this one
+    # reverts, and what the user chose to happen to ActionsManager's own stored copy
+    # once the rollback merges: "revert" adopts what is then on GitHub, "keep" holds
+    # the ActionsManager version and lets drift report the divergence. Deliberately
+    # outside the snapshot guard below only because they are never written after
+    # construction anyway; nothing updates them.
+    rollback_of_campaign_id = Column(
+        Integer, ForeignKey("project_pr_campaigns.campaign_id", ondelete=_ON_DELETE_SET_NULL), nullable=True
+    )
+    rollback_am_action = Column(String(20), nullable=True)
+
+    _SNAPSHOT_FIELDS = ("target_repos", "base_commits", "policy_version", "branch_protection")
+
+    @validates(*_SNAPSHOT_FIELDS)
+    def _reject_snapshot_mutation(self, key, value):
+        # campaign_id is only populated once the row has been flushed, so this
+        # allows the constructor and rejects every later write.
+        if self.campaign_id is not None:
+            raise ValueError(
+                f"{key} is a creation-time snapshot and cannot be changed after the "
+                "campaign exists — create a new campaign instead."
+            )
+        return value
+
+    @validates("target_pr_urls")
+    def _reject_pr_url_assignment(self, key, value):
+        # Append-only rather than frozen, so record_pr_url is the single writer
+        # once the row exists — it sets the flag below after enforcing the rule.
+        if self.campaign_id is not None and not self.__dict__.get("_recording_pr_url"):
+            raise ValueError(
+                "target_pr_urls is append-only after the campaign exists — "
+                "use record_pr_url() to fill an empty slot."
+            )
+        return value
+
+    def record_pr_url(self, target_key: str, pr_url: str) -> None:
+        """Fill in the PR URL for a target that did not have one yet.
+
+        Raises if the target already recorded a URL — which PR a campaign opened
+        against a target is decided once, and silently overwriting it would lose
+        the record of what actually went out.
+        """
+        recorded = json.loads(self.target_pr_urls) if self.target_pr_urls else {}
+        if recorded.get(target_key):
+            raise ValueError(
+                f"{target_key} already recorded PR {recorded[target_key]} for this campaign."
+            )
+        recorded[target_key] = pr_url
+        self.__dict__["_recording_pr_url"] = True
+        try:
+            self.target_pr_urls = json.dumps(recorded)
+        finally:
+            self.__dict__.pop("_recording_pr_url", None)
+
+
+class ProjectPullRequest(Base):
+    """Pull requests table for tracking PRs created by Actions Manager"""
+    __tablename__ = "project_pull_requests"
+
+    pr_id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    # Campaign this PR row belongs to. Nullable so legacy rows created before
+    # campaign tracking remain valid (they are grouped heuristically instead).
+    campaign_id = Column(Integer, ForeignKey("project_pr_campaigns.campaign_id", ondelete=_ON_DELETE_SET_NULL), nullable=True, index=True)
+    repo_name = Column(String(255), nullable=False)  # Full repository name (owner/repo)
+    pr_number = Column(Integer, nullable=False)  # GitHub PR number
+    pr_url = Column(String(500), nullable=False)  # GitHub PR URL
+    pr_state = Column(String(20), nullable=False, default="open")  # PR state: open, merged, closed
+    branch_name = Column(String(255), nullable=False)  # Actions Manager branch name
+    target_branch = Column(String(255), nullable=False)  # Target/base branch name
+    # Extended fields for PR history display
+    title = Column(String(500), nullable=True)  # PR title from GitHub
+    author = Column(String(255), nullable=True)  # PR author login from GitHub
+    body = Column(String, nullable=True)  # PR description/body from GitHub
+    merged_at = Column(DateTime, nullable=True)  # When the PR was merged
+    closed_at = Column(DateTime, nullable=True)  # When the PR was closed (without merge)
+    workflow_names = Column(String, nullable=True)  # Comma-separated list of associated workflow names
+    file_names = Column(String, nullable=True)  # Comma-separated list of custom file paths + CODEOWNERS committed in this PR
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # Add composite unique constraint to prevent duplicate entries
+    __table_args__ = (UniqueConstraint('project_id', 'repo_name', 'branch_name', 'target_branch', 
+                                       name='uq_project_pr_branch_target'),)
+
+
+class ProjectSecret(Base):
+    """
+    Stores secret names (NOT values) for projects without prefix.
+    Only used when project.use_prefix = False.
+    Values remain secure in GitHub; only names are tracked locally.
+    """
+    __tablename__ = "project_secrets"
+
+    secret_id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    secret_name = Column(String(255), nullable=False)  # Secret name without prefix (e.g., "DATABASE_PASSWORD")
+    created_at = Column(DateTime, default=func.now())
+
+    # Ensure unique secret names per project
+    __table_args__ = (UniqueConstraint('project_id', 'secret_name', name='uq_project_secret_name'),)
+
+
+class ProjectEnvVar(Base):
+    """
+    Stores environment variable names (NOT values) for projects without prefix.
+    Only used when project.use_prefix = False.
+    Values remain in GitHub; only names are tracked locally.
+    """
+    __tablename__ = "project_env_vars"
+
+    env_var_id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    env_var_name = Column(String(255), nullable=False)  # Env var name without prefix (e.g., "DEBUG_MODE")
+    created_at = Column(DateTime, default=func.now())
+
+    # Ensure unique env var names per project
+    __table_args__ = (UniqueConstraint('project_id', 'env_var_name', name='uq_project_env_var_name'),)
+
+
+class ProjectMembership(Base):
+    """
+    Project-level access control for non-admin users.
+
+    Grants a workspace member access to a specific project with a role:
+      - project_editor: can edit workflows, create PRs, manage project config
+      - project_viewer: read-only access to the project
+
+    Admins bypass this table and have implicit full access to all projects.
+
+    For a ``member``, this table grants *write* access: they already see every
+    project in the workspace as a viewer, and a row here raises them to
+    project_editor on one of them. For a ``read_only`` member it is the only way
+    in at all - without a row they see nothing, and the middleware refuses their
+    writes regardless of what a row says.
+
+    Designed for future extensibility (e.g. teams, additional roles).
+    """
+    __tablename__ = "project_memberships"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey(_FK_ACCOUNTS_USER_ID, ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    project_role = Column(String(30), nullable=False, default="project_viewer")  # project_editor, project_viewer
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # Each user can only have one membership per project
+    __table_args__ = (
+        UniqueConstraint('user_id', 'project_id', name='uq_user_project_membership'),
+    )
+
+    user = relationship("Account")
+    project = relationship("Project")
+
+
+class ProjectDisplayOrder(Base):
+    """
+    Per-user ordering of project cards on the Projects grid (issue #1804).
+
+    The grid used to sort by projects.updated_at, so opening or editing a
+    project jumped it to the front. Position is stored per user rather than on
+    the project so one user's arrangement never changes anyone else's view, and
+    reordering never touches projects.updated_at.
+    """
+    __tablename__ = "project_display_order"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey(_FK_ACCOUNTS_USER_ID, ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    position = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # Each user can only have one position per project
+    __table_args__ = (
+        UniqueConstraint('user_id', 'project_id', name='uq_user_project_display_order'),
+    )
+
+    user = relationship("Account")
+    project = relationship("Project")
+
+
+class Codeowners(Base):
+    """
+    CODEOWNERS file management table.
+
+    Stores the locally-managed CODEOWNERS content for a repository within a
+    project, mirroring how workflows are tracked.  The ``git_hash`` field
+    captures the GitHub blob SHA from the last successful sync so drift can
+    be detected efficiently against the live GitHub copy.
+
+    The ``status`` lifecycle mirrors the workflow status field:
+        - ``new``                  – first save, never deployed
+        - ``committed_locally``    – local edits not yet pushed to GitHub
+        - ``under_review``         – PR opened against the target branch
+        - ``synced_with_github``   – local content matches GitHub
+    """
+    __tablename__ = "codeowners"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete="CASCADE"), nullable=False, index=True)
+    content = Column(Text, nullable=False, default="")
+    file_path = Column(String(64), nullable=False, default=".github/CODEOWNERS")  # .github/CODEOWNERS or CODEOWNERS
+    git_hash = Column(String(255), nullable=True)
+    status = Column(String(30), nullable=False, default="new")
+    last_modified_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # Each repo within a project has at most one CODEOWNERS draft
+    __table_args__ = (
+        UniqueConstraint('project_id', 'repo_id', name='uq_codeowners_project_repo'),
+    )
+
+
+class CustomFile(Base):
+    """
+    Project-level custom file management table.
+
+    Stores workflow-adjacent text files (scripts, config files, action
+    definitions, etc.) that belong to a project and are deployed to every
+    repository in that project alongside workflow YAML files.
+
+    The ``file_status`` lifecycle mirrors the workflow status field:
+        - ``new``                  – just created, never synced to GitHub
+        - ``committed_locally``    – local edits not yet pushed to GitHub
+        - ``under_review``         – included in an open PR Campaign
+        - ``synced_with_github``   – content matches the GitHub target branch
+
+    ``pending_delete`` marks a file for deletion on next PR/direct delivery.
+    The row is hard-deleted after successful removal from GitHub.
+    """
+    __tablename__ = "custom_files"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False)
+    display_name = Column(String(255), nullable=True)
+    file_path = Column(String(500), nullable=False)
+    file_content = Column(Text, nullable=False, default="")
+    git_hash = Column(String(255), nullable=True)
+    file_status = Column(String(30), nullable=False, default="new")
+    pending_delete = Column(Boolean, nullable=False, default=False)
+    last_modified_by = Column(String(255), nullable=True)
+    description = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('project_id', 'file_path', name='uq_custom_file_project_path'),
+        Index('ix_custom_files_project_id', 'project_id'),
+    )
+
+
+class RepoWorkflowOverride(Base):
+    """
+    Per-repository workflow override.
+
+    Allows a single repository within a project to use a different version of a
+    project workflow than the shared project-level workflow.  This is the
+    foundation of the scope-aware drift resolution flow: when a user resolves
+    drift in a single repo, they can either (a) adopt the GitHub version into
+    the project (and sync the other repos), (b) adopt locally only, or
+    (c) create a per-repo override so this repo can intentionally diverge from
+    the project default without re-triggering drift on every detection cycle.
+
+    Drift detection consults this table first: if an override exists for
+    (project, repo, workflow) the override's YAML/hash is compared against
+    GitHub instead of the shared project workflow.
+
+    A row in this table does NOT replace the underlying ``Workflow``; it simply
+    captures a divergent expected content/hash for a single repo.  Removing
+    the override row reverts the repo back to comparing against the shared
+    project workflow.
+    """
+    __tablename__ = "repo_workflow_overrides"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete="CASCADE"), nullable=False, index=True)
+    workflow_id = Column(Integer, ForeignKey(_FK_WORKFLOWS_WORKFLOW_ID, ondelete="CASCADE"), nullable=False, index=True)
+    workflow_name = Column(String(255), nullable=False)  # Snapshot of the workflow_name at override creation
+    workflow_yaml = Column(Text, nullable=False)  # Repo-specific expected YAML
+    workflow_git_hash = Column(String(255), nullable=True)  # Last-known GitHub SHA for this override
+    source_repo_name = Column(String(255), nullable=True)  # Repo that originally provided the override content
+    last_modified_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # One override per (project, repo, workflow)
+    __table_args__ = (
+        UniqueConstraint('project_id', 'repo_id', 'workflow_id', name='uq_repo_workflow_override'),
+    )
+
+
+class LinkedReusableWorkflow(Base):
+    """
+    Links a specific reusable workflow from an RWX project into a standard project.
+    Tracks which standard project is using which workflow from which RWX source project.
+    """
+    __tablename__ = "linked_reusable_workflows"
+
+    id = Column(Integer, primary_key=True, index=True)
+    standard_project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    rwx_project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False)
+    workflow_id = Column(Integer, ForeignKey(_FK_WORKFLOWS_WORKFLOW_ID, ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+    # Ensure a workflow is only linked once per standard project
+    __table_args__ = (
+        UniqueConstraint('standard_project_id', 'workflow_id', name='unique_standard_workflow'),
+    )
+
+
+class NotificationEvent(Base):
+    """Domain events (drift/campaign state transitions) that may trigger a notification."""
+    __tablename__ = "notification_events"
+
+    event_id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String(100), nullable=False, index=True)  # e.g. drift.detected, campaign.opened
+    dedup_key = Column(String(500), nullable=False, unique=True, index=True)  # stable key preventing duplicate events for the same state transition
+    payload = Column(Text, nullable=False)  # Event-specific details as a JSON string
+    created_at = Column(DateTime, default=func.now(), nullable=False, index=True)
+
+
+class NotificationDelivery(Base):
+    """Outbox row tracking delivery of one notification event to one recipient."""
+    __tablename__ = "notification_deliveries"
+
+    delivery_id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(Integer, ForeignKey("notification_events.event_id", ondelete="CASCADE"), nullable=False, index=True)
+    recipient_email = Column(String(255), nullable=False)
+    status = Column(String(20), nullable=False, default="pending", index=True)  # pending, sent, failed
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    sent_at = Column(DateTime, nullable=True)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)  # retry/backoff scheduling
+
+
+class NotificationSubscription(Base):
+    """Per-recipient notification preferences: which project(s) and event(s) to notify about."""
+    __tablename__ = "notification_subscriptions"
+
+    subscription_id = Column(Integer, primary_key=True, index=True)
+    recipient_email = Column(String(255), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=True, index=True)  # NULL = all projects
+    event_types = Column(Text, nullable=True)  # comma-separated event_type list; NULL = all event types
+    notify_on_resolved = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class NotificationSettings(Base):
+    """Single-row global notification settings (feature enable/disable)."""
+    __tablename__ = "notification_settings"
+
+    settings_id = Column(Integer, primary_key=True, index=True)
+    notifications_enabled = Column(Boolean, nullable=False, default=True)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class DriftSettings(Base):
+    """Single-row global drift sweep settings, tuned by workspace admins in the GUI.
+
+    Replaces the DRIFT_* environment variables. Absence of the row means
+    "defaults", so an install that has never opened the settings page behaves
+    exactly as it did when the defaults lived in code.
+    """
+    __tablename__ = "drift_settings"
+
+    settings_id = Column(Integer, primary_key=True, index=True)
+    sweep_enabled = Column(Boolean, nullable=False, default=True)
+    recheck_interval_minutes = Column(Integer, nullable=False, default=15)
+    batch_size = Column(Integer, nullable=False, default=5)
+    poll_interval_seconds = Column(Integer, nullable=False, default=60)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class WorkflowDriftState(Base):
+    """Last known per-(workflow, repo, branch) drift check result.
+
+    Exists so drift notifications can diff a newly-computed check against
+    the previous one to detect state transitions — drift is checked
+    on-demand (no scheduler), so this is the only place "previous state"
+    is available to compare against.
+
+    Keyed by branch as well as repo: a project can deliver the same workflow
+    to several branches and each drifts independently. Without the branch in
+    the key, resolving drift on one branch cleared the record for all of them
+    and the project reported clean while other branches were still wrong.
+    """
+    __tablename__ = "workflow_drift_states"
+
+    state_id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    workflow_id = Column(Integer, ForeignKey(_FK_WORKFLOWS_WORKFLOW_ID, ondelete="CASCADE"), nullable=False, index=True)
+    repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete="CASCADE"), nullable=False, index=True)
+    # Empty string, not NULL: this is part of the unique key, and NULL never
+    # compares equal to NULL, so a nullable column would let duplicate rows
+    # accumulate for any state written without a resolved branch.
+    branch = Column(String(255), nullable=False, default="", server_default="")
+    has_drift = Column(Boolean, nullable=False, default=False)
+    content_hash = Column(String(64), nullable=True)
+    # Enough to render the drift list without calling GitHub. The YAML itself
+    # is deliberately not cached: a diff is only meaningful against GitHub's
+    # current content, so it is fetched when the user opens one rather than
+    # replayed from a snapshot that may already be stale.
+    github_sha = Column(String(255), nullable=True)
+    deleted_in_github = Column(Boolean, nullable=False, default=False, server_default="0")
+    # Set the first time a check actually finds this workflow's file on this
+    # (repo, branch), and never cleared while the pairing exists. It is the only
+    # durable record that the file was really delivered here.
+    #
+    # The fields that look like they already say so do not. ``workflow_git_hash``
+    # is the blob SHA of whatever branch was last written, including a PR branch,
+    # so a workflow whose campaign is still open carries a real hash while having
+    # never landed. ``github_sha`` above is cleared the moment a check finds the
+    # file gone, so it cannot outlive the check that reports a deletion. Reading
+    # either as delivery history is what made opening a campaign report every
+    # repo as "deleted" (issue #1981).
+    confirmed_present_at = Column(DateTime, nullable=True)
+    # Incremented on every not-drifted -> drifted transition. Included in the
+    # notification dedup key alongside content_hash so a drift that resolves
+    # and then reoccurs with byte-identical content (e.g. a revert) still
+    # gets its own notification instead of colliding with the stale one.
+    drift_cycle_count = Column(Integer, nullable=False, default=0)
+    last_checked_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('workflow_id', 'repo_id', 'branch',
+                         name='uq_workflow_drift_state_workflow_repo_branch'),
+    )
+
+
+class WorkflowTreeCache(Base):
+    """Cached listing of a (repo, branch)'s workflow files, plus its GitHub ETag.
+
+    Drift has to ask GitHub what is in every branch a project delivers to, and
+    that cost is paid on every check even when nothing has changed. GitHub
+    answers a conditional request (``If-None-Match``) for unchanged content with
+    a 304, and **304 responses do not count against the rate limit** — so a repo
+    nobody has touched becomes free to re-verify however often it is checked.
+
+    ``sha_map_json`` is the {filename: blob_sha} mapping the Trees call returned,
+    replayed on a 304. Without it a 304 would carry no body and there would be
+    nothing to compare against.
+
+    ``branch_is_recent`` caches the separate "has this branch moved lately"
+    lookup, which otherwise costs one API call per matched branch per check.
+    It is invalidated by ``branch_head_sha`` rather than by a timer: the branch
+    listing already tells us each branch's head commit, and if the head has not
+    moved the recency answer cannot have changed. That is exact, so a branch
+    that just became active is never wrongly skipped the way a TTL would allow.
+
+    Purely a cache: dropping a row costs one extra API call and nothing else.
+    """
+    __tablename__ = "workflow_tree_cache"
+
+    id = Column(Integer, primary_key=True, index=True)
+    repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete="CASCADE"), nullable=False, index=True)
+    branch = Column(String(255), nullable=False)
+    etag = Column(String(255), nullable=True)
+    sha_map_json = Column(Text, nullable=True)
+    fetched_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    # Whether the branch had a recent commit, and the head commit that answer
+    # was computed from. Nullable: unknown until something asks.
+    branch_is_recent = Column(Boolean, nullable=True)
+    branch_head_sha = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('repo_id', 'branch', name='uq_workflow_tree_cache_repo_branch'),
+    )
+
+
+class WorkflowRun(Base):
+    """A GitHub Actions run, stored so build metrics can be computed without GitHub.
+
+    Runs are listed per repository — one call returns every workflow's runs — and
+    then attributed to the project that owns the matching workflow file. A repo
+    can belong to several projects, but a workflow belongs to exactly one, so
+    filtering by filename lands each row under a single project.
+
+    ``duration_seconds`` and ``queue_seconds`` are derived once here rather than
+    at query time because the alternative is GitHub's ``/timing`` endpoint, which
+    costs one call per run.
+
+    ``workflow_id`` is SET NULL, not CASCADE: deleting a workflow must not erase
+    the history of what it did, or removing a workflow would silently rewrite
+    past success rates.
+    """
+    __tablename__ = "workflow_runs"
+
+    run_row_id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
+    repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete="CASCADE"), nullable=False, index=True)
+    workflow_id = Column(Integer, ForeignKey(_FK_WORKFLOWS_WORKFLOW_ID, ondelete=_ON_DELETE_SET_NULL), nullable=True, index=True)
+    github_run_id = Column(BigInteger, nullable=False)
+    run_number = Column(Integer, nullable=True)
+    run_attempt = Column(Integer, nullable=True)
+    # Basename of the run's ``path`` (".github/workflows/ci.yml" -> "ci.yml"),
+    # which is what ties a run back to a project's workflow.
+    workflow_filename = Column(String(255), nullable=False)
+    workflow_name = Column(String(255), nullable=True)
+    # Same rationale as WorkflowDriftState.branch: empty string rather than NULL
+    # so rows without a resolved branch still compare equal to each other.
+    branch = Column(String(255), nullable=False, default="", server_default="")
+    event = Column(String(50), nullable=True)
+    status = Column(String(30), nullable=True)  # queued, in_progress, completed
+    conclusion = Column(String(30), nullable=True)  # success, failure, cancelled, skipped, timed_out, ... ; NULL while running
+    run_created_at = Column(DateTime, nullable=True)
+    run_started_at = Column(DateTime, nullable=True)
+    run_updated_at = Column(DateTime, nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+    queue_seconds = Column(Integer, nullable=True)
+    html_url = Column(String(500), nullable=True)
+    # Doubles as the staleness cursor, so no separate sync-state table is needed.
+    synced_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        # Scoped by project, not just (repo, run): a repo can belong to several
+        # projects, and two of them may each own a workflow that delivers under
+        # the same filename. Keyed on (repo, run) alone, whichever project synced
+        # first would own the row and the other's panel would stay empty forever.
+        UniqueConstraint('project_id', 'repo_id', 'github_run_id',
+                         name='uq_workflow_runs_project_repo_run'),
+        Index('ix_workflow_runs_project_created', 'project_id', 'run_created_at'),
+    )
