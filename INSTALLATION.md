@@ -1,6 +1,6 @@
 # Self-Hosted Beta Installation
 
-> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. No paid plans are currently available. The beta is self-hosted only and is provided as-is, without warranty, SLA, support guarantee, uptime guarantee, or production-readiness guarantee. You are responsible for securing your deployment, protecting GitHub credentials and local environment files, reviewing workflow changes, and backing up data.
+> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. The beta is self-hosted only and is provided as-is, without warranty, SLA, support guarantee, uptime guarantee, or production-readiness guarantee. You are responsible for securing your deployment, protecting GitHub credentials and local environment files, reviewing workflow changes, and backing up data.
 
 ## Overview
 
@@ -71,8 +71,6 @@ invalidate any saved encrypted tokens.
 The app validates the token with GitHub, stores it encrypted, and uses the saved PAT for GitHub API calls.
 
 Do **not** put your personal PAT on the Docker command line or in `GITHUB_TOKEN` for normal user login. Enter it in the UI after the container starts so it does not end up in shell history or deployment config.
-
-> **Important:** The automated `install.sh` flow still prompts for OAuth credentials today. For a PAT-only quick install, use the Docker run or Docker Compose examples in this guide instead of the installer.
 
 ## Create a GitHub OAuth App
 
@@ -191,7 +189,7 @@ A non-loopback `http://` `APP_URL` requires `ALLOW_INSECURE_HTTP=true` — witho
 
 Optional:
 - Omit OAuth credentials if you plan to sign in only with a GitHub PAT
-- `LICENSE_KEY` is optional and reserved for future/commercial licensing behavior; no paid plans are currently available during beta
+- `LICENSE_KEY` is optional. The beta doesn't use a license key; leave it unset
 
 ## Option 2: Docker Compose
 
@@ -246,7 +244,7 @@ For OAuth login, uncomment and configure `APP_URL`, `GITHUB_CLIENT_ID`, and `GIT
 | `APP_URL` | Recommended | Application URL (e.g., `http://192.168.1.100:8080`). Required for OAuth login. Also sets the allowed CORS origin — omitting it leaves CORS open to all origins (`*`), which allows cross-origin requests using any session token. Always set this for non-localhost deployments, even when using PAT login. |
 | `GITHUB_CLIENT_ID` | No | GitHub OAuth client ID (required only for OAuth login) |
 | `GITHUB_CLIENT_SECRET` | No | GitHub OAuth client secret (required only for OAuth login) |
-| `LICENSE_KEY` | No | Optional self-hosted license key; no paid plans are currently available during beta |
+| `LICENSE_KEY` | No | Optional. The beta doesn't use a license key; leave it unset |
 
 For advanced configuration and architecture details, see [DOCKER_DEPLOYMENT_MODES.md](DOCKER_DEPLOYMENT_MODES.md) and [docs/ENVIRONMENT_VARIABLES.md](docs/ENVIRONMENT_VARIABLES.md).
 
@@ -418,4 +416,4 @@ to keep using the old path until you are ready to migrate.
 - Keep image tags pinned for controlled upgrades and update containers when beta fixes are published.
 - Back up persistent data regularly, including the SQLite volume or PostgreSQL database.
 - Keep `.env.self-hosted`, OAuth credentials, PATs, database files, backups, license keys, and optional API keys private. Never commit a real `.env` file.
-- Prefer PR-based workflow delivery while evaluating the beta. Use direct commit mode only after carefully checking the target repository and branch.
+- When resolving drift or removing a file, prefer a pull request. The direct options commit straight to the branch with no review, so check the target repository and branch first.

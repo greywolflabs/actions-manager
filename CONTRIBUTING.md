@@ -18,12 +18,12 @@ We are committed to providing a welcoming and inclusive environment. Please be r
 
 ## Getting Started
 
-1. Fork the repository on GitHub
+1. Fork [greywolflabs/actions-manager](https://github.com/greywolflabs/actions-manager) on GitHub
 2. Clone your fork locally
 3. Set up the development environment (see [Development Setup](#development-setup))
-4. Create a feature branch for your changes
+4. Create a feature branch from `staging`
 5. Make your changes following our guidelines
-6. Submit a pull request
+6. Submit a pull request against the `staging` branch
 
 ## Development Setup
 
@@ -190,7 +190,7 @@ Temporary documentation files will be moved to `docs/archive/` and are excluded 
 ## Questions?
 
 If you have questions about contributing:
-- Open an issue for discussion
+- Ask in [GitHub Discussions](https://github.com/greywolflabs/actions-manager/discussions)
 - Check existing issues and documentation
 - Review closed PRs for examples
 

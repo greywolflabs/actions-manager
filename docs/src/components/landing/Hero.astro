@@ -1,7 +1,16 @@
 ---
-import { Image } from 'astro:assets';
+import { getImage } from 'astro:assets';
 import { Icon } from '@astrojs/starlight/components';
-import screenshot from '../../content/docs/assets/screenshots/workflows/workflow-page-view.png';
+// The README's demo as video, recorded by
+// frontend/docs-screenshots/readme-demo.spec.ts. The README keeps the GIF,
+// since GitHub won't play repository video; here a video is a quarter of the
+// size at full resolution. astro:assets doesn't handle video, hence ?url.
+import demoWebm from '../../../assets/readme/pr-campaign.webm?url';
+import demoMp4 from '../../../assets/readme/pr-campaign.mp4?url';
+import firstFrame from '../../../assets/readme/pr-campaign-poster.png';
+
+// Shown until the video plays, and kept for visitors who ask for reduced motion.
+const poster = await getImage({ src: firstFrame, width: 1440, format: 'webp' });
 ---
 
 <section class="landing-band landing-ink not-content">
@@ -18,9 +27,9 @@ import screenshot from '../../content/docs/assets/screenshots/workflows/workflow
 				<a class="button primary" href="getting-started/quick-start.html">
 					Get started <Icon name="right-arrow" />
 				</a>
-				<a class="button secondary" href="#demo">
+				<a class="button secondary" href="getting-started/product-demo.html">
 					<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5v15l12-7.5z" fill="currentColor"></path></svg>
-					Watch the demo
+					Watch the full demo
 				</a>
 			</div>
 			<p class="facts">docker run · one container · SQLite by default</p>
@@ -30,13 +39,20 @@ import screenshot from '../../content/docs/assets/screenshots/workflows/workflow
 				<span></span><span></span><span></span>
 				<code>localhost:8080</code>
 			</div>
-			<Image
-				src={screenshot}
-				alt="A Payments Platform project in ActionsManager: build-and-test.yml open in the workflow editor, targeting two repositories."
-				widths={[640, 960, 1280]}
-				sizes="(min-width: 72rem) 40rem, (min-width: 60rem) 50vw, calc(100vw - 3rem)"
-				loading="eager"
-			/>
+			<video
+				class="demo"
+				muted
+				loop
+				playsinline
+				preload="auto"
+				poster={poster.src}
+				width="1440"
+				height="900"
+				aria-label="ActionsManager: build-and-test.yml edited once, then rolled out to three repositories as a PR campaign, each with its own pull request to merge or close."
+			>
+				<source src={demoWebm} type="video/webm" />
+				<source src={demoMp4} type="video/mp4" />
+			</video>
 		</figure>
 	</div>
 </section>
@@ -45,8 +61,8 @@ import screenshot from '../../content/docs/assets/screenshots/workflows/workflow
 	<p class="landing-inner">
 		<Icon name="information" />
 		<span>
-			<strong>Free self-hosted beta.</strong> No paid plans are available. Self-hosted only. Features,
-			limits, and licensing may change before general availability.{' '}
+			<strong>Free self-hosted beta.</strong> Self-hosted only. Features and limits may change before
+			general availability.{' '}
 			<a href="beta/beta-notes.html">Beta notes</a>
 		</span>
 	</p>
@@ -139,7 +155,7 @@ import screenshot from '../../content/docs/assets/screenshots/workflows/workflow
 		font-size: var(--sl-text-xs);
 		color: var(--sl-color-gray-3);
 	}
-	.window img {
+	.window video {
 		display: block;
 		width: 100%;
 		height: auto;
@@ -175,3 +191,18 @@ import screenshot from '../../content/docs/assets/screenshots/workflows/workflow
 		color: var(--sl-color-text-accent);
 	}
 </style>
+
+<script>
+	// Autoplay only for visitors who haven't asked for reduced motion; they get
+	// the poster with controls instead. Without JavaScript the poster stays.
+	const video = document.querySelector<HTMLVideoElement>('.window video.demo');
+	if (video) {
+		if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+			video.controls = true;
+		} else {
+			video.play().catch(() => {
+				video.controls = true;
+			});
+		}
+	}
+</script>

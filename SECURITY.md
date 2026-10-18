@@ -32,7 +32,7 @@ Operators are responsible for securing their own deployment. At minimum:
 - Prefer fine-grained GitHub PATs or OAuth permissions with least-privilege repository access.
 - Rotate credentials immediately if they may have been exposed in logs, shell history, screenshots, issues, support bundles, or commits.
 - Back up the SQLite volume or PostgreSQL database before upgrades.
-- Review generated or edited workflow changes before merging or applying them. PR-based delivery is safer for beta testing than direct commits.
+- Review generated or edited workflow changes before merging them. When resolving drift or removing a file, prefer a pull request: the direct options change the branch at once, with no review.
 - Keep the container image updated and pin image tags for controlled upgrades.
 - Disable debug, mock, and stub settings for any shared or exposed deployment.
 

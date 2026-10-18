@@ -1,0 +1,127 @@
+name: 🐛 Bug report
+description: Something in ActionsManager doesn't work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        - **Question or setup help?** Ask in [Q&A][qa] instead.
+        - **Security problem?** Don't post it here. [Report it privately][security].
+        - The [troubleshooting guides](https://actionsmanager.io/troubleshooting) may already cover it.
+
+        [qa]: https://github.com/greywolflabs/actions-manager/discussions/categories/q-a
+        [security]: https://github.com/greywolflabs/actions-manager/security/advisories/new
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem, including any error message the UI showed.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps that shows the problem.
+      placeholder: |
+        1. Open project ...
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ActionsManager version
+      description: >-
+        The image tag you run. `docker inspect actions-manager --format '{{.Config.Image}}'` shows it.
+        If that says `latest`, add the digest from
+        `docker image inspect ghcr.io/greywolflabs/actions-manager:latest --format '{{index .RepoDigests 0}}'`.
+      placeholder: 1.14.0-beta.1
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How do you run it?
+      options:
+        - docker run
+        - Docker Compose
+        - Podman / podman-compose
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: database
+    attributes:
+      label: Database
+      options:
+        - SQLite (default)
+        - PostgreSQL
+        - Not sure
+  - type: dropdown
+    id: sign-in
+    attributes:
+      label: Sign-in method
+      options:
+        - GitHub OAuth
+        - Fine-grained personal access token
+        - Classic personal access token
+        - Not sure
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Where in ActionsManager the problem shows up.
+      options:
+        - Installation, upgrade or container startup
+        - Sign-in and GitHub permissions
+        - Projects
+        - Workflows and the workflow editor
+        - Pull requests, PR campaigns and delivery
+        - Drift detection
+        - Reusable workflows
+        - Secrets, variables and environments
+        - Managed Actions
+        - Build detection
+        - Build metrics
+        - Rulesets
+        - Notifications
+        - Backup and restore
+        - Documentation
+        - Other
+  - type: input
+    id: browser
+    attributes:
+      label: Browser
+      description: For problems in the UI.
+      placeholder: Firefox, Chrome, Safari or Edge, and its version
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >-
+        Output from `docker logs actions-manager`, or the browser console for a UI problem.
+        **Remove tokens, secrets and anything from your `.env` file before you paste.**
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: >-
+            I removed personal access tokens, OAuth tokens, `SECRET_KEY`, client and webhook secrets,
+            and `.env` contents from everything above.
+          required: true
+        - label: >-
+            I searched [existing issues](https://github.com/greywolflabs/actions-manager/issues?q=is%3Aissue)
+            and this hasn't been reported.
+          required: true

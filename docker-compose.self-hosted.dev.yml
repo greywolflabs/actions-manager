@@ -9,11 +9,6 @@
 #   docker compose -f docker-compose.self-hosted.yml \
 #                  -f docker-compose.self-hosted.dev.yml up --build
 #
-# Or with the installer, which wires this up automatically when invoked with
-# the contributor build flag:
-#
-#   ./install.sh --build
-#
 # This overlay:
 #   * Builds the image from ./Dockerfile.self-hosted instead of pulling.
 #   * Tags the locally built image so it does not collide with the published

@@ -16,12 +16,7 @@ ActionsManager treats workflow management as a fleet operation, not a per-reposi
 
 ### Applying a Workflow
 
-**Applying** a workflow pushes the managed workflow definition to the `.github/workflows/` directory of each repository in the project. You can deliver the change via:
-
-- **PR-based delivery** — opens a pull request in each repository for review before merging
-- **Direct commit** — commits the change directly to the target branch (use carefully)
-
-See [PR Campaigns](pr-campaigns.html) for PR-based delivery.
+**Applying** a workflow pushes the managed workflow definition to the `.github/workflows/` directory of each repository in the project, through a [PR Campaign](pr-campaigns.html): one pull request per repository, which you review and merge.
 
 ### Updating a Workflow
 
@@ -363,16 +358,14 @@ mode shows `AM_ABC_ci.yml` rather than `ci.yml`, with the prefix dimmed so the p
 easy to scan. Workflows linked from a Reusable Workflow Project are named by the project that owns
 them and never take the consuming project's prefix.
 
-## Delivery Modes
+## Delivery
 
-| Mode | Description | When to Use |
-|------|-------------|-------------|
-| PR-based | Opens a PR in each repository | Recommended for most changes; enables review |
-| Direct commit | Commits directly to the target branch | Fast delivery when review is not required |
+New and edited workflows reach GitHub only through pull requests, opened as a [PR Campaign](pr-campaigns.html), so every change can be reviewed before it merges.
 
-:::note
-PR-based delivery is recommended for beta testing and production use. Direct commit mode should be used carefully — changes cannot be reviewed before taking effect.
-:::
+ActionsManager commits straight to a branch, with no review, only when you choose it:
+
+- **Restore Directly**, or **Adopt for project and sync** with direct commit, when [resolving drift](drift-detection.html#resolving-drift)
+- **Commit directly to the target branch**, when [removing a workflow](#removing-a-workflow) or [a custom file](#removing-a-custom-file)
 
 ## Build Detection
 

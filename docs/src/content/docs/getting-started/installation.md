@@ -8,7 +8,7 @@ Detailed installation guide for ActionsManager Self-Hosted Beta.
 
 ---
 
-> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. No paid plans are currently available. Provided as-is, without warranty or production-readiness guarantee.
+> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. Provided as-is, without warranty or production-readiness guarantee.
 
 ## Prerequisites
 

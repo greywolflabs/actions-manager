@@ -1,24 +1,19 @@
-# ActionsManager Self-Hosted Beta
+# ActionsManager
 
-ActionsManager is a multi-repository control plane for GitHub Actions workflows. It helps teams manage, synchronize, and review workflow changes across many repositories from one self-hosted interface.
+**Manage GitHub Actions workflows across many repositories from one place.**
 
-> **Beta notice:** ActionsManager Self-Hosted is currently a **free beta preview** for testing, evaluation, and feedback. No paid plans are currently available. The beta is self-hosted only; the hosted Cloud/SaaS and GitHub Marketplace paths are not part of this first public beta. Features, limits, licensing behavior, and commercial availability may change before general availability. The beta is provided as-is, without warranty, SLA, support guarantee, uptime guarantee, production-readiness guarantee, or enterprise/compliance/security guarantee.
+The same CI workflow gets copied into every repository, and the copies drift apart: one repo pins an old action, another skips a step, a third was hand-edited during an incident. ActionsManager keeps one definition per file, delivers it to every repository and branch in a project as pull requests, and tells you when a repository's copy no longer matches what it delivered.
 
-Self-hosted operators are responsible for securing their deployment, protecting GitHub credentials and local environment files, backing up data, configuring least-privilege GitHub access, and reviewing workflow changes before applying, merging, or directly committing them. PR-based delivery is recommended for beta testing; direct commit mode should be used carefully.
+[![Release](https://img.shields.io/github/v/release/greywolflabs/actions-manager?include_prereleases&sort=semver)](https://github.com/greywolflabs/actions-manager/releases)
+[![License](https://img.shields.io/github/license/greywolflabs/actions-manager)](LICENSE)
+[![Publish Self-Hosted Image](https://github.com/greywolflabs/actions-manager/actions/workflows/publish-self-hosted-image.yml/badge.svg)](https://github.com/greywolflabs/actions-manager/actions/workflows/publish-self-hosted-image.yml)
+[![Container image](https://img.shields.io/badge/ghcr.io-greywolflabs%2Factions--manager-2496ED?logo=docker&logoColor=white)](https://github.com/greywolflabs/actions-manager/pkgs/container/actions-manager)
 
-## 🎥 See ActionsManager in Action
+![Editing a workflow, then opening pull requests to three repositories in one PR campaign](docs/assets/readme/pr-campaign.gif)
 
-[![Watch the ActionsManager demo on YouTube](https://img.youtube.com/vi/WkDYK7pCBjI/maxresdefault.jpg)](https://youtu.be/WkDYK7pCBjI)
+## Quick start
 
-Watch a complete multi-repository workflow rollout end to end. **What it covers:** PAT authentication, creating the `MavenBuilds` project, adding three repositories, build-type detection, pull request creation, pull request management, and pull request merging.
-
-**→ [Watch the full demo](https://youtu.be/WkDYK7pCBjI)** &nbsp;·&nbsp; **→ [Read the demo walkthrough](https://actionsmanager.io/getting-started/product-demo)**
-
-## 🚀 Quick Start: Self-Hosted Beta
-
-Run ActionsManager as a single self-hosted container on port 8080. For the fastest evaluation path, sign in with a GitHub personal access token from the UI after the container starts.
-
-Generate a stable secret key once and store it (use the same value on every restart):
+Run ActionsManager as a single self-hosted container on port 8080. Generate a secret key once and keep it (use the same value on every restart):
 
 ```bash
 openssl rand -hex 32
@@ -39,33 +34,34 @@ docker run -d \
 
 Then open `http://localhost:8080`, choose **Sign in with Personal Access Token**, and paste a fine-grained or classic PAT. Do **not** put personal PATs in Docker command lines, shell history, screenshots, or committed environment files.
 
-**→ [Documentation Site](https://actionsmanager.io)**
-**→ [Self-Hosted Installation Guide](INSTALLATION.md)**
-**→ [Beta Notes](BETA.md)**
-**→ [Privacy Notice](PRIVACY.md)**
-**→ [Security Policy](SECURITY.md)**
+**→ [Documentation](https://actionsmanager.io)** &nbsp;·&nbsp; **→ [First workflow walkthrough](https://actionsmanager.io/getting-started/first-workflow-walkthrough)** &nbsp;·&nbsp; **→ [Demo video](https://youtu.be/8TrgE9YDGXA)**
 
-## First Workflow Walkthrough
+ActionsManager is in a free, self-hosted beta. See the [Beta Notes](BETA.md) for its limits and your responsibilities as an operator.
 
-After starting the container and opening `http://localhost:8080`, follow these steps for the first-time beta user happy path:
+## Features
 
-1. **Sign in with a PAT** — choose **Sign in with Personal Access Token** and paste a fine-grained or classic GitHub PAT.
-2. **Welcome screen** — on a first sign-in ActionsManager introduces itself and offers a guided tour of the steps below. Choose **Show me around** to take it, or **Not now** to skip. The tour highlights the control you need next and waits for you to perform each action — it never clicks anything for you. Restart it any time from **Restart tour** in the user menu.
-3. **Saved Projects dashboard** — after login you land here. Click **New Project**.
-4. **Create a Caller Workflow Project** — enter a project name, choose **Caller Workflow Project**, and pick a color.
-5. **Select repositories** — choose public or private visibility, then select one or more repositories to manage.
-6. **Review resource naming** — keep **Prefix Mode** enabled unless you intentionally want unmanaged filenames. Review the summary and create the project.
-7. **Project workspace** — the empty workspace shows **Import Existing**, **Create Pull Requests**, and **Add Workflow**. Click **Add Workflow**.
-8. **Choose workflow type** — select **Regular Workflow**.
-9. **Configure the workflow** — enter a name and choose **Open Blank Workflow**, **Detect Build Types**, or **Generate Templates**.
-10. **Review the YAML editor** — the editor shows the prefixed filename, selected repository, and **Unsaved** state.
-11. **Save as a local draft** — click **Commit Locally**, confirm in the modal.
-12. **New Local status** — the editor shows the **New Local** badge and a toast confirms the draft is saved.
-13. **Create pull requests when ready** — return to the workspace and click **Create Pull Requests** to propose the workflow to GitHub. PR-based delivery is recommended for beta testing.
+- **[Projects](https://actionsmanager.io/features/projects.html)** group repositories with the files you manage for them: workflows, custom files and a CODEOWNERS file.
+- **[PR campaigns](https://actionsmanager.io/features/pr-campaigns.html)** deliver a change to every repository and branch in a project as pull requests, which you review, merge, close or roll back from one place.
+- **[Drift detection](https://actionsmanager.io/features/drift-detection.html)** re-checks every repository and branch in the background and shows when a delivered file was edited or deleted in GitHub. Adopt GitHub's version, or restore yours by pull request.
+- **[Reusable and caller workflows](https://actionsmanager.io/features/reusable-workflows.html)**: author reusable workflows in a Reusable Workflow Project and link them into the Caller Workflow Projects that use them.
+- **[Workflow editor](https://actionsmanager.io/features/workflows.html)** in YAML or a GUI view, with [build-type detection](https://actionsmanager.io/features/build-detection.html) (Maven, Gradle, npm, .NET, Python, Go, Rust, Docker and more) to start from a matching template.
+- **Secrets, variables, deploy environments and [rulesets](https://actionsmanager.io/features/rulesets.html)** managed across a project's repositories.
+- **[Managed actions](https://actionsmanager.io/features/managed-actions.html)**: a shared catalog of third-party actions and their inputs for the GUI editor.
+- **[Build metrics](https://actionsmanager.io/features/build-metrics.html)**, **[notifications](https://actionsmanager.io/features/notifications.html)**, **[permissions](https://actionsmanager.io/features/permissions.html)** and **[backup and restore](https://actionsmanager.io/features/backup-restore.html)**.
 
-> **Saving a draft does not push to GitHub.** A saved draft exists only in ActionsManager until you create pull requests or use direct commit mode.
+## How it compares
 
-**→ [Full screenshot walkthrough →](https://actionsmanager.io/getting-started/first-workflow-walkthrough)**
+| Tool | What it does | What ActionsManager adds |
+|---|---|---|
+| [repo-file-sync-action](https://github.com/BetaHuhn/repo-file-sync-action) | A GitHub Action in a source repository that copies files to other repositories, by pull request by default, each time the source repository changes. | A record of what was delivered to each repository and branch, drift reports when a target repository changes a file later, and a UI. |
+| [multi-gitter](https://github.com/lindell/multi-gitter) | A CLI that runs a script in many repositories and opens a pull request wherever it changes something, tracking those pull requests by branch name. | Files that stay managed: one definition, delivered and then checked for drift per repository and branch. |
+| [Renovate](https://docs.renovatebot.com/) | Keeps dependency versions up to date, including action and reusable-workflow versions inside existing workflow files. | It writes and delivers the workflow files themselves. The two work well together. |
+| [GitHub rulesets: required workflows](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#require-workflows-to-pass-before-merging) | Makes pull requests in targeted repositories pass a workflow from a central repository. Documented for GitHub Enterprise Cloud and Enterprise Server. | The workflow, custom files and CODEOWNERS land in each repository and branch, with drift tracking. |
+
+## Requirements
+
+- **Docker 20.10+** or **Podman 3.0+**, on Linux or macOS, with 4 GB+ RAM and 10 GB+ disk.
+- A GitHub account with access to the repositories you'll manage, and a **personal access token** (fine-grained recommended, classic supported) or a **GitHub OAuth App** for "Log in with GitHub". Saved tokens are encrypted at rest and never returned to the UI.
 
 ### Recommended PAT permissions
 
@@ -78,227 +74,17 @@ After starting the container and opening `http://localhost:8080`, follow these s
 | Secrets | Read and write | Repository secrets management (optional) |
 | Variables | Read and write | Repository variables management (optional) |
 
-See [GitHub PAT Setup](docs/GITHUB_PAT_SETUP.md) for full token creation instructions.
+See [GitHub PAT Setup](docs/GITHUB_PAT_SETUP.md) for token creation and [GitHub OAuth Setup](https://actionsmanager.io/getting-started/github-oauth-setup.html) for OAuth.
 
-## What ActionsManager Does
+## Documentation
 
-ActionsManager is a control plane for GitHub Actions, designed for teams that need to manage workflows across many repositories rather than one at a time. Instead of editing YAML in each repo, you operate on a fleet:
+- **Install and run:** [Self-Hosted Installation](INSTALLATION.md) (Docker run and Compose, TLS, backups), [Self-Hosted Docker Deployment](DOCKER_DEPLOYMENT_MODES.md), [Environment Variables](docs/ENVIRONMENT_VARIABLES.md)
+- **Use it:** [Documentation site](https://actionsmanager.io), [Product demo](https://actionsmanager.io/getting-started/product-demo), [Troubleshooting](https://actionsmanager.io/troubleshooting.html)
+- **Policies:** [Beta Notes](BETA.md), [Security Policy](SECURITY.md), [Privacy Notice](PRIVACY.md)
+- **Contribute:** [CONTRIBUTING.md](CONTRIBUTING.md), [Development Guide](docs/DEVELOPMENT.md), [Frontend Development](docs/FRONTEND_DEVELOPMENT.md)
 
-- **Manage workflows across repositories** from a single interface, with project-based grouping for multi-repo operations
-- **Bulk operations** to apply, update, or remove workflows across every repository in a project in one action
-- **Synchronize workflows at scale** by treating reusable workflows as the source of truth and propagating changes to consumers
-- **Drift detection and resolution** to surface when a repository's workflow has diverged from the managed definition
-- **PR orchestration** to deliver changes through reviewable pull requests across many repositories at once, with optional direct-commit mode where appropriate
-- **Control workflow consistency** by enforcing a known-good state for both reusable workflow definitions and the caller workflows that consume them
-- **Intelligent build detection** that inspects repositories (Maven, Gradle, npm, .NET, Python, Go, Rust, etc.) and recommends matching workflow templates
-- **Secrets & variables management** at repository and environment scope, including bulk deployment
-- **GitHub authentication options** with GitHub OAuth plus fine-grained or classic personal access tokens
-- **Real-time collaboration** via WebSockets so teams see updates as they happen
+Found a problem? Check the [issues](https://github.com/greywolflabs/actions-manager/issues). The API docs are at `/docs` on a running backend when `DISABLE_API_DOCS=false` (off by default in production).
 
-## Project Types
+## License
 
-ActionsManager uses two project types:
-
-**Reusable Workflow Projects** are producer projects. They define reusable workflows that can be shared across repositories.
-
-**Caller Workflow Projects** are consumer projects. They manage the repositories and caller workflows that invoke reusable workflows using `uses:`.
-
-| Project Type | Role | Description |
-|---|---|---|
-| **Reusable Workflow Project** | Producer | Authors and versions reusable workflow definitions that are shared across repositories |
-| **Caller Workflow Project** | Consumer | Manages repositories whose workflows call reusable workflows |
-
-> **Developer note:** Internally, the API and database use the value `standard` for Caller Workflow Projects and `rwx` for Reusable Workflow Projects. This is a legacy/internal convention for backward compatibility. The user interface and all user-facing documentation display these as **Caller Workflow Project** and **Reusable Workflow Project** respectively. No schema or API rename is planned.
-
-## Reusable Workflows and Caller Workflows
-
-ActionsManager manages **both** sides of GitHub Actions reusability — and the real value comes from managing them together.
-
-- **Reusable Workflows (Producers)** — the centrally defined workflows (typically in a shared repository) that encode your organization's build, test, release, security, and deployment standards. ActionsManager lets you author and version these as the single source of truth.
-- **Caller Workflows (Consumers)** — the per-repository workflows that invoke a reusable workflow via `uses:`. ActionsManager generates, distributes, and keeps these in sync across every repository in a project, so consumers stay aligned with the producer they reference.
-
-Most tools focus on one side or the other. Managing producers without their consumers leaves drift; managing consumers without a versioned producer leaves duplication. ActionsManager closes that loop: when a reusable workflow changes, the platform knows which caller workflows are affected and can deliver the update across the fleet.
-
-## How It Actually Works at Scale
-
-ActionsManager is built around a few concrete primitives that make multi-repository management practical:
-
-- **Projects** group multiple repositories under a single managed scope. A project is the unit you operate on — permissions, workflows, secrets, and rollouts are all coordinated at the project level.
-- **Workflows are applied across repos**, not per-repo. When you define or update a workflow in a project, ActionsManager tracks every repository it should exist in and what state it should be in.
-- **Reusable workflows are centrally defined** in a designated repository (the producer). They are versioned and treated as the canonical definition.
-- **Caller workflows consume them** in each target repository. ActionsManager generates and maintains these caller files, keeping their `uses:` reference and inputs aligned with the producer.
-- **Drift detection ensures consistency** by re-checking every repository and branch a project delivers to on a background schedule, comparing the workflow file there against the managed definition and flagging any divergence (manual edits, direct commits, deleted files).
-- **PR-based delivery allows safe rollout** — changes are proposed as pull requests across all impacted repositories, can be reviewed and merged independently or in bulk, and direct-commit mode is available when review overhead isn't needed.
-
-The result: one place to change a workflow, one place to see who's out of sync, one place to roll the change out.
-
-## Primary Use Case
-
-A typical end-to-end flow on ActionsManager looks like this:
-
-1. **Update a reusable workflow** in the producer repository (for example, bump the version of a shared build-and-publish workflow).
-2. **Detect impacted repos** — ActionsManager identifies every caller workflow across every project that consumes the updated reusable workflow.
-3. **Create PRs across repos** in a single bulk operation. Each affected repository receives a pull request updating its caller workflow to the new version, with consistent commit messages and metadata.
-4. **Merge or sync** the PRs individually, in bulk, or via direct commits where PR review isn't required.
-5. **Resolve drift if needed** — for any repository whose workflow was edited outside the platform, drift detection surfaces the divergence and provides a guided resolution to bring it back in line with the managed state.
-
-This same flow covers rolling out a new workflow to a project, retiring an obsolete one, or enforcing a security/compliance change across an entire repository fleet.
-
-## Core Features
-
-### 🌐 Multi-Repository Management
-- Group repositories into **Projects** as the unit of management
-- Operate on entire fleets of repositories from a single interface
-- Branch-specific workflow configurations supported per repository
-
-### ⚡ Bulk Workflow Operations
-- Apply, update, or remove workflows across every repository in a project in one action
-- Bulk PR creation, bulk merging, and bulk synchronization
-- Consistent commit messages, branch naming, and metadata across the fleet
-
-### 🔁 Workflow Synchronization & Consistency Enforcement
-- Treat reusable workflows as the source of truth and keep caller workflows aligned
-- Enforce a known-good workflow state across all managed repositories
-- Manage **both** reusable workflow definitions (producers) and caller workflows (consumers) together
-
-### 📊 Drift Detection & Resolution
-- Automatic background re-checks of every repository and branch a project delivers to
-- Surfaces manual edits, direct commits, and workflow files deleted outside the platform
-- Guided resolution — fix PR, direct restore, or adopt GitHub's version — single or in bulk
-
-### 🚀 PR-Based and Direct Delivery Modes
-- **PR mode**: Reviewable pull requests across many repositories with audit trail
-- **Direct mode**: Commit changes straight to target branches when review overhead isn't required
-- Per-PR branch naming and best-effort branch cleanup after merge
-
-### ⚙️ Workflow Authoring
-- Visual workflow editor with syntax highlighting (CodeMirror)
-- Insert existing project secrets, variables and deployment environments straight into workflow YAML — names only, never values
-- Template library for common CI/CD patterns
-- First-class support for both reusable workflow definitions and caller workflows
-
-### 🔍 Build Type Detection
-Automatically detects and suggests workflows for:
-- **Java**: Maven, Gradle, Ant
-- **Node.js**: npm, Yarn
-- **C#/.NET**: MSBuild, dotnet CLI
-- **Python**: pip, Poetry, setuptools
-- **Go**: go mod
-- **Rust**: Cargo
-- **Docker**: Dockerfile-based builds
-
-### 🔐 Secrets & Environment Management
-- Secure creation and management of repository secrets
-- Environment variable configuration
-- Bulk secret deployment across repositories in a project
-
-### 🔐 Authentication & Security
-- GitHub OAuth and Personal Access Token authentication (see [GitHub Authentication Options](#github-authentication-options))
-- Secure token management and API access
-
-### 📦 Managed Actions
-- Shared, workspace-wide catalog of imported third-party GitHub Actions with parsed, editable inputs
-- Import from a repo URL, a direct `action.yml` file URL, or a GitHub Marketplace listing
-- Surfaces in the GUI workflow editor's step picker to pre-fill `with:` inputs — see [Managed Actions](https://actionsmanager.io/features/managed-actions.html)
-
-### 🧪 Self-Hosted Beta Scope
-- Free during the beta period; no paid plans are currently available
-- Self-hosted only for the first public beta
-- Cloud/SaaS and GitHub Marketplace billing are future/planned paths, not active beta offerings
-- Features, limits, and licensing behavior may change before general availability
-
-## 💎 Beta Availability and Future Licensing
-
-The first public release is **ActionsManager Self-Hosted Beta**. It is free during beta, and no paid plans are currently available.
-
-| Topic | Current beta status |
-|-------|---------------------|
-| **Self-hosted** | Available as a free beta preview |
-| **Cloud/SaaS** | Not part of the first public beta |
-| **GitHub Marketplace billing** | Not active for this beta |
-| **Paid plans** | Not currently available |
-| **Future commercial licensing** | May be introduced later; terms and limits may change before GA |
-
-The application contains tier and license-key code paths used for development and future planning. During this beta, public documentation should not be read as a live paid-plan offer. Free beta access does not grant permanent free access to future paid features.
-
-**→ [Commercial License Overview](COMMERCIAL-LICENSE.md)**
-**→ [License Key Guide](LICENSE_KEY_GUIDE.md)**
-
-## 📋 Installation Requirements
-
-### System Requirements
-
-- **Docker 20.10+** or **Podman 3.0+** (with podman-compose)
-- **Linux** or **macOS** operating system
-- **4GB+ RAM** for self-hosted beta
-- **10GB+ disk space**
-- A **GitHub account** with repository access
-- **GitHub OAuth App** (optional - only required if you want OAuth login)
-
-> **Note:** Docker/Podman is the **only supported installation method** for end users. Local development setup (without containers) is for contributors only — see [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
-
-## GitHub Authentication Options
-
-ActionsManager supports three GitHub credential types today:
-
-- **GitHub OAuth access token** via the normal "Log in with GitHub" flow — fastest browser-based setup, best for individuals and small teams
-- **Fine-grained personal access token** (recommended for self-hosted) — repository-scoped, doesn't require a GitHub OAuth App
-- **Classic personal access token** — broader scope, supported for compatibility
-
-Credential selection works like this: a saved PAT is used when configured, otherwise the current OAuth token is used, and a clear authentication error is returned when neither is available. Saved PATs are encrypted at rest and never returned to the UI in raw form.
-
-**→ [GitHub PAT Setup](docs/GITHUB_PAT_SETUP.md)** — fine-grained/classic token creation, minimum permissions, troubleshooting
-**→ [GitHub OAuth Setup](https://actionsmanager.io/getting-started/github-oauth-setup.html)** — OAuth App creation and callback configuration
-
-## Docker Deployment
-
-ActionsManager runs as a single self-hosted container: the image shown in [Quick Start](#-quick-start-self-hosted-beta) above, on port 8080. See [Self-Hosted Docker Deployment](DOCKER_DEPLOYMENT_MODES.md) for its architecture and startup rules, or [INSTALLATION.md](INSTALLATION.md) for the complete Docker run / Docker Compose walkthrough (SSL/TLS, backups, production hardening).
-
-## 📚 Documentation
-
-### Getting Started
-- **[Quick Start Guide](docs/QUICK_START.md)** - Self-hosted beta quick start
-- **[Product Demo](https://actionsmanager.io/getting-started/product-demo)** - Full walkthrough video and written guide
-- **[Self-Hosted Installation](INSTALLATION.md)** - Docker run and Docker compose setup
-- **[Beta Notes](BETA.md)** - Beta scope, limitations, and user responsibilities
-
-### Configuration
-- **[Environment Variables](docs/ENVIRONMENT_VARIABLES.md)** - Complete reference for all configuration options
-- **[GitHub PAT Setup](docs/GITHUB_PAT_SETUP.md)** - Fine-grained and classic PAT setup, permissions, and troubleshooting
-- **[Licensing Model](LICENSING_MODEL.md)** - Community/Core and future commercial model notes
-- **[Privacy Notice](PRIVACY.md)** - Self-hosted beta privacy notice
-- **[Security Policy](SECURITY.md)** - Vulnerability reporting and hardening guidance
-- **[Self-Hosted Docker Deployment](DOCKER_DEPLOYMENT_MODES.md)** - Container architecture, startup rules and hardening
-
-### Reference
-- **[Database Schema](DATABASE_SCHEMA.md)** - Table structure and relationships
-- **API Documentation** - once the backend is running, visit `/docs` for interactive Swagger/OpenAPI docs. Disabled by default in production installs (`ENVIRONMENT=production`, the shipped default); set `DISABLE_API_DOCS=false` to re-enable.
-
-### For Contributors
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Fork/branch/PR workflow, code review expectations
-- **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** - Backend/frontend local setup, testing, project structure
-- **[docs/FRONTEND_DEVELOPMENT.md](docs/FRONTEND_DEVELOPMENT.md)** - Frontend stack, component patterns, testing
-
-### Troubleshooting
-- **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** and **[Troubleshooting guides](https://actionsmanager.io/troubleshooting.html)** - Installation, auth, backend/frontend, database, and Docker issues
-- **[LICENSE_KEY_GUIDE.md](LICENSE_KEY_GUIDE.md)** - License key configuration and troubleshooting
-- Check the [Issues](https://github.com/greywolflabs/actions-manager/issues) page for known problems
-- Review the [Build Detection](https://actionsmanager.io/features/build-detection.html) documentation for build type detection details
-- Examine application logs for detailed error messages
-
-## Licensing
-
-ActionsManager uses a dual licensing model:
-
-- Community/Core source code is licensed under Apache License 2.0.
-- Commercial Pro, Enterprise, self-hosted paid features, and cloud/SaaS access may be governed by separate commercial terms, EULA, or GitHub Marketplace subscription terms.
-
-See:
-- [LICENSE](LICENSE)
-- [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)
-- [EULA.md](EULA.md)
-- [TERMS_OF_SERVICE.md](TERMS_OF_SERVICE.md)
-- [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
-- [LICENSING_MODEL.md](LICENSING_MODEL.md)
-
-These documents are product/legal drafts and should be reviewed by a qualified attorney before public launch.
+ActionsManager is developed by GreyWolf Labs and licensed under the [Apache License 2.0](LICENSE). Redistributions must keep the attribution in [NOTICE](NOTICE). The [Privacy Notice](PRIVACY.md) describes what a self-hosted install stores and where.

@@ -8,7 +8,7 @@ A screenshot walkthrough of the happy path for first-time Self-Hosted Beta users
 
 ---
 
-> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview. No paid plans are currently available. The beta is provided as-is, without warranty or production-readiness guarantee.
+> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview. The beta is provided as-is, without warranty or production-readiness guarantee.
 
 ## Overview
 
@@ -232,9 +232,8 @@ The workflow now exists as a local draft in ActionsManager. No changes have been
 
 | Action | Effect |
 |--------|--------|
-| **Create Pull Requests** | Proposes the draft workflow to GitHub repositories as reviewable pull requests. Recommended for beta testing. |
+| **Create Pull Requests** | Proposes the draft workflow to GitHub repositories as reviewable pull requests. |
 | **Continue editing** | Update the YAML and save additional drafts before creating pull requests. |
-| **Direct commit** | Commits directly to the repository branch without a pull request. Use carefully. |
 
 Return to the project workspace and click **Create Pull Requests** when you are ready to send the workflow to GitHub.
 
@@ -244,11 +243,11 @@ Return to the project workspace and click **Create Pull Requests** when you are 
 
 ### Saving a draft is not the same as pushing to GitHub
 
-A **Save draft / Commit Locally** action stores the workflow in ActionsManager only. The workflow file does not appear in any repository until you explicitly create a pull request or use direct commit mode. Both are separate steps after drafting.
+A **Save draft / Commit Locally** action stores the workflow in ActionsManager only. The workflow file does not appear in any repository until you create pull requests for it, a separate step after drafting.
 
-### PR-based delivery is recommended for beta testing
+### Every change goes out as a pull request
 
-Pull request delivery lets you review each change before it merges. This is the safest path during beta. Direct commit mode is available but bypasses review; use it only when review overhead is not needed and the change is well understood.
+ActionsManager delivers workflows to your repositories only through pull requests, so you can review each change before it merges.
 
 ### Recommended PAT permissions
 

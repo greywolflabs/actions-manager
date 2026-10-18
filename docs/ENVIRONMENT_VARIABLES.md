@@ -197,41 +197,9 @@ when the stored copy is stale, or when someone presses **Refresh**.
 
 | Variable | Required | Default | Description | Mode | Example |
 |----------|----------|---------|-------------|------|---------|
-| `LICENSE_KEY` | ❌ No | — | Vendor-issued JWT-signed license key (reserved for future paid tiers; no paid plans are currently available during beta) | Self-hosted | `****** |
+| `LICENSE_KEY` | ❌ No | — | Optional. The beta doesn't use a license key; leave it unset. | Self-hosted | — |
 
-**Details:**
-- **Beta note:** No paid plans are currently available. The beta runs without a license key; leaving `LICENSE_KEY` unset is the correct configuration for the self-hosted beta. The license-key code path is retained for future commercial tier behavior.
-
-- **JWT License Format** (for future use):
-  - Signed using RS256 algorithm
-  - Required payload: `{"tier": "professional"}` or `"enterprise"`
-  - Optional payload: `{"tier": "professional", "exp": 1735689600}`
-  - Customers configure only `LICENSE_KEY`; no customer-provided signing secret is required
-
-- **Supported Tiers (internal/future)**:
-  - `free` - Default, used when no valid `LICENSE_KEY` is set (the self-hosted beta runs this way)
-  - `professional` / `pro` - Not currently available
-  - `enterprise` - Not currently available
-
-- **Self-Hosted Beta Limits** (current, no license key required):
-  - Listed in [Beta Notes](https://actionsmanager.io/beta/beta-notes.html#self-hosted-beta-limits)
-  - Public and private repositories allowed
-
-- **License Issuance**:
-  - Professional and Enterprise license keys are issued by the vendor.
-  - Maintainer-only signing material must not be sent to self-hosted customers.
-
-- **Validation**:
-  - Happens at application startup
-  - Result is cached for application lifetime
-  - Invalid/expired licenses fall back to free tier
-  - No network calls needed (purely cryptographic)
-
-- **Error Handling**:
-  - Invalid format → free tier fallback, with warning
-  - Expired license → free tier fallback, with warning
-  - Invalid signature → free tier fallback, with warning
-  - No license → self-hosted beta limits (normal operation)
+Without a license key, the installation runs with the [self-hosted beta limits](https://actionsmanager.io/beta/beta-notes.html#self-hosted-beta-limits).
 
 **Note:** This is only used in `INSTALLATION_MODE=self-hosted`.
 
@@ -443,8 +411,7 @@ POSTGRES_DB=actions_manager
 POSTGRES_USER=actions_manager
 POSTGRES_PASSWORD=SecurePassword123!
 
-# Licensing (optional; no paid plans are currently available during beta)
-# LICENSE_KEY=eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+# The beta doesn't use a license key; leave LICENSE_KEY unset
 
 # Production settings
 DEBUG_MODE=false
@@ -456,7 +423,7 @@ USE_MOCK_RESPONSES=false
 2. Create `.env.self-hosted` with above values
 3. Register production GitHub OAuth app
 4. Update OAuth callback URL to production domain
-5. Leave `LICENSE_KEY` unset (no paid plans are currently available during beta)
+5. Leave `LICENSE_KEY` unset
 6. Use SSL/TLS certificate for HTTPS
 7. Set up reverse proxy (nginx/caddy) for SSL termination
 8. Configure monitoring and logging
@@ -869,6 +836,5 @@ USE_MOCK_RESPONSES=false
 ## References
 
 - [Self-Hosted Docker Deployment](../DOCKER_DEPLOYMENT_MODES.md)
-- [License Key Guide](../LICENSE_KEY_GUIDE.md)
 - [Main README](../README.md)
 - [Installation Guide](../INSTALLATION.md)

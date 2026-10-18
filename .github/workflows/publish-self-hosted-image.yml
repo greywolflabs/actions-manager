@@ -5,8 +5,8 @@ name: Publish Self-Hosted Image
 # which is where it runs.
 #
 # Builds the self-hosted image from the public source of each release and
-# publishes it as ghcr.io/<this repository> - the image the docs, install.sh
-# and docker-compose.self-hosted.yml use:
+# publishes it as ghcr.io/<this repository> - the image the docs and
+# docker-compose.self-hosted.yml use:
 #
 #   base-images -> build-amd64 + build-arm64 (pushed by digest, untagged)
 #     -> merge (:sha-<commit>) -> verify (compose smoke test, /app/VERSION,

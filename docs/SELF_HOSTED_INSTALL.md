@@ -1,6 +1,6 @@
 # ActionsManager Self-Hosted Beta Installation Guide
 
-> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. No paid plans are currently available. The beta is self-hosted only and is provided as-is, without warranty, SLA, support guarantee, uptime guarantee, or production-readiness guarantee. Operators are responsible for securing their deployment, protecting credentials and `.env` files, reviewing workflow changes, and backing up data.
+> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. The beta is self-hosted only and is provided as-is, without warranty, SLA, support guarantee, uptime guarantee, or production-readiness guarantee. Operators are responsible for securing their deployment, protecting credentials and `.env` files, reviewing workflow changes, and backing up data.
 
 For the supported first-run path, prefer [../INSTALLATION.md](../INSTALLATION.md). This longer guide is retained as a detailed reference.
 
@@ -11,7 +11,7 @@ For the supported first-run path, prefer [../INSTALLATION.md](../INSTALLATION.md
 3. [Prerequisites](#prerequisites)
 4. [Installation Methods](#installation-methods)
 5. [Post-Installation Setup](#post-installation-setup)
-6. [Account Tiers](#account-tiers)
+6. [Beta Limits](#beta-limits)
 7. [Configuration Options](#configuration-options)
 8. [Upgrading](#upgrading)
 9. [Troubleshooting](#troubleshooting)
@@ -48,14 +48,11 @@ Self-hosted deployment means running ActionsManager.io on your own servers or in
 - You are responsible for hardening and access controls
 
 ✅ **Beta scope**
-- Free during beta
-- No paid plans are currently available
-- Features, limits, and license behavior may change before GA
+- Features and limits may change before GA
 - Optional PostgreSQL for larger evaluations
 
 ✅ **Simple Deployment**
 - Single container deployment via Docker/Podman
-- Automated installation script
 - Everything runs in a single port (8080)
 
 ---
@@ -213,103 +210,7 @@ For PAT setup, see [GitHub PAT Setup](GITHUB_PAT_SETUP.md).
 
 ## Installation Methods
 
-### Method 1: Automated Installation (Recommended)
-
-The automated installer guides you through all setup steps interactively.
-
-#### Quick Install (One Command)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/greywolflabs/actions-manager/main/install.sh | bash
-```
-
-#### Install with More Control
-
-```bash
-# Clone the repository
-git clone https://github.com/greywolflabs/actions-manager.git
-cd actions-manager
-
-# Run the installer
-./install.sh
-```
-
-#### What the Installer Does
-
-✅ Validates OS (Linux/macOS)
-✅ Checks Docker/Podman installation
-✅ Verifies system dependencies (curl, git)
-✅ Prompts for port configuration
-✅ Guides through GitHub OAuth setup
-✅ Handles optional license key configuration
-✅ Generates random SECRET_KEY
-✅ Creates `.env.self-hosted` configuration
-✅ **Pulls the official pre-built image** from GHCR (no local build required)
-✅ Starts the application
-✅ Displays access information
-
-> **Contributors:** if you want to build the image from local source instead
-> of pulling from GHCR, run `./install.sh --build`. The installer will then
-> layer `docker-compose.self-hosted.dev.yml` on top of the release compose
-> file and build `Dockerfile.self-hosted` locally. This is **not** the
-> recommended flow for end users.
-
-#### Interactive Prompts
-
-When you run the installer, you'll be asked:
-
-**1. Port Selection**
-```
-Port [default: 8080]:
-```
-Press Enter for default or enter a custom port (1-65535).
-
-**2. GitHub OAuth Configuration**
-```
-GitHub Client ID:
-GitHub Client Secret: [hidden input]
-```
-Paste your OAuth credentials from the GitHub app settings.
-
-**3. License (Optional)**
-```
-License Key (optional):
-License Key only; no signing secret is required for customers
-```
-Leave blank for free tier. Enter your license key if you have one.
-
-#### After Installation
-
-Once complete, you'll see:
-
-```
-============================================================
-✓ ActionsManager.io Successfully Installed!
-============================================================
-
-Access your instance at:
-  🌐 Web Interface:    http://localhost:8080
-  📚 API Docs:         http://localhost:8080/docs
-
-Next steps:
-  1. Open http://localhost:8080 in your browser
-  2. Choose a sign-in method:
-     - Log in with GitHub (OAuth)
-     - Sign in with Personal Access Token
-  3. If using OAuth, authorize the OAuth application
-  4. If using a PAT, paste the token and submit it for validation
-  5. Create your first project
-  6. Add repositories and start creating workflows
-
-For help: https://github.com/greywolflabs/actions-manager/issues
-============================================================
-```
-
-> **Note:** The API Docs link (`/docs`) is disabled by default. The installer's default config sets `ENVIRONMENT=production`, which auto-disables the interactive Swagger/OpenAPI UI. Set `DISABLE_API_DOCS=false` in your `.env.self-hosted` to re-enable it.
-
-### Method 2: Manual Installation
-
-For advanced users who want complete control:
+### Manual Installation
 
 #### Step 1: Clone Repository
 
@@ -341,7 +242,7 @@ GITHUB_CLIENT_SECRET=your_github_client_secret
 # without it the container refuses to start. Remove it once you use https://.
 # ALLOW_INSECURE_HTTP=true
 
-# OPTIONAL: License key (reserved for future paid tiers; no paid plans are currently available during beta)
+# OPTIONAL: License key. The beta doesn't use one; leave it unset.
 # LICENSE_KEY=your_jwt_license_key
 
 # OPTIONAL: PostgreSQL (default uses SQLite)
@@ -508,15 +409,11 @@ Output will show:
 
 ### Understanding Your Tier
 
-See [Account Tiers](#account-tiers) section for detailed feature comparison.
+See [Beta Limits](#beta-limits).
 
 ---
 
-## Account Tiers
-
-ActionsManager Self-Hosted is free during beta. No paid plans are currently available; future tier names, limits, support terms, and license behavior may change before general availability.
-
-### Self-Hosted Beta Limits
+## Beta Limits
 
 All users running the self-hosted beta image get the same beta limits:
 
@@ -531,12 +428,6 @@ All users running the self-hosted beta image get the same beta limits:
 | **Private repositories** | ✅ Yes |
 | **Reusable workflows** | ✅ Yes |
 | **Drift detection** | ✅ Yes |
-
-> **Paid plans are not currently available during the self-hosted beta.** Cloud/SaaS and GitHub Marketplace billing are future/planned paths and are not part of this first public beta.
-
-### Future Tiers (Not Yet Available)
-
-The application contains tier and license-key code paths for future planning. During the beta, these are not active paid offerings. Future paid tiers may increase project counts, secrets, and other limits. Free beta access does not grant permanent free access to future paid features.
 
 ### Checking Your Tier
 
@@ -684,7 +575,6 @@ docker compose -f docker-compose.self-hosted.yml logs | grep -i "migration"
 #### License Configuration
 
 ```bash
-# License key (reserved for future paid tiers; no paid plans are currently available during beta)
 # Leave unset for self-hosted beta — no license key is required
 # LICENSE_KEY=your_jwt_license_key_here
 ```
@@ -734,7 +624,7 @@ GITHUB_CLIENT_SECRET=prod_secret
 # URLs - custom domain and port
 APP_URL=https://actions.example.com:8443
 
-# No paid plans are currently available during beta; leave LICENSE_KEY unset
+# Leave LICENSE_KEY unset during the beta
 ```
 
 #### Example 3: Production with PostgreSQL
@@ -906,10 +796,6 @@ cp .env.self-hosted .env.self-hosted.backup
 docker compose -f docker-compose.self-hosted.yml exec app tar -czf - -C /app/data actions_manager.db > backup_$(date +%Y%m%d_%H%M%S).tar.gz
 ```
 
-### Upgrading Your License Tier
-
-See [Account Tiers](#account-tiers)
-
 ### Version Compatibility
 
 Check if your data is compatible with new versions:
@@ -1039,22 +925,6 @@ ports:
 
 # Rebuild
 docker compose -f docker-compose.self-hosted.yml up --build -d
-```
-
-#### Problem: Installation Script Permission Denied
-
-**Symptoms:**
-```
--bash: ./install.sh: Permission denied
-```
-
-**Solution:**
-```bash
-# Make script executable
-chmod +x install.sh
-
-# Run again
-./install.sh
 ```
 
 ### Runtime Issues
@@ -1490,7 +1360,6 @@ If you continue experiencing issues:
 
 #### 1. Check Documentation
 - [README.md](../README.md) - General overview
-- [LICENSE_KEY_GUIDE.md](../LICENSE_KEY_GUIDE.md) - License configuration
 - [DOCKER_DEPLOYMENT_MODES.md](../DOCKER_DEPLOYMENT_MODES.md) - Self-hosted Docker deployment
 - [DATABASE_SCHEMA.md](../DATABASE_SCHEMA.md) - Database details
 
@@ -2044,10 +1913,10 @@ services:
 
 ```bash
 # Using Trivy
-trivy image greywolflabs/actions-manager:latest
+trivy image ghcr.io/greywolflabs/actions-manager:latest
 
 # Using Docker Scout
-docker scout cves greywolflabs/actions-manager:latest
+docker scout cves ghcr.io/greywolflabs/actions-manager:latest
 ```
 
 ### PostgreSQL Production Setup
@@ -2202,7 +2071,6 @@ df -h  # Check available space
 ### Documentation
 - [README.md](../README.md) - Main documentation
 - [INSTALLATION.md](../INSTALLATION.md) - Installation guide
-- [LICENSE_KEY_GUIDE.md](../LICENSE_KEY_GUIDE.md) - License configuration
 - [DOCKER_DEPLOYMENT_MODES.md](../DOCKER_DEPLOYMENT_MODES.md) - Self-hosted Docker deployment
 - [DATABASE_SCHEMA.md](../DATABASE_SCHEMA.md) - Database structure
 
@@ -2247,7 +2115,7 @@ df -h  # Check available space
 
 ---
 
-**Questions or feedback?** [Create an issue](https://github.com/greywolflabs/actions-manager/issues) on GitHub.
+**Questions or feedback?** Ask in [GitHub Discussions](https://github.com/greywolflabs/actions-manager/discussions).
 
 ---
 

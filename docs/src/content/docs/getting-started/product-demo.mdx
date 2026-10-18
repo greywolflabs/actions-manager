@@ -12,41 +12,36 @@ See a complete multi-repository GitHub Actions workflow rollout, start to finish
 
 ## Watch the demo
 
-<VideoPlayer
-	sizes="(min-width: 72rem) 45rem, (min-width: 50rem) calc(100vw - 21.75rem), calc(100vw - 2rem)"
-	loading="eager"
-/>
+<VideoPlayer />
 
-The player loads from youtube-nocookie.com only after you press play. [Watch on YouTube ↗](https://youtu.be/WkDYK7pCBjI)
+This cut has no sound; a caption names each chapter as it starts. For a narrated version with captions, [watch it on YouTube ↗](https://youtu.be/8TrgE9YDGXA). GitHub is simulated in both, so no real repository or account appears.
 
 ## What's in the video
 
-The demo walks through a complete rollout to a multi-repository Maven project:
+The demo rolls one workflow out to three Node.js repositories, `payments-service`, `payments-worker` and `checkout-web`:
 
-1. **Authenticate using a GitHub PAT** — sign in with a fine-grained or classic personal access token. On a first sign-in, a welcome screen offers a guided tour of everything below.
-2. **Create the `MavenBuilds` Caller Workflow Project** — set up a project to manage a group of repositories.
-3. **Add three repositories** — bring the target repos under management.
-4. **Detect the Maven build type** — ActionsManager inspects each repository and identifies its build type.
-5. **Generate workflow changes and create pull requests** — a caller workflow is generated per repository and proposed as a pull request.
-6. **Manage the pull requests** — review and track PR status for all three repositories from one place.
-7. **Merge the pull requests** — apply the workflow changes to each repository.
+1. **Sign in with a personal access token** (0:00): paste a fine-grained or classic PAT on the sign-in screen.
+2. **Create a Caller Workflow Project** (0:10): name it **Payments Platform**, pick the three repositories, choose prefix mode and set the project key **PAY**.
+3. **Detect the build type** (0:32): add a workflow called `build-and-test`. ActionsManager detects Node.js (npm) in all three repositories, so one workflow fits the whole project. Picking Node.js (npm) starts the workflow from that template, and it is committed locally as a draft.
+4. **Open pull requests across repositories** (0:48): one PR campaign opens PRs #41, #42 and #43, one per repository, each adding `AM_PAY_build-and-test.yml` on the `actions-manager/payments-platform` branch.
+5. **Review and merge** (1:07): **Merge Open PRs** merges all three from the campaign, which moves to **Completed Campaigns**.
 
 :::note
-Never expose a Personal Access Token in recordings, screenshots, shell history, documentation, or committed files. This demo does not require you to provide a PAT to YouTube or any third-party service — PAT authentication happens only between your browser and your own ActionsManager instance.
+Never expose a Personal Access Token in recordings, screenshots, shell history, documentation, or committed files. The token typed in this demo is a placeholder. PAT authentication happens only between your browser and your own ActionsManager instance.
 :::
 
 ## What this demonstrates
 
-- **Multi-repository project management** — grouping repositories under one Caller Workflow Project
-- **Automated build detection** — identifying a repository's build type without manual inspection
-- **Consistent workflow generation** — the same workflow template applied uniformly across every repository
-- **PR-based delivery** — proposing changes as reviewable pull requests instead of direct commits
-- **Centralized PR management** — tracking and merging pull requests across repositories from one interface
-- **Workflow synchronization after merge** — keeping caller workflows aligned with the managed definition once merged
+- **Multi-repository project management**: grouping repositories under one Caller Workflow Project
+- **Automated build detection**: identifying each repository's build type without manual inspection
+- **Consistent workflow delivery**: one workflow definition delivered to every repository in the project
+- **PR-based delivery**: proposing changes as reviewable pull requests instead of direct commits
+- **Centralized PR management**: tracking and merging pull requests across repositories from one PR campaign
 
 ## Next steps
 
 - **→ [Self-Hosted Installation](installation.html)**
 - **→ [Quick Start](quick-start.html)**
+- **→ [First Workflow Walkthrough](first-workflow-walkthrough.html)**
 - **→ [GitHub PAT Setup](github-pat-setup.html)**
 - **→ [ActionsManager on GitHub](https://github.com/greywolflabs/actions-manager)**
