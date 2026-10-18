@@ -691,6 +691,39 @@ describe("CreatePRModal", () => {
     expect(modal.textContent).toMatch(/personal access tokens/i);
   });
 
+  describe("preflight explanation", () => {
+    const PREFLIGHT_INTRO = /preflight creates a validation pull request/i;
+    const LOCKED = /campaign creation is locked until the validation pr is merged/i;
+    const preflightProps = {
+      validationRepo: "owner/validation",
+      preflightRequired: true,
+      preflightRunAt: null,
+      preflightError: null,
+      preflightPrUrl: null,
+    };
+
+    it("says nothing about preflight when no validation repository is configured", () => {
+      render(<CreatePRModal {...baseProps} />);
+
+      expect(screen.queryByText(PREFLIGHT_INTRO)).not.toBeInTheDocument();
+      expect(screen.queryByText(LOCKED)).not.toBeInTheDocument();
+    });
+
+    it("explains preflight and the lock while preflight blocks the campaign", () => {
+      render(<CreatePRModal {...baseProps} {...preflightProps} preflightStatus="not_run" />);
+
+      expect(screen.getByText(PREFLIGHT_INTRO)).toBeInTheDocument();
+      expect(screen.getByText(LOCKED)).toBeInTheDocument();
+    });
+
+    it("drops the lock once preflight has passed", () => {
+      render(<CreatePRModal {...baseProps} {...preflightProps} preflightStatus="passed" />);
+
+      expect(screen.getByText(PREFLIGHT_INTRO)).toBeInTheDocument();
+      expect(screen.queryByText(LOCKED)).not.toBeInTheDocument();
+    });
+  });
+
   it("disables Create Campaign when preflight is required and not passed", () => {
     render(
       <CreatePRModal

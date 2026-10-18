@@ -1,6 +1,6 @@
 # Privacy Notice for ActionsManager Self-Hosted Beta
 
-This notice describes the current self-hosted beta behavior. It is product documentation, not legal advice. Privacy terms for any future Cloud/SaaS or paid offering should be reviewed before launch.
+This notice describes the current self-hosted beta behavior. It is product documentation, not legal advice.
 
 ## Where the self-hosted beta runs
 

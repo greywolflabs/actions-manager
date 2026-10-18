@@ -90,28 +90,6 @@ don't turn off TLS verification for pip or npm to get past it.
 
 **Note:** Use GitHub Actions workflow for reliable builds in production.
 
-### Install Script Fails
-
-**Symptom:** `install.sh` exits with error.
-
-**Diagnostic:**
-```bash
-# Check Docker/Podman
-docker --version
-podman --version
-
-# Check docker-compose
-docker compose version
-
-# Run with debug
-bash -x install.sh
-```
-
-**Common Issues:**
-- Docker/Podman not installed
-- User not in docker group: `sudo usermod -aG docker $USER`
-- Missing dependencies: `curl`, `git`
-
 ## Authentication Issues
 
 ### OAuth Flow Fails
@@ -678,8 +656,8 @@ Include:
 
 ### Where to Get Help
 
-- **GitHub Issues:** Bug reports and feature requests
-- **GitHub Discussions:** Questions and community support
+- **GitHub Issues:** Bug reports
+- **GitHub Discussions:** Questions, feature ideas and community support
 - **Documentation:** [docs/README.md](README.md)
 
 ## Related Documentation

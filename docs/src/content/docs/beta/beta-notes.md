@@ -12,20 +12,12 @@ What the beta is, what it is not, and what to expect.
 
 ActionsManager Self-Hosted is currently available as a **free beta preview** for testing, evaluation, and feedback.
 
-This beta is **self-hosted only**. It is not:
-- The hosted Cloud/SaaS service
-- A GitHub Marketplace release
-- A paid product
-
-No paid plans are currently available.
+This beta is **self-hosted only**: it runs on infrastructure you control.
 
 ## What Beta Means
 
 - The beta is intended for testing, evaluation, and feedback
-- It is **free during the beta period**
-- Features, limits, licensing behavior, packaging, and commercial availability **may change** before general availability
-- Paid plans or commercial licensing may be introduced in the future
-- Free beta access does **not** grant permanent free access to future paid features or commercial offerings
+- Features and limits **may change** before general availability
 
 ## Self-Hosted Beta Limits
 
@@ -41,7 +33,7 @@ The following limits apply during the self-hosted beta:
 | Repositories per project | 10 |
 | Workflow run history | 30 days |
 
-These limits are designed to support realistic product evaluation. Paid plans are not currently available to increase them.
+These limits are designed to support realistic product evaluation.
 
 ## No Production Guarantee
 
@@ -59,7 +51,7 @@ Do not rely on the beta as a guaranteed production service.
 - Single-container self-hosted deployment
 - GitHub PAT and OAuth authentication
 - Multi-repository project management
-- Workflow management with PR-based and direct-commit delivery
+- Workflow management with PR-based delivery
 - Drift detection and resolution
 - Secrets and variables management
 - Real-time WebSocket updates
@@ -89,8 +81,8 @@ Self-hosted operators are responsible for:
 ## Providing Feedback
 
 Feedback is welcome during the beta. You can:
-- [Open an issue](https://github.com/greywolflabs/actions-manager/issues) to report bugs or request features
-- [Start a discussion](https://github.com/greywolflabs/actions-manager/discussions) for questions and general feedback
+- [Open an issue](https://github.com/greywolflabs/actions-manager/issues) to report a bug
+- [Start a discussion](https://github.com/greywolflabs/actions-manager/discussions) for questions, feature ideas and general feedback
 
 When reporting issues, please include:
 - ActionsManager version or image tag

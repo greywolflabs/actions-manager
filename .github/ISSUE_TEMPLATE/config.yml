@@ -1,0 +1,16 @@
+# Links point at the public repository on purpose: this repository has no
+# Discussions, and the export leaves public-repository URLs untouched.
+blank_issues_enabled: false
+contact_links:
+  - name: ❓ Ask a question
+    url: https://github.com/greywolflabs/actions-manager/discussions/categories/q-a
+    about: Help with installing, signing in, GitHub permissions or using ActionsManager.
+  - name: 💡 Suggest an idea
+    url: https://github.com/greywolflabs/actions-manager/discussions/categories/ideas
+    about: Feature requests, and beta limits that got in your way. Others can upvote them.
+  - name: 🔐 Report a security vulnerability
+    url: https://github.com/greywolflabs/actions-manager/security/advisories/new
+    about: Report it privately. Please don't open a public issue for a security problem.
+  - name: 📚 Documentation
+    url: https://actionsmanager.io
+    about: Setup guides, feature docs and troubleshooting.

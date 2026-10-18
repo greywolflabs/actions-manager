@@ -686,7 +686,7 @@ Saved PAT validation status is tracked in the `accounts` table so the UI can sho
 
 ### Account Tiers & Feature Limits
 
-> **Beta note:** Paid plans are not currently available. During the self-hosted beta, all users share the same beta limits regardless of the stored `account_type` value (see below).
+> **Beta note:** During the self-hosted beta, all users share the same beta limits regardless of the stored `account_type` value (see below).
 
 **Self-Hosted Beta Limits (enforced when `INSTALLATION_MODE=self-hosted`):**
 

@@ -123,7 +123,7 @@ ENV INSTALLATION_MODE=self-hosted
 COPY --from=frontend-builder /app/frontend/build /app/frontend/build
 
 # Ship the license terms with the image.
-COPY LICENSE COMMERCIAL-LICENSE.md /app/
+COPY LICENSE NOTICE /app/
 
 # Release version, read at runtime by backend/projects.py (one directory up
 # from /app/backend, matching how it resolves the repo root in local dev).

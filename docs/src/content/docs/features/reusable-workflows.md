@@ -42,7 +42,7 @@ A typical producer-to-consumer update cycle:
 1. **Update the reusable workflow** in the producer repository (e.g., bump a version or change inputs)
 2. **ActionsManager detects** which caller workflows across all consumer projects reference the updated reusable workflow
 3. **Create a PR campaign** — each affected repository receives a pull request updating its caller workflow to the new version
-4. **Merge or sync** the PRs individually, in bulk, or via direct commit
+4. **Merge** the PRs individually or in bulk
 5. **Drift detection confirms** that all consumers are back in sync with the producer
 
 ## Importing an Existing Reusable Workflow

@@ -8,7 +8,7 @@ How ActionsManager Self-Hosted Beta handles your data.
 
 ---
 
-> **Note:** This notice describes the current self-hosted beta behavior. It is product documentation, not legal advice. Privacy terms for any future Cloud/SaaS or paid offering will be reviewed and published separately before launch.
+> **Note:** This notice describes the current self-hosted beta behavior. It is product documentation, not legal advice.
 
 ## Where Data is Stored
 

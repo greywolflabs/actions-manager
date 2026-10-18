@@ -37,8 +37,6 @@ docker run -d \
 
 Do **not** place your personal PAT in the Docker command or `GITHUB_TOKEN` for normal sign-in. Start the container first, then enter the PAT in the UI so it is not exposed in shell history or config files.
 
-The automated `install.sh` path still prompts for OAuth credentials today, so Docker run / Docker Compose is the fastest PAT-only path.
-
 ## Supported Token Types
 
 - **Fine-grained personal access token** — recommended

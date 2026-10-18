@@ -1,6 +1,6 @@
 # Actions Manager Self-Hosted Beta Quick Start
 
-Actions Manager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. No paid plans are currently available. The beta is self-hosted only; Cloud/SaaS and GitHub Marketplace billing are not part of the first public beta.
+Actions Manager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. The beta is self-hosted only: it runs on infrastructure you control.
 
 ## 📋 Table of Contents
 
@@ -18,7 +18,7 @@ Actions Manager Self-Hosted is currently a free beta preview for testing, evalua
 **ActionsManager.io** is a centralized platform for managing GitHub Actions workflows across your repositories. With ActionsManager.io, you can:
 
 ✅ **Create and deploy workflows** from an intuitive visual interface  
-✅ **Two deployment modes** - Direct commit for speed, PR-based for review  
+✅ **Deliver through pull requests** - one reviewable PR per repository, tracked as a PR campaign  
 ✅ **Detect build types automatically** (Maven, npm, .NET, Python, Go, Rust, Docker)  
 ✅ **Manage secrets securely** across multiple repositories  
 ✅ **Monitor drift** between local and GitHub workflow versions  
@@ -52,7 +52,6 @@ Actions Manager Self-Hosted is currently a free beta preview for testing, evalua
 - 4 Caller Workflow Projects, 2 Reusable Workflow Projects
 - 6 secrets, 6 environment variables, 6 deployment environments per project
 - Public and private repositories allowed
-- Free during beta; paid plans are not currently available
 - Operators control their own infrastructure, backups, and credentials
 
 **Requirements:**
@@ -93,8 +92,6 @@ docker run -d \
 3. Open `http://localhost:8080`
 4. Click **Sign in with Personal Access Token**
 5. Start the container first, then paste your PAT into the login screen so it is not stored in shell history.
-
-> 💡 **Note:** The automated `install.sh` installer still prompts for OAuth credentials today. Use the container command above for the quickest PAT-only install.
 
 ### Prerequisites Checklist
 
@@ -145,53 +142,12 @@ docker compose version
 4. Click **"Register application"**
 5. **Copy your Client ID** and generate a **Client Secret** (save these!)
 
-### Step 2: Run the Automated Installer (3 minutes, OAuth-oriented)
+### Step 2: Start ActionsManager (1 minute)
 
-**Option A: Direct installation (one command)**
+- **Personal Access Token:** run the `docker run` command in [Fastest Path: PAT Quick Install](#fastest-path-pat-quick-install) above.
+- **GitHub OAuth App:** follow [Create a GitHub OAuth App](../INSTALLATION.md#create-a-github-oauth-app) and the Docker run or Docker Compose steps in the [installation guide](../INSTALLATION.md).
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/greywolflabs/actions-manager/main/install.sh | bash
-```
-
-**Option B: Clone first for more control**
-
-```bash
-git clone https://github.com/greywolflabs/actions-manager.git
-cd actions-manager
-chmod +x install.sh
-./install.sh
-```
-
-### Step 3: Answer Installation Prompts
-
-The installer will ask:
-
-**Port (press Enter for default 8080):**
-```
-Port [default: 8080]: 
-```
-→ Just press Enter unless you need a different port
-
-**GitHub OAuth Credentials (from Step 1, only if you chose OAuth):**
-```
-GitHub Client ID: <paste your Client ID>
-GitHub Client Secret: <paste your Client Secret>
-```
-
-**License (press Enter to skip — not required for self-hosted beta):**
-```
-License Key (optional): 
-```
-→ Leave blank (no paid plans are currently available during beta)
-
-The installer will then:
-- ✅ Validate Docker/Podman
-- ✅ Generate secure configuration
-- ✅ Build containers (10-15 minutes)
-- ✅ Start ActionsManager.io
-- ✅ Display your access information
-
-### Step 4: First Login (1 minute)
+### Step 3: First Login (1 minute)
 
 Once installation completes:
 
@@ -303,7 +259,7 @@ The workflow editor shows the generated filename (with prefix), the selected rep
 
 Click **Commit Locally**. The workflow is saved immediately, and the editor shows the **New Local** status badge with a toast notification confirming the draft was saved.
 
-> **Saving a draft does not push to GitHub.** The workflow file does not appear in any repository until you create pull requests or use direct commit mode.
+> **Saving a draft does not push to GitHub.** The workflow file does not appear in any repository until you create pull requests.
 
 ### 12. Create pull requests when ready to push the workflow to GitHub
 
@@ -457,7 +413,7 @@ lsof -i :8080
 1. **Read the feature docs:**
    - [Project Management](https://actionsmanager.io/features/projects.html)
    - [Workflow Creation](https://actionsmanager.io/features/workflows.html)
-   - [Secret Management](../README.md#-secrets--environment-management)
+   - [Secret Management](../README.md#features)
 
 2. **Configure advanced features:**
    - Custom OAuth apps for different environments
@@ -467,7 +423,6 @@ lsof -i :8080
 
 **For Self-Hosted:**
 - [SELF_HOSTED_INSTALL.md](SELF_HOSTED_INSTALL.md) - Complete installation reference
-- [LICENSE_KEY_GUIDE.md](../LICENSE_KEY_GUIDE.md) - License-key behavior (no paid plans are currently available during beta)
 - [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md) - All configuration options
 
 ### 🎓 Learning Resources
@@ -477,7 +432,7 @@ lsof -i :8080
    - [GitHub Actions Examples](https://github.com/actions)
 
 2. **CI/CD Patterns:**
-   - [CI/CD Best Practices](https://github.com/greywolflabs/actions-manager#core-features)
+   - [CI/CD Best Practices](https://github.com/greywolflabs/actions-manager#features)
    - [Creating Workflows](https://actionsmanager.io/features/workflows.html)
 
 3. **Team Collaboration:**
@@ -510,7 +465,7 @@ lsof -i :8080
 
 ## Self-Hosted Beta Limits
 
-ActionsManager Self-Hosted is a **free beta preview**. No paid plans are currently available. The beta limits are:
+ActionsManager Self-Hosted is a **free beta preview**. The beta limits are:
 
 | Resource | Beta Limit |
 |---|---|
@@ -521,7 +476,7 @@ ActionsManager Self-Hosted is a **free beta preview**. No paid plans are current
 | GitHub environments per project | 6 |
 | Repositories per project | 10 |
 
-All users running the self-hosted beta image get the same limits. Cloud/SaaS and GitHub Marketplace billing are future/planned paths and are not part of the beta.
+All users running the self-hosted beta image get the same limits.
 
 ---
 
@@ -530,25 +485,19 @@ All users running the self-hosted beta image get the same limits. Cloud/SaaS and
 ### Self-Hosted in 5 Minutes
 
 ```bash
-# 1. Create GitHub OAuth App (2 min)
-# https://github.com/settings/developers → New OAuth App
+# 1. Create a GitHub PAT (2 min)
+# https://github.com/settings/tokens → Fine-grained token
 
-# 2. Run installer (1 min)
-curl -fsSL https://raw.githubusercontent.com/greywolflabs/actions-manager/main/install.sh | bash
+# 2. Start the container (1 min)
+# Run the docker run command from "Fastest Path: PAT Quick Install" above
 
-# 3. Answer prompts (1 min)
-# Port, OAuth credentials
+# 3. Sign in (1 min)
+# http://localhost:8080 → Sign in with Personal Access Token
 
-# 4. Wait for build (10-15 min)
-# Let Docker build containers
-
-# 5. Login (1 min)
-# http://localhost:8080 → Log in with GitHub or Sign in with Personal Access Token
-
-# 6. Create project (1 min)
+# 4. Create project (1 min)
 # Dashboard → Create Project
 
-# 7. Add repos & deploy workflow (2 min)
+# 5. Add repos & deploy workflow (2 min)
 # Project → Add Repository → Create Workflow
 ```
 
@@ -565,7 +514,7 @@ You now have ActionsManager.io running! Next:
 5. ✅ Configure secrets
 6. ✅ Enable drift detection
 
-**Questions?** Open an issue on [GitHub](https://github.com/greywolflabs/actions-manager/issues)
+**Questions?** Ask in [GitHub Discussions](https://github.com/greywolflabs/actions-manager/discussions)
 
 **Ready to go deeper?** See [SELF_HOSTED_INSTALL.md](SELF_HOSTED_INSTALL.md)
 

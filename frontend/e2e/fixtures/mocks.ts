@@ -283,6 +283,8 @@ export interface MockState {
    * plain campaign shape.
    */
   campaignExtras?: Record<string, unknown>;
+  /** Fields every project created through POST /api/projects/ starts with. */
+  projectDefaults?: Partial<ProjectStub>;
   /**
    * Body of the last POST /api/projects. `use_prefix` only leaves the browser
    * in this request, so asserting it is the only way to prove the naming mode
@@ -318,6 +320,7 @@ export function createMockState(initial: Partial<MockState> = {}): MockState {
     actionsProjectPreview: initial.actionsProjectPreview ?? SAMPLE_ACTIONS_PREVIEW,
     rollbackPreview: initial.rollbackPreview ?? null,
     campaignExtras: initial.campaignExtras,
+    projectDefaults: initial.projectDefaults,
     failNextSave: initial.failNextSave ?? false,
     failProjectsList: initial.failProjectsList ?? false,
     renameImpact: initial.renameImpact ?? RENAME_IMPACT,
@@ -512,6 +515,7 @@ export async function installApiMocks(
         const payload = JSON.parse(route.request().postData() || "{}");
         state.lastProjectCreateRequest = payload;
         const created = makeProject({
+          ...state.projectDefaults,
           project_id: state.projects.length + 1,
           project_name: payload.project_name,
           project_code: (payload.custom_project_key || payload.project_name || "PROJ").toUpperCase().slice(0, MOCK_PROJECT_CODE_MAX_LENGTH),
@@ -1103,7 +1107,9 @@ export async function mockResolveDrift(
 
 /**
  * Override the create-pull-requests endpoint with a multi-repo response.
- * Each entry in `results` maps a repo to success/failure state.
+ * Each entry in `results` maps a repo to success/failure state. `title`,
+ * `author`, `createdAt` and `workflowNames` describe the campaign the created
+ * PRs form; they default to the values the e2e specs have always seen.
  */
 export async function mockCreatePullRequests(
   page: Page,
@@ -1117,9 +1123,13 @@ export async function mockCreatePullRequests(
       branch_name?: string;
       error?: string;
     }>;
+    title?: string;
+    author?: string;
+    createdAt?: string;
+    workflowNames?: string;
   } = {},
 ): Promise<void> {
-  const { repoResults = [] } = options;
+  const { repoResults = [], title, author, createdAt = "2025-01-02T00:00:00Z", workflowNames } = options;
 
   await page.route(
     apiPath((p) => p === "/api/create-pull-requests"),
@@ -1144,8 +1154,11 @@ export async function mockCreatePullRequests(
           pr_state: "open",
           branch_name: r.branch_name ?? "actions-manager/test",
           target_branch: "main",
-          created_at: "2025-01-02T00:00:00Z",
-          updated_at: "2025-01-02T00:00:00Z",
+          title,
+          author,
+          workflow_names: workflowNames,
+          created_at: createdAt,
+          updated_at: createdAt,
         }));
 
         state.prStatus.pull_requests = pull_requests;

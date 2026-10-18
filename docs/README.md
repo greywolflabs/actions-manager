@@ -63,8 +63,7 @@ Welcome to the Actions Manager documentation! This guide will help you find the 
 
 - **[GitHub PAT Setup](GITHUB_PAT_SETUP.md)** - Fine-grained and classic PAT setup, permissions, and troubleshooting
 - **[Environment Variables](ENVIRONMENT_VARIABLES.md)** - Configuration reference
-- **[License Keys](../LICENSE_KEY_GUIDE.md)** - License key management (self-hosted)
-- **[Licensing Model](../LICENSING_MODEL.md)** - Open-source, commercial, EULA, SaaS terms, and privacy overview
+- **[License](../LICENSE)** - Apache License 2.0
 - **[Troubleshooting](TROUBLESHOOTING.md)** - Common issues and solutions
 - **[PR Campaigns](https://actionsmanager.io/features/pr-campaigns.html)** - Delivering workflows to GitHub through pull requests
 
@@ -166,7 +165,7 @@ When updating documentation, please follow the [Contributing Guidelines](../CONT
 ## 🆘 Need Help?
 
 - **Found an error?** Open an issue or submit a PR
-- **Have a question?** Check [Troubleshooting](TROUBLESHOOTING.md) or open an issue
+- **Have a question?** Check [Troubleshooting](TROUBLESHOOTING.md) or ask in [GitHub Discussions](https://github.com/greywolflabs/actions-manager/discussions)
 - **Want to contribute?** See [Contributing Guide](../CONTRIBUTING.md)
 
 ---

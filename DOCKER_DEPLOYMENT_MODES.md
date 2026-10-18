@@ -1,6 +1,6 @@
 # Self-Hosted Docker Deployment
 
-This document describes the ActionsManager self-hosted container: how it is built, how it starts, and what it checks. The first public beta is **Self-Hosted only**; Cloud/SaaS is not an active beta offering (see [LICENSING_MODEL.md](LICENSING_MODEL.md)).
+This document describes the ActionsManager self-hosted container: how it is built, how it starts, and what it checks. The first public beta is **Self-Hosted only**.
 
 > For first-time self-hosted beta setup, use the simplified install guide: **[INSTALLATION.md](INSTALLATION.md)**.
 
@@ -16,7 +16,6 @@ rather than running with weakened security guarantees.
 | Env template | `.env.self-hosted.example` |
 | `INSTALLATION_MODE` | `self-hosted`, the only mode the image serves |
 | `ENVIRONMENT` | `production` recommended; `development` only for local testing |
-| Billing | Free during beta; optional future `LICENSE_KEY` behavior |
 | Database | SQLite (default) or PostgreSQL |
 | `LICENSE_KEY` | Optional |
 | Tier override env vars (`ACCOUNT_TYPE`, `TIER`, `PLAN`, `FORCE_TIER`, `OVERRIDE_TIER`) | **Refused at startup** |
@@ -84,10 +83,8 @@ The self-hosted deployment uses a **single container** that combines both fronte
 - Optional PostgreSQL for larger deployments
 
 ✅ **Beta Availability**
-- Free during beta
-- No paid plans currently available
-- Optional license-key code path exists for future/commercial behavior
-- No marketplace dependencies for self-hosted beta
+- No license key needed
+- The same [beta limits](https://actionsmanager.io/beta/beta-notes.html#self-hosted-beta-limits) for every installation
 
 ### Files
 
@@ -134,7 +131,7 @@ Optional:
   unset: the frontend uses the browser's address.
 - `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` - GitHub OAuth app credentials, only for
   OAuth sign-in
-- `LICENSE_KEY` - optional self-hosted license key; no paid plans are currently available during beta
+- `LICENSE_KEY` - optional; the beta doesn't use a license key, so leave it unset
 - `DATABASE_URL` - PostgreSQL connection (defaults to SQLite)
 
 See [docs/ENVIRONMENT_VARIABLES.md](docs/ENVIRONMENT_VARIABLES.md) for the full reference.

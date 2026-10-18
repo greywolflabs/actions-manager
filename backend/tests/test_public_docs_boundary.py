@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 EXPORT_SCRIPT = Path("scripts") / "export_public_tree.sh"
 # Public-facing files the export keeps outside docs/, as globs from the repository root.
 PUBLIC_FILES = (
-    "*.md", "backend/*.md", "frontend/*.md", "install.sh", "Dockerfile.self-hosted",
+    "*.md", "backend/*.md", "frontend/*.md", "Dockerfile.self-hosted",
     "docker-compose.self-hosted*.yml", "backend/.env.example", ".env.self-hosted.example",
 )
 FRONTEND_SRC = "frontend/src/"
@@ -153,7 +153,7 @@ def test_scan_covers_the_public_docs():
     # An empty scan would pass the guard, so check it reaches what it should.
     scanned = {path.relative_to(REPO_ROOT).as_posix() for path in public_docs()}
     assert {"README.md", "docs/QUICK_START.md", ".env.self-hosted.example"} <= scanned
-    assert {"backend/MIGRATIONS.md", "install.sh", "Dockerfile.self-hosted"} <= scanned
+    assert {"backend/MIGRATIONS.md", "Dockerfile.self-hosted"} <= scanned
     assert "docker-compose.self-hosted.yml" in scanned
     assert any(name.startswith("frontend/") for name in scanned)
     assert any(name.endswith(".mdx") for name in scanned)
@@ -211,7 +211,6 @@ def test_guard_catches_a_planted_line_and_skips_allowed_ones(tmp_path):
 def test_guard_scans_the_files_the_export_keeps_outside_docs(tmp_path):
     _write(tmp_path, "backend/MIGRATIONS.md", "See marketplace_webhooks.\n")
     _write(tmp_path, "frontend/GUIDE.md", "Build the admin panel.\n")
-    _write(tmp_path, "install.sh", "#!/bin/sh\nINSTALLATION_MODE=cloud\n")
     _write(tmp_path, "Dockerfile.self-hosted", "ENV INSTALLATION_MODE=self-hosted\n")
     _write(tmp_path, "docker-compose.self-hosted.dev.yml", "ADMIN_PASSWORD: x\n")
     _write(tmp_path, "backend/NOTES.md", "admin panel\n")
@@ -221,7 +220,6 @@ def test_guard_scans_the_files_the_export_keeps_outside_docs(tmp_path):
     assert find_leaks(tmp_path, {}) == [
         "backend/MIGRATIONS.md:1: See marketplace_webhooks.",
         "frontend/GUIDE.md:1: Build the admin panel.",
-        "install.sh:2: INSTALLATION_MODE=cloud",
         "docker-compose.self-hosted.dev.yml:1: ADMIN_PASSWORD: x",
     ]
 

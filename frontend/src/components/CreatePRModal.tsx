@@ -768,9 +768,11 @@ const PRCreationForm: React.FC<PRCreationFormProps> = ({
 
   return (
     <>
-      <p className="modal-description">
-        Preflight creates a validation pull request in a safe repository before the real campaign is created. Review the validation PR in GitHub. If the changes look correct, merge the validation PR to approve preflight. If the changes are wrong or need updates, close the validation PR and re-run preflight after making fixes.
-      </p>
+      {validationRepo && (
+        <p className="modal-description">
+          Preflight creates a validation pull request in a safe repository before the real campaign is created. Review the validation PR in GitHub. If the changes look correct, merge the validation PR to approve preflight. If the changes are wrong or need updates, close the validation PR and re-run preflight after making fixes.
+        </p>
+      )}
       {error && <div className="error-message">❌ {error}</div>}
       <div className="campaign-naming">
         <label className="campaign-naming-label" htmlFor="campaign-name">Campaign name</label>
@@ -808,11 +810,13 @@ const PRCreationForm: React.FC<PRCreationFormProps> = ({
       <div className={`repo-selection campaign-section ${campaignBlockedByPreflight ? "campaign-section-gated" : ""}`}>
         <h3 className="selection-section-title">Campaign Pull Requests</h3>
         {campaignBlockedByPreflight && (
-          <div className="warning-message">Campaign creation is gated: {requiredMessage}</div>
+          <>
+            <div className="warning-message">Campaign creation is gated: {requiredMessage}</div>
+            <p className="modal-description">
+              Campaign creation is locked until the validation PR is merged. This prevents opening the real campaign before the generated workflow changes have been reviewed and approved in the validation repository.
+            </p>
+          </>
         )}
-        <p className="modal-description">
-          Campaign creation is locked until the validation PR is merged. This prevents opening the real campaign before the generated workflow changes have been reviewed and approved in the validation repository.
-        </p>
         <div className="campaign-summary">
           <span className="selection-count">
             {totalSelectedWorkflows} of {totalWorkflows} workflow{totalWorkflows !== 1 ? "s" : ""} selected

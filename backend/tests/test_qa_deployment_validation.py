@@ -4,9 +4,8 @@ QA Test Suite for Docker Deployment Validation
 This test suite validates:
 1. Docker-compose configurations (self-hosted and cloud)
 2. Environment variable handling
-3. Installation script functionality
-4. Deployment health checks
-5. Common error scenarios
+3. Deployment health checks
+4. Common error scenarios
 
 Acceptance Criteria:
 - Both compose files work correctly
@@ -19,7 +18,6 @@ import os
 import re
 import sys
 import yaml
-import subprocess
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -220,120 +218,6 @@ class TestEnvironmentFiles:
         content_lower = content.lower()
         assert 'LICENSE_KEY' in content
         assert 'no license_secret is required' in content_lower or 'no signing secret is required' in content_lower
-
-
-class TestInstallScript:
-    """Test install.sh script functionality"""
-    
-    def test_install_script_exists(self):
-        """Verify install.sh exists"""
-        install_script = REPO_ROOT / "install.sh"
-        assert install_script.exists(), "install.sh not found"
-    
-    def test_install_script_is_executable(self):
-        """Verify install.sh has execute permissions"""
-        install_script = REPO_ROOT / "install.sh"
-        assert os.access(install_script, os.X_OK), "install.sh is not executable"
-    
-    def test_install_script_has_shebang(self):
-        """Verify install.sh has proper shebang"""
-        install_script = REPO_ROOT / "install.sh"
-        with open(install_script, 'r') as f:
-            first_line = f.readline().strip()
-        
-        assert first_line.startswith('#!/'), "install.sh missing shebang"
-    
-    def test_install_script_checks_docker(self):
-        """Verify install.sh checks for Docker/Podman"""
-        install_script = REPO_ROOT / "install.sh"
-        with open(install_script, 'r') as f:
-            content = f.read()
-        
-        assert 'check_docker' in content or 'docker' in content.lower()
-    
-    def test_install_script_prompts_for_github_oauth(self):
-        """Verify install.sh prompts for GitHub OAuth"""
-        install_script = REPO_ROOT / "install.sh"
-        with open(install_script, 'r') as f:
-            content = f.read()
-        
-        assert 'GITHUB_CLIENT_ID' in content
-        assert 'GITHUB_CLIENT_SECRET' in content
-    
-    def test_install_script_prompts_for_license(self):
-        """Verify install.sh prompts for license key without customer signing secrets"""
-        install_script = REPO_ROOT / "install.sh"
-        with open(install_script, 'r') as f:
-            content = f.read()
-        
-        assert 'LICENSE_KEY' in content
-        assert 'License Secret' not in content
-
-    def test_install_script_states_beta_limits_not_paid_tiers(self):
-        """No paid plans exist, and printed numbers drift from tier_service.py
-        (#2154): the installer links the beta limits instead of listing tiers."""
-        install_script = REPO_ROOT / "install.sh"
-        with open(install_script, 'r') as f:
-            content = f.read()
-
-        for stale in ('Professional Tier', 'Enterprise Tier', 'Professional/Enterprise',
-                      'Free Tier Limits', '3 projects', '2 secrets per project'):
-            assert stale not in content, stale
-        assert 'beta/beta-notes.html#self-hosted-beta-limits' in content
-    
-    def test_install_script_has_troubleshooting_section(self):
-        """Verify install.sh includes troubleshooting"""
-        install_script = REPO_ROOT / "install.sh"
-        with open(install_script, 'r') as f:
-            content = f.read()
-        
-        assert 'troubleshooting' in content.lower() or 'error' in content.lower()
-    
-    def test_install_script_generates_secret_key(self):
-        """Verify install.sh generates SECRET_KEY"""
-        install_script = REPO_ROOT / "install.sh"
-        with open(install_script, 'r') as f:
-            content = f.read()
-        
-        assert 'SECRET_KEY' in content
-        assert 'generate' in content.lower() or 'openssl' in content or 'random' in content.lower()
-
-    @pytest.mark.parametrize("license_key", ["", "eyJ.test.sig"])
-    def test_create_env_file_writes_a_file_the_container_starts_with(self, tmp_path, monkeypatch, license_key):
-        # #2164: a missing heredoc opener ran the OAuth and SECRET_KEY block as
-        # shell code, so the installer died with "EOF: command not found".
-        script = (REPO_ROOT / "install.sh").read_text().rstrip()
-        functions = script.removesuffix("\nmain")
-        assert functions != script, "install.sh no longer ends with its main call"
-        prompts = {"PORT": "8080", "GITHUB_CLIENT_ID": "Iv1.test", "GITHUB_CLIENT_SECRET": "s3cret", "LICENSE_KEY": license_key}
-        result = subprocess.run(
-            ["bash", "-c", functions + "\ncreate_env_file"],
-            cwd=tmp_path, env={**os.environ, **prompts}, capture_output=True, text=True, timeout=30,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-
-        values = {}
-        for line in (tmp_path / ".env.self-hosted").read_text().splitlines():
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            key, sep, value = line.partition("=")
-            # docker compose refuses the whole env_file over one bad line.
-            assert sep, f"not KEY=value: {line!r}"
-            assert re.fullmatch(r"[A-Z_][A-Z0-9_]*", key), f"not KEY=value: {line!r}"
-            values[key] = value
-        assert values["GITHUB_CLIENT_ID"] == "Iv1.test"
-        assert values["GITHUB_CLIENT_SECRET"] == "s3cret"
-        assert len(values["SECRET_KEY"]) >= 32
-        assert values.get("LICENSE_KEY", "") == license_key
-
-        import mode_validation
-        # The container sees only this file, not the shell or .env running pytest.
-        for name in ("ENVIRONMENT", "APP_URL", "VITE_APP_URL", "ALLOW_INSECURE_HTTP", *mode_validation.TIER_OVERRIDE_ENV_VARS):
-            monkeypatch.delenv(name, raising=False)
-        for key, value in values.items():
-            monkeypatch.setenv(key, value)
-        assert mode_validation.get_environment() == "production"
-        assert mode_validation.get_violations("self-hosted") == []
 
 
 class TestDockerfile:
@@ -554,11 +438,6 @@ class TestDeploymentDocumentation:
         doc = REPO_ROOT / "INSTALLATION.md"
         assert doc.exists(), "INSTALLATION.md not found"
     
-    def test_license_key_guide_exists(self):
-        """Verify LICENSE_KEY_GUIDE.md exists"""
-        doc = REPO_ROOT / "LICENSE_KEY_GUIDE.md"
-        assert doc.exists(), "LICENSE_KEY_GUIDE.md not found"
-    
     def test_docker_deployment_doc_covers_self_hosted_only(self):
         """The public deployment doc describes the self-hosted container, not the cloud build (#2141)"""
         doc = REPO_ROOT / "DOCKER_DEPLOYMENT_MODES.md"
@@ -583,36 +462,10 @@ class TestDeploymentDocumentation:
             content = f.read()
         
         assert 'upgrade' in content.lower() or 'updating' in content.lower()
-    
-    def test_license_guide_explains_tiers(self):
-        """Verify license guide explains all tiers"""
-        doc = REPO_ROOT / "LICENSE_KEY_GUIDE.md"
-        with open(doc, 'r') as f:
-            content = f.read()
-        
-        assert 'free' in content.lower()
-        assert 'professional' in content.lower()
-        assert 'enterprise' in content.lower()
 
 
 class TestCommonErrorScenarios:
     """Test that common error scenarios are documented"""
-    
-    def test_expired_license_error_documented(self):
-        """Verify expired license error is documented"""
-        doc = REPO_ROOT / "LICENSE_KEY_GUIDE.md"
-        with open(doc, 'r') as f:
-            content = f.read()
-        
-        assert 'expired' in content.lower()
-    
-    def test_invalid_license_error_documented(self):
-        """Verify invalid license error is documented"""
-        doc = REPO_ROOT / "LICENSE_KEY_GUIDE.md"
-        with open(doc, 'r') as f:
-            content = f.read()
-        
-        assert 'invalid' in content.lower()
     
     def test_oauth_error_documented(self):
         """Verify OAuth errors are documented"""
@@ -624,12 +477,11 @@ class TestCommonErrorScenarios:
     
     def test_port_conflict_error_documented(self):
         """Verify port conflict errors are documented"""
-        # Check install script or docs for port conflict handling
-        install_script = REPO_ROOT / "install.sh"
-        with open(install_script, 'r') as f:
+        doc = REPO_ROOT / "INSTALLATION.md"
+        with open(doc, 'r') as f:
             content = f.read()
         
-        assert 'port' in content.lower()
+        assert 'port already in use' in content.lower()
 
 
 class TestUpgradeDowngradePaths:

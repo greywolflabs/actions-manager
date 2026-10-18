@@ -30,12 +30,19 @@ This guide covers local development setup, workflows, testing procedures, and be
 
 ## Development Setup
 
-### 1. Clone the Repository
+### 1. Fork and Clone the Repository
+
+ActionsManager is developed at [greywolflabs/actions-manager](https://github.com/greywolflabs/actions-manager). Fork it on GitHub, clone your fork, and branch from `staging`:
 
 ```bash
-git clone https://github.com/greywolflabs/actions-manager.git
+git clone https://github.com/<your-username>/actions-manager.git
 cd actions-manager
+git remote add upstream https://github.com/greywolflabs/actions-manager.git
+git fetch upstream staging
+git checkout -b feature/my-change upstream/staging
 ```
+
+Open your pull request against the `staging` branch of greywolflabs/actions-manager. See [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ### 2. Backend Setup
 
@@ -161,6 +168,10 @@ actions-manager/
 ├── .github/                    # GitHub Actions workflows
 └── tests/                      # Test files
 ```
+
+### Project type values
+
+The API and database store a project's type as `standard` for a **Caller Workflow Project** and `rwx` for a **Reusable Workflow Project**. This is a legacy internal convention kept for backward compatibility. The interface and all user-facing documentation use the display names, and no schema or API rename is planned.
 
 ## Development Workflow
 

@@ -8,7 +8,7 @@ Get ActionsManager running in under 5 minutes.
 
 ---
 
-> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. No paid plans are currently available. The beta is provided as-is, without warranty or production-readiness guarantee.
+> **Beta notice:** ActionsManager Self-Hosted is currently a free beta preview for testing, evaluation, and feedback. The beta is provided as-is, without warranty or production-readiness guarantee.
 
 ## Prerequisites
 

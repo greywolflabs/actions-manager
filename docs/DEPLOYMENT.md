@@ -19,30 +19,6 @@ For the container architecture and startup rules, see [DOCKER_DEPLOYMENT_MODES.m
 
 ## Self-Hosted Deployment
 
-### Quick Install
-
-The fastest way to deploy self-hosted:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/greywolflabs/actions-manager/main/install.sh | bash
-```
-
-Or clone and run locally:
-
-```bash
-git clone https://github.com/greywolflabs/actions-manager.git
-cd actions-manager
-./install.sh
-```
-
-The installer will:
-- ✅ Check system requirements
-- ✅ Prompt for GitHub OAuth credentials
-- ✅ Configure license key (optional)
-- ✅ Generate secure SECRET_KEY
-- ✅ Build and start containers
-- ✅ Display access information
-
 ### Manual Self-Hosted Deployment
 
 For custom configurations:
