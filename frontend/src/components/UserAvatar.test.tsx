@@ -96,7 +96,7 @@ vi.mock('../api/user', () => ({
 import { getGitHubTokenStatus, saveGitHubToken, testGitHubToken, removeGitHubToken } from '../api/user';
 
 import type { Mock } from 'vitest';
-import type { Plan } from '../api/user';
+import type { GitHubTokenStatus, Plan } from '../api/user';
 import { BETA_PLAN, PROFESSIONAL_PLAN } from '../test/plans';
 interface UserAvatarProps {
   avatarUrl: string | null;
@@ -117,7 +117,7 @@ interface UserAvatarProps {
   };
   githubToken?: {
     configured: boolean;
-    status: "not_configured" | "configured" | "valid" | "missing_scopes" | "missing_repo_access" | "missing_org_approval" | "insufficient_repo_permissions" | "token_invalid" | "unknown_error";
+    status: "not_configured" | "configured" | "unreadable" | "valid" | "missing_scopes" | "missing_repo_access" | "missing_org_approval" | "insufficient_repo_permissions" | "token_invalid" | "unknown_error";
     message: string;
     token_type?: "oauth_token" | "classic_pat" | "fine_grained_pat" | "github_app_user" | "github_app_installation" | "unknown" | null;
   };
@@ -233,6 +233,123 @@ describe('UserAvatar Component', () => {
 
     expect(screen.getByRole('button', { name: 'Replace token' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Remove token' })).toBeInTheDocument();
+  });
+
+  test.each([
+    ['missing_repo_access', 'No repository access'],
+    ['missing_org_approval', 'Blocked by organization policy'],
+    ['unknown_error', 'Not verified'],
+    ['token_invalid', 'Invalid or expired'],
+    ['missing_scopes', 'Missing required permissions'],
+    ['insufficient_repo_permissions', 'Missing required permissions'],
+  ] as const)('labels a saved token with status %s as "%s", not Configured (#2308)', (status, label) => {
+    renderWithTheme(
+      <UserAvatar
+        avatarUrl={null}
+        username="testuser"
+        accountType="free"
+        githubToken={{ configured: true, status, message: 'from the server', token_type: 'classic_pat' }}
+        onLogout={vi.fn()}
+      />
+    );
+    openUserMenu('User menu for testuser');
+
+    expect(screen.getByText(`${label} · Classic PAT`)).toBeInTheDocument();
+    expect(screen.queryByText(/^Configured/)).not.toBeInTheDocument();
+  });
+
+  test.each(['valid', 'configured'] as const)('labels a saved token with status %s as Configured', (status) => {
+    renderWithTheme(
+      <UserAvatar
+        avatarUrl={null}
+        username="testuser"
+        accountType="free"
+        githubToken={{ configured: true, status, message: 'Token configured.', token_type: 'classic_pat' }}
+        onLogout={vi.fn()}
+      />
+    );
+    openUserMenu('User menu for testuser');
+
+    expect(screen.getByText('Configured · Classic PAT')).toBeInTheDocument();
+  });
+
+  test('a status the menu does not know is not reported as Configured (#2308)', () => {
+    const status = 'sso_required' as GitHubTokenStatus['status'];
+    renderWithTheme(
+      <UserAvatar
+        avatarUrl={null}
+        username="testuser"
+        accountType="free"
+        githubToken={{ configured: true, status, message: 'from the server', token_type: 'classic_pat' }}
+        onLogout={vi.fn()}
+      />
+    );
+    openUserMenu('User menu for testuser');
+
+    expect(screen.getByText('Not verified · Classic PAT')).toBeInTheDocument();
+  });
+
+  test('the label follows the status a save reports, without a remount (#2308)', async () => {
+    (saveGitHubToken as Mock).mockResolvedValue({ saved: true });
+    (getGitHubTokenStatus as Mock).mockResolvedValue({
+      configured: true,
+      status: 'missing_org_approval',
+      message: 'Organization policies are blocking this stored token.',
+      token_type: 'fine_grained_pat'
+    });
+    renderWithTheme(
+      <UserAvatar
+        avatarUrl={null}
+        username="testuser"
+        accountType="free"
+        githubToken={{ configured: true, status: 'valid', message: 'Token configured.', token_type: 'fine_grained_pat' }}
+        onLogout={vi.fn()}
+      />
+    );
+    openUserMenu('User menu for testuser');
+    expect(screen.getByText('Configured · Fine-grained PAT')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Manage authentication' }));
+    fireEvent.change(screen.getByLabelText('GitHub personal access token'), { target: { value: 'github_pat_1234567890' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Replace token' }));
+
+    expect(await screen.findByText('Blocked by organization policy · Fine-grained PAT')).toBeInTheDocument();
+    expect(screen.queryByText('Configured · Fine-grained PAT')).not.toBeInTheDocument();
+  });
+
+  test('reports a saved token that cannot be decrypted, and clears it once the token is saved again', async () => {
+    const message = 'The saved token cannot be decrypted, which usually means SECRET_KEY changed since it was saved.';
+    (saveGitHubToken as Mock).mockResolvedValue({ saved: true });
+    (getGitHubTokenStatus as Mock).mockResolvedValue({
+      configured: true,
+      status: 'valid',
+      message: 'Token configured.',
+      token_type: 'fine_grained_pat'
+    });
+    renderWithTheme(
+      <UserAvatar
+        avatarUrl={null}
+        username="testuser"
+        accountType="free"
+        githubToken={{ configured: true, status: 'unreadable', message, token_type: 'fine_grained_pat' }}
+        onLogout={vi.fn()}
+      />
+    );
+    openUserMenu('User menu for testuser');
+
+    expect(screen.getByText('Saved but unreadable · Fine-grained PAT')).toBeInTheDocument();
+    expect(screen.queryByText(/^Configured/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Manage authentication' }));
+    expect(screen.getByText(message)).toBeInTheDocument();
+
+    // The remedy is to save the token again; the new status shows without a remount.
+    fireEvent.change(screen.getByLabelText('GitHub personal access token'), { target: { value: 'github_pat_1234567890' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Replace token' }));
+
+    expect(await screen.findByText('Configured · Fine-grained PAT')).toBeInTheDocument();
+    expect(screen.queryByText('Saved but unreadable · Fine-grained PAT')).not.toBeInTheDocument();
+    expect(screen.queryByText(message)).not.toBeInTheDocument();
   });
 
   test('should save token without exposing the raw value afterwards', async () => {

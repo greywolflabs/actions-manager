@@ -1,5 +1,5 @@
-import { saveDraftWorkflow, saveDraftLinkedWorkflow, deleteWorkflow, createBlankWorkflow } from './workflowOperations';
-import { saveWorkflows, deleteWorkflowFromGitHub, deleteWorkflowFromDatabase, deleteReusableWorkflowFromGitHub } from '../api/workflows';
+import { saveDraftWorkflow, saveDraftLinkedWorkflow, deleteWorkflow, createBlankWorkflow, commitAndUpdatePRWorkflow } from './workflowOperations';
+import { saveWorkflows, updateWorkflows, deleteWorkflowFromGitHub, deleteWorkflowFromDatabase, deleteReusableWorkflowFromGitHub } from '../api/workflows';
 import { saveRxWorkflows } from '../api/rxworkflows';
 import { updateLinkedReusableWorkflow } from '../api/projects';
 import { Workflow, RXWorkflow } from '../types/workflow';
@@ -72,7 +72,7 @@ describe('workflowOperations', () => {
       const result = callback([]);
       
       expect(result).toEqual([
-        { name: 'new-reusable', content: 'name: new-reusable\n\non:\n  workflow_dispatch:\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v6\n', isReusable: true, isModified: true }
+        { name: 'new-reusable', content: 'name: new-reusable\n\non:\n  workflow_call:\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v6\n', isReusable: true, isModified: true }
       ]);
     });
 
@@ -91,8 +91,59 @@ describe('workflowOperations', () => {
       
       expect(result).toEqual([
         { name: 'existing', content: 'test', isReusable: true },
-        { name: 'new-reusable', content: 'name: new-reusable\n\non:\n  workflow_dispatch:\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v6\n', isReusable: true, isModified: true }
+        { name: 'new-reusable', content: 'name: new-reusable\n\non:\n  workflow_call:\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v6\n', isReusable: true, isModified: true }
       ]);
+    });
+  });
+
+  describe('commitAndUpdatePRWorkflow (#2316)', () => {
+    const workflows: Workflow[] = [{ name: 'build', content: 'on: push', isReusable: false }];
+    const commit = () => commitAndUpdatePRWorkflow(
+      0, 'regular', workflows, [], { user: 'user', projectName: 'project', selectedRepos: ['acme/app', 'acme/new'] },
+    );
+
+    test('says which ticked repositories the server skipped as not the project\'s', async () => {
+      (saveWorkflows as Mock).mockResolvedValue({ success: true });
+      (updateWorkflows as Mock).mockResolvedValue({
+        results: { 'acme/app on main': { status: 'pr_updated' } }, skipped_repos: ['acme/new'],
+      });
+
+      expect(await commit()).toBe(true);
+
+      expect(toast.warning).toHaveBeenCalledWith(
+        'Not pushed to acme/new: not part of this project yet. Save the project to add it.'
+      );
+    });
+
+    test('reports the repositories a pull request now carries the push to, even when another failed', async () => {
+      (saveWorkflows as Mock).mockResolvedValue({ success: true });
+      (updateWorkflows as Mock).mockResolvedValue({
+        results: {
+          'acme/app on main': { status: 'pr_updated' },
+          'acme/app on release/x': { status: 'pr_updated' },
+          'acme/new on main': { status: 'pr_created' },
+          'acme/broken on main': { status: 'error', error: 'boom' },
+        },
+      });
+      const onReposDelivered = vi.fn();
+
+      expect(await commitAndUpdatePRWorkflow(
+        0, 'regular', workflows, [],
+        { user: 'user', projectName: 'project', selectedRepos: ['acme/app', 'acme/new', 'acme/broken'], onReposDelivered },
+      )).toBe(false);
+
+      expect(onReposDelivered).toHaveBeenCalledWith(['acme/app', 'acme/new']);
+    });
+
+    test('warns about nothing when every repository was the project\'s', async () => {
+      (saveWorkflows as Mock).mockResolvedValue({ success: true });
+      (updateWorkflows as Mock).mockResolvedValue({
+        results: { 'acme/app on main': { status: 'pr_updated' } }, skipped_repos: [],
+      });
+
+      await commit();
+
+      expect(toast.warning).not.toHaveBeenCalled();
     });
   });
 
@@ -165,6 +216,42 @@ describe('workflowOperations', () => {
       expect(toast.success).toHaveBeenCalledWith(
         expect.stringContaining("saved as draft")
       );
+    });
+
+    test('hands the save\'s kind changes on, after marking the workflow saved (#2318)', async () => {
+      const workflows: Workflow[] = [
+        { name: 'deploy', content: 'on: workflow_call', isReusable: false, workflowStatus: 'new' }
+      ];
+      const markWorkflowAsSaved = vi.fn();
+      const applyKindChanges = vi.fn();
+      const kindChanges = [{ name: 'deploy', is_reusable: true, workflow_status: 'committed_locally' }];
+      (saveWorkflows as Mock).mockResolvedValue({ success: true, kind_changes: kindChanges });
+
+      await saveDraftWorkflow(
+        0, 'regular', workflows, [], 'user', 'project',
+        undefined, markWorkflowAsSaved, undefined, undefined, undefined, applyKindChanges
+      );
+
+      expect(applyKindChanges).toHaveBeenCalledWith(kindChanges);
+      expect(markWorkflowAsSaved.mock.invocationCallOrder[0])
+        .toBeLessThan(applyKindChanges.mock.invocationCallOrder[0]);
+      // Otherwise the workflow seems to vanish from the section being edited.
+      expect(toast.success).toHaveBeenCalledWith(
+        "Workflow 'deploy.yml' saved as draft. Its trigger makes it a reusable workflow now."
+      );
+    });
+
+    test('a save that kept the kind moves nothing', async () => {
+      const applyKindChanges = vi.fn();
+      (saveWorkflows as Mock).mockResolvedValue({ success: true, kind_changes: [] });
+
+      await saveDraftWorkflow(
+        0, 'regular', [{ name: 'build', content: 'on: push', isReusable: false }], [], 'user', 'project',
+        undefined, undefined, undefined, undefined, undefined, applyKindChanges
+      );
+
+      expect(applyKindChanges).toHaveBeenCalledWith([]);
+      expect(toast.success).toHaveBeenCalledWith("Workflow 'build.yml' saved as draft.");
     });
 
     test('success toast includes workflow filename with .yml suffix', async () => {
@@ -457,6 +544,81 @@ describe('workflowOperations', () => {
 
       expect(fetchWorkflowsCount).toHaveBeenCalled();
       expect(refreshProjectData).toHaveBeenCalled();
+    });
+
+    describe("a caller project's own reusable workflow (#2309)", () => {
+      const rxworkflows: RXWorkflow[] = [
+        { name: 'shared', content: 'test', isReusable: true },
+        { name: 'other', content: 'test', isReusable: true },
+      ];
+
+      test('is removed from the project repositories by campaign, never from the RWX repo', async () => {
+        const setRXWorkflows = vi.fn();
+        (deleteWorkflowFromGitHub as Mock).mockResolvedValue({});
+
+        await deleteWorkflow({
+          index: 0, type: 'reusable', workflows: [], rxworkflows, user: 'user', projectName: 'project',
+          selectedRepos: ['owner/repo'], regexPattern: '', scope: 'project_and_github',
+          delivery: 'campaign', projectType: 'standard',
+          setWorkflows: vi.fn(), setRXWorkflows, setSelectedWorkflowId: vi.fn(),
+        });
+
+        expect(deleteWorkflowFromGitHub).toHaveBeenCalledWith(
+          'user', ['owner/repo'], 'shared', '', 'project', 'campaign'
+        );
+        expect(deleteReusableWorkflowFromGitHub).not.toHaveBeenCalled();
+        // The campaign carries the removal, so the row stays until it merges.
+        expect(deleteWorkflowFromDatabase).not.toHaveBeenCalled();
+        expect(setRXWorkflows).not.toHaveBeenCalled();
+      });
+
+      test('a direct removal drops it from the reusable list without a reload', async () => {
+        const setRXWorkflows = vi.fn();
+        (deleteWorkflowFromGitHub as Mock).mockResolvedValue({});
+        (deleteWorkflowFromDatabase as Mock).mockResolvedValue({});
+
+        await deleteWorkflow({
+          index: 0, type: 'reusable', workflows: [], rxworkflows, user: 'user', projectName: 'project',
+          selectedRepos: ['owner/repo'], regexPattern: '', scope: 'project_and_github',
+          delivery: 'direct', projectType: 'standard',
+          setWorkflows: vi.fn(), setRXWorkflows, setSelectedWorkflowId: vi.fn(),
+        });
+
+        expect(deleteWorkflowFromGitHub).toHaveBeenCalledWith(
+          'user', ['owner/repo'], 'shared', '', 'project', 'direct'
+        );
+        expect(deleteWorkflowFromDatabase).toHaveBeenCalledWith('user', 'project', 'shared');
+        const updater = setRXWorkflows.mock.calls[0][0];
+        expect(updater(rxworkflows).map((w: RXWorkflow) => w.name)).toEqual(['other']);
+      });
+    });
+
+    describe("a Reusable Workflow Project's own reusable workflow", () => {
+      const rxworkflows: RXWorkflow[] = [{ name: 'deploy', content: 'test', isReusable: true }];
+
+      test('is removed by a campaign through the campaign route, and stays listed until it merges', async () => {
+        const setRXWorkflows = vi.fn();
+        const setSelectedWorkflowId = vi.fn();
+        const refreshProjectData = vi.fn().mockResolvedValue(undefined);
+        (deleteWorkflowFromGitHub as Mock).mockResolvedValue({});
+
+        await deleteWorkflow({
+          index: 0, type: 'reusable', workflows: [], rxworkflows, user: 'user', projectName: 'rwx-project',
+          selectedRepos: ['owner/shared'], regexPattern: '', scope: 'project_and_github',
+          delivery: 'campaign', projectType: 'rwx',
+          setWorkflows: vi.fn(), setRXWorkflows, setSelectedWorkflowId, refreshProjectData,
+        });
+
+        expect(deleteWorkflowFromGitHub).toHaveBeenCalledWith(
+          'user', ['owner/shared'], 'deploy', '', 'rwx-project', 'campaign'
+        );
+        expect(deleteReusableWorkflowFromGitHub).not.toHaveBeenCalled();
+        expect(deleteWorkflowFromDatabase).not.toHaveBeenCalled();
+        expect(setRXWorkflows).not.toHaveBeenCalled();
+        expect(setSelectedWorkflowId).not.toHaveBeenCalled();
+        // What reloads the workflow as under review, without the user refreshing.
+        expect(refreshProjectData).toHaveBeenCalled();
+      });
     });
 
     test('should delete reusable workflow', async () => {

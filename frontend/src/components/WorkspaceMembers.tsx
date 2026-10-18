@@ -160,7 +160,7 @@ const WorkspaceMembers: React.FC<WorkspaceMembersProps> = ({
                   value={member.workspace_role}
                   onChange={(e) => handleRoleChange(member.user_id, e.target.value)}
                   disabled={updating === member.user_id}
-                  className="text-sm rounded-md border border-border dark:border-border-dark bg-container dark:bg-container-dark text-text-primary dark:text-text-primary-dark px-2 py-1 focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50"
+                  className="text-sm rounded-md border border-border dark:border-border-dark bg-container dark:bg-container-dark text-text-primary dark:text-text-primary-dark px-2 py-1 focus:outline-hidden focus:ring-2 focus:ring-primary disabled:opacity-50"
                   aria-label={`Change role for ${member.github_user}`}
                 >
                   {ROLE_OPTIONS.map((opt) => (

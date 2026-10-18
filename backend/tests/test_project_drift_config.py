@@ -12,6 +12,7 @@ every project behind it.
 
 import os
 import sys
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from models import Account, Base, Project, ProjectMembership, WorkspaceMember  # noqa: E402
 from main import app  # noqa: E402
 from projects import get_db  # noqa: E402
+from auth import create_auth_session  # noqa: E402
 
 engine = create_engine(
     "sqlite:///:memory:",
@@ -64,9 +66,15 @@ class TestProjectDriftConfig:
     def setup_method(self):
         self.client = TestClient(app)
 
+    def _signed_in(self, github_user: str = OWNER) -> dict:
+        db = TestingSessionLocal()
+        try:
+            return {"Authorization": f"Bearer {create_auth_session(github_user, db)}"}
+        finally:
+            db.close()
+
     def _create_project(self, name: str) -> int:
-        resp = self.client.post("/api/projects/", json={
-            "github_user": OWNER,
+        resp = self.client.post("/api/projects/", headers=self._signed_in(), json={
             "project_name": name,
             "selected_repos": ["test/repo1"],
             "workflows": [],
@@ -79,10 +87,10 @@ class TestProjectDriftConfig:
         assert resp.status_code == 200, resp.text
         return resp.json()["project_id"]
 
-    def _patch(self, project_id: int, minutes, github_user: str = OWNER, headers=None):
+    def _patch(self, project_id: int, minutes, github_user: str = OWNER):
         return self.client.patch(
             f"/api/projects/{project_id}/drift-config",
-            headers=headers,
+            headers=self._signed_in(github_user),
             json={"github_user": github_user, "drift_check_interval_minutes": minutes},
         )
 
@@ -140,10 +148,35 @@ class TestProjectDriftConfig:
         project_id = self._create_project("Detail")
         self._patch(project_id, 30)
 
-        resp = self.client.get("/api/projects/Detail", params={"github_user": OWNER})
+        resp = self.client.get(
+            "/api/projects/Detail", params={"github_user": OWNER}, headers=self._signed_in()
+        )
 
         assert resp.status_code == 200, resp.text
         assert resp.json()["drift_check_interval_minutes"] == 30
+
+    @pytest.mark.parametrize("minutes, gap", [(1440, 1440), (None, 15)])
+    def test_a_new_interval_reschedules_the_next_check(self, minutes, gap):
+        """The sweep reads only the stored next check (#2343), so a change that
+        left it alone would keep the project on its old schedule."""
+        project_id = self._create_project("Reschedule")
+        checked_at = datetime(2026, 1, 1, 12, 0)
+        db = TestingSessionLocal()
+        try:
+            db.get(Project, project_id).last_drift_check_at = checked_at
+            db.commit()
+        finally:
+            db.close()
+        if minutes is None:
+            self._patch(project_id, 30)
+
+        assert self._patch(project_id, minutes).status_code == 200
+
+        db = TestingSessionLocal()
+        try:
+            assert db.get(Project, project_id).next_drift_check_at == checked_at + timedelta(minutes=gap)
+        finally:
+            db.close()
 
     def test_an_unknown_project_is_a_404(self):
         assert self._patch(999999, 30).status_code == 404
@@ -164,8 +197,7 @@ class TestProjectDriftConfig:
         finally:
             db.close()
 
-        resp = self._patch(project_id, 1440, github_user="drift-viewer",
-                           headers={"X-GitHub-User": "drift-viewer"})
+        resp = self._patch(project_id, 1440, github_user="drift-viewer")
 
         assert resp.status_code == 403, resp.text
         assert self._stored_interval(project_id) is None

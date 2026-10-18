@@ -22,7 +22,7 @@ Personal Access Tokens submitted via the login UI are stored **encrypted** in th
 - Never included in API responses
 - Only decrypted when making GitHub API calls
 
-The UI shows only masked token status: **Configured**, **Invalid or expired**, or **Missing required permissions**.
+The UI shows only masked token status: **Configured**, **Invalid or expired**, **Missing required permissions**, **No repository access**, **Blocked by organization policy**, **Not verified** (the permission check could not be completed), or **Saved but unreadable** (the saved token can no longer be decrypted, usually because `SECRET_KEY` changed; save it again to re-encrypt it).
 
 ## Credential Resolution Order
 

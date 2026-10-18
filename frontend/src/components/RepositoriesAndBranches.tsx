@@ -195,7 +195,7 @@ const RepositoriesAndBranches: React.FC<RepositoriesAndBranchesProps> = ({
                     placeholder="e.g., main, release-.*, feature/auth"
                     value={regexPattern}
                     onChange={handleRegexChange}
-                    className="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
                   />
                 </div>
 
@@ -218,7 +218,7 @@ const RepositoriesAndBranches: React.FC<RepositoriesAndBranchesProps> = ({
                       max="30"
                       value={branchMaxAgeDays}
                       onChange={handleMaxAgeDaysChange}
-                      className="w-20 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 text-center focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      className="w-20 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 text-center focus:outline-hidden focus:ring-2 focus:ring-blue-500"
                     />
                   </div>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
@@ -286,7 +286,7 @@ const RepositoriesAndBranches: React.FC<RepositoriesAndBranchesProps> = ({
         <select
           value={validationRepo || ""}
           onChange={(event) => setValidationRepo?.(event.target.value || null)}
-          className="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          className="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
           aria-label="Validation Repository"
         >
           <option value="">No validation repository</option>

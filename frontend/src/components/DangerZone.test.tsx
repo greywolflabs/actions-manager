@@ -44,4 +44,21 @@ describe('DangerZone', () => {
     await user.click(screen.getByRole('button', { name: /Delete Project/i }));
     expect(onDeleteProject).toHaveBeenCalledTimes(1);
   });
+
+  test('a project already being deleted cannot be deleted again, and says why', async () => {
+    const onDeleteProject = vi.fn();
+    render(
+      <DangerZone
+        {...defaultProps}
+        onDeleteProject={onDeleteProject}
+        disabledReason="This project is already being deleted."
+      />
+    );
+
+    const button = screen.getByRole('button', { name: /Delete Project/i });
+    expect(button).toBeDisabled();
+    expect(screen.getByTestId('danger-zone-disabled-reason')).toHaveTextContent('already being deleted');
+    await user.click(button);
+    expect(onDeleteProject).not.toHaveBeenCalled();
+  });
 });

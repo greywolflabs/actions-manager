@@ -6,9 +6,11 @@ import "../styles/projectMgmt.css";
 interface DangerZoneProps {
   projectName: string;
   onDeleteProject: () => void;
+  /** Why deleting is not available right now, e.g. the project is already being deleted. */
+  disabledReason?: string | null;
 }
 
-const DangerZone: React.FC<DangerZoneProps> = ({ projectName, onDeleteProject }) => {
+const DangerZone: React.FC<DangerZoneProps> = ({ projectName, onDeleteProject, disabledReason = null }) => {
   return (
     <div className="danger-zone-page">
       {/* Warning intro */}
@@ -24,13 +26,21 @@ const DangerZone: React.FC<DangerZoneProps> = ({ projectName, onDeleteProject })
         <div className="danger-zone-card-header">
           <h3 className="danger-zone-card-title">🗑️ Delete Project</h3>
           <p className="danger-zone-card-description">
-            Permanently remove <strong>{projectName}</strong> from ActionsManager. You can choose to delete database records only, or also remove all associated GitHub resources (workflows, secrets, environments).
+            Permanently remove <strong>{projectName}</strong> from ActionsManager. You choose whether its files stay in GitHub or are removed by a pull request per repository and branch, and whether its secrets and variables are deleted too.
           </p>
+          {disabledReason && (
+            <p className="danger-zone-card-description" data-testid="danger-zone-disabled-reason">
+              {disabledReason}
+            </p>
+          )}
         </div>
         <div className="danger-zone-card-action">
           <Button
+            type="button"
             variant="destructive"
             onClick={onDeleteProject}
+            disabled={disabledReason !== null}
+            title={disabledReason ?? undefined}
             className="danger-zone-delete-btn"
           >
             ❌ Delete Project

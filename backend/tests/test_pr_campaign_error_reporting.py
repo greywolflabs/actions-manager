@@ -5,7 +5,7 @@ A campaign whose only change was a custom file marked for deletion reported
 ``Successfully created 0 pull request(s)`` plus a bare red "Error" per repo. The
 cause was three layers of discarded information:
 
-  1. ``_delete_custom_file_from_branch`` treated "the file was already absent"
+  1. ``_delete_path_from_branch`` treated "the file was already absent"
      as a commit, so the AM branch was byte-identical to its base.
   2. ``_create_pull_request`` dropped GitHub's 422 ("No commits between ...")
      and returned ``None``.
@@ -30,7 +30,7 @@ from workflows import (  # noqa: E402
     _build_pr_error_result,
     _commit_custom_files_to_branch,
     _create_pull_request,
-    _delete_custom_file_from_branch,
+    _delete_path_from_branch,
     _describe_empty_delivery,
     _finalize_pr_result,
     _process_regular_workflows_update,
@@ -95,7 +95,7 @@ class TestDeleteOutcome:
 
     def test_absent_file_is_reported_as_absent_not_deleted(self):
         with patch("workflows.github_get", return_value=_resp(404, {})):
-            outcome, error = _delete_custom_file_from_branch(
+            outcome, error = _delete_path_from_branch(
                 "o", "r", "scripts/x.sh", "actions-manager/cmp-main", "CMP", "u", None, {}
             )
         assert outcome == DELETE_ABSENT
@@ -104,7 +104,7 @@ class TestDeleteOutcome:
     def test_present_file_is_deleted(self):
         with patch("workflows.github_get", return_value=_resp(200, {"sha": "abc"})), \
              patch("workflows.requests.delete", return_value=_resp(200, {})):
-            outcome, error = _delete_custom_file_from_branch(
+            outcome, error = _delete_path_from_branch(
                 "o", "r", "scripts/x.sh", "actions-manager/cmp-main", "CMP", "u", None, {}
             )
         assert outcome == DELETE_DELETED
@@ -114,7 +114,7 @@ class TestDeleteOutcome:
         rejected = _resp(409, {"message": "x.sh does not match abc"})
         with patch("workflows.github_get", return_value=_resp(200, {"sha": "abc"})), \
              patch("workflows.requests.delete", return_value=rejected):
-            outcome, error = _delete_custom_file_from_branch(
+            outcome, error = _delete_path_from_branch(
                 "o", "r", "scripts/x.sh", "actions-manager/cmp-main", "CMP", "u", None, {}
             )
         assert outcome == DELETE_FAILED
@@ -212,7 +212,7 @@ class TestRequestConstruction:
         with patch("github_api_tracker.requests.request", side_effect=fake_request), \
              patch("github_api_tracker.track_github_api_call"), \
              patch("rate_limiter.check_rate_limit", return_value=(True, {})):
-            outcome, error = _delete_custom_file_from_branch(
+            outcome, error = _delete_path_from_branch(
                 "acme", "app", ".github/test.txt",
                 "actions-manager/nop1/test1/fa71c483-main",
                 "NOP1", "u", None,
@@ -270,7 +270,8 @@ class TestEmptyBranchCleanup:
                 regex_pattern="",
                 branch_max_age_days=30,
                 headers={},
-                db=None,
+                # The absent file is recorded as not on the branch.
+                db=MagicMock(),
                 user="u",
                 custom_files=[{"id": 1, "file_path": "x.sh",
                                "file_content": "", "pending_delete": True}],

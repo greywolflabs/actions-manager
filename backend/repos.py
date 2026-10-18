@@ -124,11 +124,6 @@ def _repos_create_url_for_owner(owner: str, owner_type: str) -> str:
 
 # ✅ Database dependency
 
-def _assert_session_owns_user(user: str, request: Request, db: Session) -> None:
-    """Raise 403 if the authenticated session belongs to a different GitHub user."""
-    auth_module.assert_session_owns_user(user, request, db)
-
-
 def _should_restrict_to_public_repos(user: str, db: Session) -> bool:
     """
     Determine if a user should be restricted to public repositories only.
@@ -162,14 +157,14 @@ def _should_restrict_to_public_repos(user: str, db: Session) -> bool:
 
 
 @router.get("/api/repos", responses=_responses(401, 403))
-def get_repos(user: str, request: Request, db: Annotated[Session, Depends(get_db)]):
+def get_repos(db: Annotated[Session, Depends(get_db)], account: auth_module.CurrentAccount):
     """Returns the authenticated user's repositories, filtered by account type.
 
     Paginates through all pages of the GitHub repos endpoint so that
     organizations (or users) with more than 100 repositories are fully
     represented.
     """
-    _assert_session_owns_user(user, request, db)
+    user = account.github_user
     if user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
@@ -222,27 +217,6 @@ def get_repos(user: str, request: Request, db: Annotated[Session, Depends(get_db
     
     return filtered_repos
 
-@router.get("/api/branches/{owner}/{repo}", responses=_responses(401, 403, 404))
-def get_branches(user: str, owner: str, repo: str, request: Request, db: Annotated[Session, Depends(get_db)]):
-    """Fetch all branches of a GitHub repository."""
-    _assert_session_owns_user(user, request, db)
-    if user not in user_tokens:
-        raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
-
-    token = user_tokens[user]
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-
-    url = f"https://api.github.com/repos/{owner}/{repo}/branches"
-    response = github_get(url, user, db, headers=headers)
-
-    if response.status_code == 404:
-        raise HTTPException(status_code=404, detail="GitHub repository not found or access denied")
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail="GitHub API error")
-
-    return response.json()
-
 
 DEFAULT_NEW_REPO_NAME = "am-reuseable-workflow"
 # GitHub's own rule for repository names. Enforced here because the value is
@@ -263,7 +237,7 @@ def _validated_repo_name(name: Optional[str]) -> str:
 
 
 @router.post("/api/create-repo", responses=_responses(400))
-async def create_github_repo(request: Request, db: Annotated[Session, Depends(get_db)]):
+async def create_github_repo(request: Request, db: Annotated[Session, Depends(get_db)], account: auth_module.CurrentAccount):
     """Creates a GitHub repository, by default 'am-reuseable-workflow'.
 
     Accepts an optional ``owner`` field in the JSON body to create the repo
@@ -276,7 +250,7 @@ async def create_github_repo(request: Request, db: Annotated[Session, Depends(ge
     """
     try:
         data = await request.json()
-        user = data.get("user")
+        user = account.github_user
         if user not in user_tokens:
             return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
 
@@ -327,10 +301,11 @@ async def create_github_repo(request: Request, db: Annotated[Session, Depends(ge
         # carrying an error string, which no caller checks for.
         raise
     except Exception as e:
-        return {"error": str(e)}
+        print(f"❌ Error creating repository: {e}")
+        return {"error": "Error creating repository"}
 
 @router.post("/api/rwx-repos")
-async def create_rwx_repo(request: Request, db: Annotated[Session, Depends(get_db)]):
+async def create_rwx_repo(request: Request, db: Annotated[Session, Depends(get_db)], account: auth_module.CurrentAccount):
     """Creates a public GitHub repository for reusable workflows, labeled with the topic 'am-rwx'.
 
     Accepts an optional ``owner`` field in the JSON body to create the repo
@@ -338,10 +313,10 @@ async def create_rwx_repo(request: Request, db: Annotated[Session, Depends(get_d
     """
     try:
         data = await request.json()
-        user = data.get("user")
+        user = account.github_user
         repo_name = data.get("repo_name", "").strip()
 
-        if not user or user not in user_tokens:
+        if user not in user_tokens:
             return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
 
         if not repo_name:
@@ -413,14 +388,14 @@ async def create_rwx_repo(request: Request, db: Annotated[Session, Depends(get_d
             }
 
     except Exception as e:
-        return {"error": str(e)}
+        print(f"❌ Error creating reusable workflow repository: {e}")
+        return {"error": "Error creating reusable workflow repository"}
 
 
 @router.get("/api/rwx-repos", responses=_responses(401, 403))
 async def get_rwx_repos(
-    user: str,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
     owner: Annotated[str | None, Query(description="Optional advanced override: scope search to a single owner (user or org).")] = None,
 ):
     """Returns reusable-workflow repositories accessible to the authenticated user.
@@ -446,7 +421,7 @@ async def get_rwx_repos(
       ``_resolve_target_owner`` (membership checked for orgs) before
       any data is returned.
     """
-    _assert_session_owns_user(user, request, db)
+    user = account.github_user
     if user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
@@ -558,43 +533,10 @@ def _serialize_rwx_repo(repo: dict, default_owner: str | None = None, default_ow
     }
 
 
-@router.get("/api/repos/status/{user}/{repo_name}", responses=_responses(401, 403))
-def check_repo_status(user: str, repo_name: str, request: Request, db: Annotated[Session, Depends(get_db)], owner: Annotated[Optional[str], Query()] = None):
-    """Checks if the specified repository exists on GitHub.
-
-    Args:
-        user: Authenticated GitHub username (used for auth token lookup).
-        repo_name: Repository name to check.
-        owner (str, optional): Owner (user or org) of the repo. Defaults to
-            the authenticated user for backward compatibility, but callers
-            should pass the actual owner when checking org-owned repositories.
-    """
-    _assert_session_owns_user(user, request, db)
-    if user not in user_tokens:
-        raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
-
-    token = user_tokens[user]
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": GITHUB_JSON_ACCEPT,
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
-    repo_owner = owner or user
-    repo_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
-    response = github_get(repo_url, user, db, headers=headers)
-
-    if response.status_code == 200:
-        return {"exists": True}
-    elif response.status_code == 404:
-        return {"exists": False}
-    else:
-        return {"error": f"GitHub API error: {response.status_code}"}
-
-
 @router.get("/api/repos/detect-build-type/{owner}/{repo}", responses=_responses(401, 403, 500))
-def detect_build_type(user: str, owner: str, repo: str, request: Request, db: Annotated[Session, Depends(get_db)]):
+def detect_build_type(owner: str, repo: str, db: Annotated[Session, Depends(get_db)], account: auth_module.CurrentAccount):
     """Detect build types in a GitHub repository."""
-    _assert_session_owns_user(user, request, db)
+    user = account.github_user
     if user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
@@ -622,13 +564,14 @@ def detect_build_type(user: str, owner: str, repo: str, request: Request, db: An
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error detecting build types: {str(e)}")
+        print(f"❌ Error detecting build types: {e}")
+        raise HTTPException(status_code=500, detail="Error detecting build types")
 
 
 @router.get("/api/repos/suggest-workflow/{owner}/{repo}", responses=_responses(401, 403, 404, 500))
-def suggest_workflow(user: str, owner: str, repo: str, request: Request, db: Annotated[Session, Depends(get_db)], build_type: str = None):
+def suggest_workflow(owner: str, repo: str, db: Annotated[Session, Depends(get_db)], account: auth_module.CurrentAccount, build_type: str = None):
     """Suggest a workflow based on detected build types or a specific build type."""
-    _assert_session_owns_user(user, request, db)
+    user = account.github_user
     if user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
@@ -670,4 +613,5 @@ def suggest_workflow(user: str, owner: str, repo: str, request: Request, db: Ann
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error suggesting workflow: {str(e)}")
+        print(f"❌ Error suggesting workflow: {e}")
+        raise HTTPException(status_code=500, detail="Error suggesting workflow")

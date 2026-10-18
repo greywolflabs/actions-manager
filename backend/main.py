@@ -11,7 +11,7 @@ A FastAPI application for managing GitHub Actions workflows with features includ
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.exc import OperationalError
@@ -22,7 +22,6 @@ import config
 
 import license
 import mode_validation
-import anyio
 import os
 import sys
 from notification_worker import start_notification_worker, stop_notification_worker
@@ -164,6 +163,25 @@ class WriteProtectionMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(WriteProtectionMiddleware)
+
+
+class ProjectHintMiddleware(BaseHTTPMiddleware):
+    """Hand X-Project-Id to the project name lookups for this request (#2240).
+
+    The UI sends the id of the project page a request comes from, so a name
+    two owners share resolves to the one on screen. The lookups only use it
+    among projects they could already reach by that name.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        token = workflows.set_project_hint(request.headers.get("X-Project-Id"))
+        try:
+            return await call_next(request)
+        finally:
+            workflows.reset_project_hint(token)
+
+
+app.add_middleware(ProjectHintMiddleware)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -337,38 +355,6 @@ async def root():
         "allow_insecure_http": auth.ALLOW_INSECURE_HTTP,
         "pat_login_enabled": auth.pat_login_enabled(),
     }
-
-
-@app.get("/gui-workflow-editor-demo", response_class=HTMLResponse)
-async def gui_workflow_editor_demo():
-    """Demo page for GUI workflow editor feature"""
-    try:
-        # Get the directory where this script is located
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(current_dir, "gui-workflow-editor-demo.html")
-        
-        # Use anyio.open_file to handle file operations asynchronously
-        async with await anyio.open_file(file_path, "r") as file:
-            content = await file.read()
-        return HTMLResponse(content=content)
-    except FileNotFoundError:
-        return HTMLResponse(content="<h1>GUI Workflow Editor Demo file not found</h1>", status_code=404)
-
-
-@app.get("/reusable-workflow-gui-demo", response_class=HTMLResponse)
-async def reusable_workflow_gui_demo():
-    """Demo page for Reusable Workflow GUI editor feature"""
-    try:
-        # Get the directory where this script is located
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(current_dir, "reusable-workflow-gui-demo.html")
-        
-        # Use anyio.open_file to handle file operations asynchronously
-        async with await anyio.open_file(file_path, "r") as file:
-            content = await file.read()
-        return HTMLResponse(content=content)
-    except FileNotFoundError:
-        return HTMLResponse(content="<h1>Reusable Workflow GUI Demo file not found</h1>", status_code=404)
 
 
 @app.websocket("/ws")

@@ -12,18 +12,19 @@ import json
 from typing import Annotated, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, Query, Request
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError, field_validator
 import httpx
 from config import GITHUB_TIMEOUT_SECONDS
+from error_detail import failure_kind
 from database import get_db
 from models import Ruleset, Project, ProjectRepo, ProjectRuleset, Account, Repo
 import os
 import auth as auth_module
 from auth import user_tokens
+from authorization import project_role
 from workflows import (
+    _ERR_INSUFFICIENT_PROJECT_ROLE,
     _find_project_by_name,
-    _require_project_editor,
     require_project_write_access,
     require_repo_write_access,
 )
@@ -33,7 +34,6 @@ router = APIRouter()
 
 # GitHub API configuration
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-ACCOUNT_NOT_FOUND = "User account not found"
 RULESET_NOT_FOUND = "Ruleset not found"
 
 # Which copies of a ruleset a removal destroys.
@@ -58,94 +58,129 @@ GITHUB_ACCEPT_JSON = "application/vnd.github+json"
 GITHUB_API_VERSION = "2022-11-28"
 
 
+# Past the column sizes PostgreSQL rejects the insert, and the client's mistake
+# would come back as a 500 (#2239).
+_MAX_RULESET_NAME = Ruleset.__table__.c.ruleset_name.type.length
+_MAX_RULESET_DESCRIPTION = Ruleset.__table__.c.description.type.length
+
+
 class RulesetCreate(BaseModel):
-    """Model for creating a new ruleset"""
-    name: str
-    description: Optional[str] = None
+    """Model for creating a new ruleset; upload validates through it too."""
+    name: str = Field(min_length=1, max_length=_MAX_RULESET_NAME)
+    description: Optional[str] = Field(default=None, max_length=_MAX_RULESET_DESCRIPTION)
     ruleset_json: dict
 
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
 
-class RulesetResponse(BaseModel):
-    """Model for ruleset response"""
-    ruleset_id: int
-    ruleset_name: str
-    description: Optional[str] = None
-    created_at: str
-    updated_at: str
+    @field_validator("name", "description")
+    @classmethod
+    def _storable_text(cls, value: Optional[str]) -> Optional[str]:
+        # The database drivers refuse these rather than store them: NUL on
+        # PostgreSQL, a lone surrogate on any of them.
+        if value is None:
+            return value
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("contains characters that cannot be stored") from None
+        if "\x00" in value:
+            raise ValueError("contains characters that cannot be stored")
+        return value
 
 
+# Neither model carries the caller: it comes from the session (#2241). A
+# github_user the client still sends is an extra field, and ignored.
 class ApplyRulesetRequest(BaseModel):
     """Model for applying ruleset to repositories"""
     repo_names: List[str]
-    github_user: str
 
 
 class RulesetSyncStatusRequest(BaseModel):
     """Model for checking ruleset sync status across repositories"""
     repo_names: List[str]
-    github_user: str
 
 
-@router.post("/api/rulesets/upload")
+def _validate_uploaded(name, description, ruleset_data: dict) -> None:
+    """Reject what the rulesets table cannot store as the client's error.
+
+    The uploaded JSON is free-form, so its name and description arrive with no
+    type or size checked. RulesetCreate holds the rules create already applies.
+    """
+    try:
+        RulesetCreate(name=name, description=description, ruleset_json=ruleset_data)
+    except ValidationError as e:
+        error = e.errors()[0]
+        raise HTTPException(status_code=400, detail=f"Invalid ruleset {error['loc'][0]}: {error['msg']}")
+
+
+@router.post(
+    "/api/rulesets/upload",
+    responses={
+        400: {"description": "Not a JSON object, or a name or description that cannot be stored"},
+        401: {"description": "Not signed in"},
+        403: {"description": "Names another user, or cannot edit the project"},
+        404: {"description": "Project not found"},
+        409: {"description": "More than one project has this name"},
+        500: {"description": "Error uploading ruleset"},
+    },
+)
 async def upload_ruleset_file(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
     file: Annotated[UploadFile, File()],
     project_name: Annotated[str, Form()],
-    github_user: Annotated[str, Form()],
 ):
     """Upload a ruleset JSON file and store it in the database"""
 
-    # github_user arrives as a form field and proves nothing on its own, and
-    # storing a ruleset against a project is a write to that project.
-    require_project_write_access(db, request, github_user, project_name)
+    # Storing a ruleset against a project is a write to that project.
+    project = require_project_write_access(db, request, account.github_user, project_name)
 
     if not file.filename.endswith('.json'):
         raise HTTPException(status_code=400, detail="File must be a JSON file")
-    
+
+    # From bytes, json detects a BOM and UTF-16/32 itself. Everything it raises
+    # on bad input is a ValueError (undecodable bytes, malformed JSON, a number
+    # past the digit limit) or, for deep nesting, a RecursionError.
     try:
-        # Read and parse JSON file
-        content = await file.read()
-        ruleset_data = json.loads(content.decode('utf-8'))
-        
+        ruleset_data = json.loads(await file.read())
+    except (ValueError, RecursionError):
+        raise HTTPException(status_code=400, detail="Invalid JSON file")
+
+    try:
         # Validate that this looks like a GitHub ruleset
         if not isinstance(ruleset_data, dict):
             raise HTTPException(status_code=400, detail="Invalid ruleset format: must be a JSON object")
         
-        # Get user account
-        user_account = db.query(Account).filter(Account.github_user == github_user).first()
-        if not user_account:
-            raise HTTPException(status_code=404, detail=ACCOUNT_NOT_FOUND)
-        
         # Extract name from ruleset or use filename
-        ruleset_name = ruleset_data.get('name', file.filename.replace('.json', ''))
-        description = ruleset_data.get('description', f"Imported from {file.filename}")
-        
+        ruleset_name = ruleset_data.get('name', file.filename.removesuffix('.json'))
+        # Cut to fit: a long filename is not the client's mistake to fix.
+        description = ruleset_data.get('description', f"Imported from {file.filename}"[:_MAX_RULESET_DESCRIPTION])
+
+        _validate_uploaded(ruleset_name, description, ruleset_data)
+
         # Create new ruleset
         new_ruleset = Ruleset(
             ruleset_name=ruleset_name,
             ruleset_json=json.dumps(ruleset_data),
             description=description,
-            user_id=user_account.user_id
+            user_id=account.user_id
         )
         
         db.add(new_ruleset)
-        db.commit()
-        db.refresh(new_ruleset)
+        db.flush()
         
-        # If project_name provided, associate with project
-        if project_name:
-            project = db.query(Project).filter(
-                and_(Project.project_name == project_name, Project.user_id == user_account.user_id)
-            ).first()
-            
-            if project:
-                project_ruleset = ProjectRuleset(
-                    project_id=project.project_id,
-                    ruleset_id=new_ruleset.ruleset_id
-                )
-                db.add(project_ruleset)
-                db.commit()
+        # Attach to the project the gate resolved. Looking it up again by owner
+        # and exact name missed editors, admins and other casings, and stored
+        # the ruleset with no project while still reporting success (#2063).
+        # One commit for both rows, so a failed link cannot leave it unattached.
+        db.add(ProjectRuleset(project_id=project.project_id, ruleset_id=new_ruleset.ruleset_id))
+        db.commit()
         
         return {
             "success": True,
@@ -157,35 +192,39 @@ async def upload_ruleset_file(
     except HTTPException:
         # Re-raise HTTP exceptions (like 404) without modification
         raise
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON file")
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error uploading ruleset: {str(e)}")
+        print(f"❌ Error uploading ruleset: {e}")
+        raise HTTPException(status_code=500, detail="Error uploading ruleset")
 
 
-@router.post("/api/rulesets/create")
+@router.post(
+    "/api/rulesets/create",
+    responses={
+        401: {"description": "Not signed in"},
+        403: {"description": "Names another user, or cannot edit the project"},
+        404: {"description": "Project not found"},
+        409: {"description": "More than one project has this name"},
+        500: {"description": "Error creating ruleset"},
+    },
+)
 async def create_ruleset(
     request: Request,
     ruleset_data: RulesetCreate,
     db: Annotated[Session, Depends(get_db)],
+    user_account: auth_module.CurrentAccount,
     project_name: str = None,
-    github_user: str = None
 ):
     """Create a new ruleset from JSON data"""
 
-    # Only gated when a project is named: this route also creates rulesets with
-    # no project attached, which is its own problem (#2063) rather than this
-    # one. When a project is named, attaching to it is a write to it.
+    # The project gate only runs when a project is named: this route can also
+    # create a ruleset with no project. When a project is named, attaching to
+    # it is a write to it.
+    project = None
     if project_name:
-        require_project_write_access(db, request, github_user, project_name)
+        project = require_project_write_access(db, request, user_account.github_user, project_name)
 
     try:
-        # Get user account
-        user_account = db.query(Account).filter(Account.github_user == github_user).first()
-        if not user_account:
-            raise HTTPException(status_code=404, detail=ACCOUNT_NOT_FOUND)
-        
         # Create new ruleset
         new_ruleset = Ruleset(
             ruleset_name=ruleset_data.name,
@@ -195,22 +234,11 @@ async def create_ruleset(
         )
         
         db.add(new_ruleset)
-        db.commit()
-        db.refresh(new_ruleset)
+        db.flush()
         
-        # If project_name provided, associate with project
-        if project_name:
-            project = db.query(Project).filter(
-                and_(Project.project_name == project_name, Project.user_id == user_account.user_id)
-            ).first()
-            
-            if project:
-                project_ruleset = ProjectRuleset(
-                    project_id=project.project_id,
-                    ruleset_id=new_ruleset.ruleset_id
-                )
-                db.add(project_ruleset)
-                db.commit()
+        if project:
+            db.add(ProjectRuleset(project_id=project.project_id, ruleset_id=new_ruleset.ruleset_id))
+        db.commit()
         
         return {
             "success": True,
@@ -220,31 +248,32 @@ async def create_ruleset(
         
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error creating ruleset: {str(e)}")
+        print(f"❌ Error creating ruleset: {e}")
+        raise HTTPException(status_code=500, detail="Error creating ruleset")
 
 
-@router.get("/api/rulesets/{project_name}")
+@router.get(
+    "/api/rulesets/{project_name}",
+    responses={
+        404: {"description": "Project not found"},
+        409: {"description": "More than one project has this name"},
+        500: {"description": "Error fetching rulesets"},
+    },
+)
 async def get_project_rulesets(
     project_name: str,
-    github_user: str,
-    request: Request,
+    account: auth_module.CurrentAccount,
     db: Annotated[Session, Depends(get_db)]
 ):
     """Get all rulesets for a specific project"""
     
-    auth_module.assert_session_owns_user(github_user, request, db)
     try:
-        # Get user account
-        user_account = db.query(Account).filter(Account.github_user == github_user).first()
-        if not user_account:
-            raise HTTPException(status_code=404, detail=ACCOUNT_NOT_FOUND)
-        
         # Resolve by access rather than ownership. The owner-scoped lookup this
         # used to do meant the panel only ever loaded for the account that owns
         # the project: every other caller - including a workspace admin on a
         # project they did not create - got a 404 that the UI shows as
         # "Error loading rulesets".
-        project = _find_project_by_name(db, github_user, project_name)
+        project = _find_project_by_name(db, account.github_user, project_name)
         
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
@@ -275,14 +304,26 @@ async def get_project_rulesets(
         # the UI was showing as "Error loading rulesets".
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching rulesets: {str(e)}")
+        print(f"❌ Error fetching rulesets: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching rulesets")
+
+
+def _github_name(ruleset: Ruleset) -> str:
+    """The name GitHub knows the ruleset by: its JSON's own, else the listed one.
+
+    Apply, sync status and removal all look a ruleset up on GitHub by this, so
+    they must agree on it, or the copy one creates is invisible to the others
+    (#2238). A null or blank name in the JSON counts as none.
+    """
+    return json.loads(ruleset.ruleset_json).get("name") or ruleset.ruleset_name
 
 
 @router.post(
     "/api/rulesets/{ruleset_id}/apply",
     responses={
-        403: {"description": "Session does not own the named user"},
-        404: {"description": "Account or ruleset not found"},
+        401: {"description": "Not signed in"},
+        403: {"description": "Names another user, or cannot edit the ruleset's projects or a target repository"},
+        404: {"description": "Ruleset or repository not found, or the ruleset is on no project the caller can see"},
         500: {"description": "Error applying ruleset"},
     },
 )
@@ -290,38 +331,26 @@ async def apply_ruleset_to_repos(
     ruleset_id: int,
     request_data: ApplyRulesetRequest,
     request: Request,
-    db: Annotated[Session, Depends(get_db)]
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     """Apply a ruleset to specified repositories"""
 
-    # github_user is client-supplied and names whose GitHub token gets used.
-    # Scoping the ruleset query to that account is not access control — the
-    # caller picks the account — so without this any signed-in member could
-    # name someone else and create rulesets on their repositories under their
-    # identity. Asserted before the try so the catch-all cannot swallow it.
-    auth_module.assert_session_owns_user(request_data.github_user, request, db)
+    # The caller picks whose GitHub token gets used, so it comes from the
+    # session: a name in the body would let a member apply rulesets under
+    # someone else's identity.
+    caller = account.github_user
+    ruleset = _ruleset_for_caller(db, account, ruleset_id, edit=True)
     # Applying writes the ruleset into those repositories. They carry no
     # project_name, so authorization comes from the projects the repositories
     # belong to.
     for _repo in request_data.repo_names:
-        require_repo_write_access(db, request, request_data.github_user, _repo)
+        require_repo_write_access(db, request, caller, _repo)
 
     try:
-        # Get user account
-        user_account = db.query(Account).filter(Account.github_user == request_data.github_user).first()
-        if not user_account:
-            raise HTTPException(status_code=404, detail=ACCOUNT_NOT_FOUND)
-        
-        # Get ruleset
-        ruleset = db.query(Ruleset).filter(
-            and_(Ruleset.ruleset_id == ruleset_id, Ruleset.user_id == user_account.user_id)
-        ).first()
-        
-        if not ruleset:
-            raise HTTPException(status_code=404, detail=RULESET_NOT_FOUND)
-        
         # Parse ruleset JSON
         ruleset_data = json.loads(ruleset.ruleset_json)
+        ruleset_data["name"] = _github_name(ruleset)
         
         results = []
         errors = []
@@ -330,7 +359,7 @@ async def apply_ruleset_to_repos(
         for repo_name in request_data.repo_names:
             try:
                 result = await apply_ruleset_to_repo(
-                    request_data.github_user, 
+                    caller,
                     repo_name, 
                     ruleset_data
                 )
@@ -339,7 +368,9 @@ async def apply_ruleset_to_repos(
                 else:
                     errors.append(f"❌ Failed to apply ruleset to {repo_name}")
             except Exception as e:
-                errors.append(f"❌ Error applying ruleset to {repo_name}: {str(e)}")
+                kind = failure_kind(e)
+                print(f"❌ {kind} applying ruleset to {repo_name}: {e}")
+                errors.append(f"❌ Error applying ruleset to {repo_name}: {kind}")
         
         return {
             "success": len(errors) == 0,
@@ -350,58 +381,41 @@ async def apply_ruleset_to_repos(
             "error_count": len(errors)
         }
         
-    except HTTPException:
-        # Without this the catch-all below reports the 404s raised above as 500s.
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error applying ruleset: {str(e)}")
+        print(f"❌ Error applying ruleset: {e}")
+        raise HTTPException(status_code=500, detail="Error applying ruleset")
 
 
 @router.post(
     "/api/rulesets/{ruleset_id}/sync-status",
     responses={
         401: {"description": "Not authenticated with GitHub"},
-        403: {"description": "Session does not own the named user"},
-        404: {"description": "Account or ruleset not found"},
+        403: {"description": "Names another user"},
+        404: {"description": "Ruleset not found, or on no project the caller can see"},
         500: {"description": "Error checking ruleset sync status"},
     },
 )
 async def check_ruleset_sync_status(
     ruleset_id: int,
     request_data: RulesetSyncStatusRequest,
-    request: Request,
-    db: Annotated[Session, Depends(get_db)]
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     """Check if a ruleset exists across all specified repositories"""
 
-    # Same client-supplied name as the apply route: it selects whose token reads
-    # the repositories, so it has to be proven before it is used.
-    auth_module.assert_session_owns_user(request_data.github_user, request, db)
+    # As for apply: the caller selects whose token reads the repositories.
+    caller = account.github_user
+    ruleset = _ruleset_for_caller(db, account, ruleset_id, edit=False)
 
     try:
-        # Get user account
-        user_account = db.query(Account).filter(Account.github_user == request_data.github_user).first()
-        if not user_account:
-            raise HTTPException(status_code=404, detail=ACCOUNT_NOT_FOUND)
-        
-        # Get ruleset
-        ruleset = db.query(Ruleset).filter(
-            and_(Ruleset.ruleset_id == ruleset_id, Ruleset.user_id == user_account.user_id)
-        ).first()
-        
-        if not ruleset:
-            raise HTTPException(status_code=404, detail=RULESET_NOT_FOUND)
-        
-        # Parse ruleset JSON to get the name
-        ruleset_data = json.loads(ruleset.ruleset_json)
-        ruleset_name = ruleset_data.get("name", ruleset.ruleset_name)
+        ruleset_name = _github_name(ruleset)
         
         # Check if user is authenticated with GitHub
-        if request_data.github_user not in user_tokens:
+        if caller not in user_tokens:
             raise HTTPException(status_code=401, detail="User not authenticated with GitHub")
         
         # Get user's GitHub token
-        token = user_tokens[request_data.github_user]
+        token = user_tokens[caller]
         headers = {
             "Authorization": f"token {token}",
             "Accept": GITHUB_ACCEPT_JSON,
@@ -469,9 +483,11 @@ async def check_ruleset_sync_status(
                         missing_repos.append(repo_name)
                         
                 except Exception as e:
+                    kind = failure_kind(e)
+                    print(f"❌ {kind} checking rulesets on {repo_name}: {e}")
                     repo_statuses[repo_name] = {
-                        "status": "error", 
-                        "message": f"Error checking repository: {str(e)}"
+                        "status": "error",
+                        "message": f"Error checking repository: {kind}"
                     }
                     missing_repos.append(repo_name)
         
@@ -490,33 +506,54 @@ async def check_ruleset_sync_status(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error checking ruleset sync status: {str(e)}")
+        print(f"❌ Error checking ruleset sync status: {e}")
+        raise HTTPException(status_code=500, detail="Error checking ruleset sync status")
 
 
-def _require_editor_on_rulesets_project(db: Session, github_user: str, ruleset_id: int) -> None:
-    """A ruleset is edited through the projects it is attached to.
+def _require_ruleset_access(db: Session, account: Account, ruleset: Ruleset, *, edit: bool) -> None:
+    """Raise unless the caller may act on *ruleset*, through the projects it is attached to.
 
-    Deleting one removes it from those projects and, for the GitHub scopes,
-    from their repositories — so it needs write access to one of them. An
-    unattached ruleset has no project to check (that orphan state is #2063);
-    it is left to the ownership check the route already performs.
+    The panel lists every ruleset attached to the project, so access has to be
+    decided the same way: whoever can see its project can read it, and
+    whoever can edit it can apply or remove it. Who added it stops mattering,
+    or an admin's upload is out of the owner's reach and a ruleset whose
+    uploader lost access can never be removed (#2236).
+
+    Editing needs every attached project, not just one: removal drops the
+    ruleset from all of them and, for the GitHub scopes, deletes it from all
+    of their repositories. (No route attaches a ruleset to a second project
+    today; this keeps that from becoming a way into someone else's.)
+
+    An unattached ruleset (created without a project, or whose project was
+    deleted) has no project to decide by, so it stays with the account that
+    added it rather than becoming everyone's.
     """
-    links = db.query(ProjectRuleset).filter(ProjectRuleset.ruleset_id == ruleset_id).all()
-    if not links:
-        return
-    for link in links:
-        project = db.query(Project).filter(Project.project_id == link.project_id).first()
-        if not project:
-            continue
-        try:
-            _require_project_editor(db, github_user, project)
-            return
-        except HTTPException:
-            continue
-    raise HTTPException(
-        status_code=403,
-        detail="Insufficient project permissions. Required: project_editor",
+    projects = (
+        db.query(Project)
+        .join(ProjectRuleset, ProjectRuleset.project_id == Project.project_id)
+        .filter(ProjectRuleset.ruleset_id == ruleset.ruleset_id)
+        .all()
     )
+    if not projects:
+        if ruleset.user_id != account.user_id:
+            raise HTTPException(status_code=404, detail=RULESET_NOT_FOUND)
+        return
+
+    roles = [project_role(db, account, project) for project in projects]
+    # Same 404 as a missing ruleset for one on projects the caller cannot see.
+    if not any(roles):
+        raise HTTPException(status_code=404, detail=RULESET_NOT_FOUND)
+    if edit and not all(role in ("project_admin", "project_editor") for role in roles):
+        raise HTTPException(status_code=403, detail=_ERR_INSUFFICIENT_PROJECT_ROLE)
+
+
+def _ruleset_for_caller(db: Session, account: Account, ruleset_id: int, *, edit: bool) -> Ruleset:
+    """Load a ruleset the caller may read, or with *edit* apply and remove."""
+    ruleset = db.query(Ruleset).filter(Ruleset.ruleset_id == ruleset_id).first()
+    if not ruleset:
+        raise HTTPException(status_code=404, detail=RULESET_NOT_FOUND)
+    _require_ruleset_access(db, account, ruleset, edit=edit)
+    return ruleset
 
 
 def _repos_targeted_by_ruleset(db: Session, ruleset_id: int) -> List[str]:
@@ -609,7 +646,8 @@ async def _delete_ruleset_from_repos(
                     client, headers, github_user, repo_name, ruleset_name
                 )
             except httpx.RequestError as e:
-                deleted, error = False, f"network error: {str(e)}"
+                print(f"❌ Network error removing ruleset from {repo_name}: {e}")
+                deleted, error = False, "network error"
 
             if error:
                 errors.append(f"{repo_name}: {error}")
@@ -628,8 +666,7 @@ async def _remove_ruleset_from_github(
     them would leave a ruleset enforcing branch protection with nothing in
     ActionsManager still pointing at it — the whole point of the GitHub option.
     """
-    # The name GitHub knows it by, which the stored JSON can disagree with.
-    github_name = json.loads(ruleset.ruleset_json).get("name", ruleset.ruleset_name)
+    github_name = _github_name(ruleset)
 
     removed_from, errors = await _delete_ruleset_from_repos(
         github_user, _repos_targeted_by_ruleset(db, ruleset.ruleset_id), github_name
@@ -651,35 +688,29 @@ async def _remove_ruleset_from_github(
 @router.delete(
     "/api/rulesets/{ruleset_id}",
     # SonarQube S8415 wants every status this route raises declared. 403 comes
-    # from assert_session_owns_user, 400 from an unknown scope, 401/502 from the
-    # GitHub half below, the two 404s from the lookups, and 500 from the
+    # from the session and project checks, 400 from an unknown scope, 401/502
+    # from the GitHub half below, 404 from the ruleset lookup, and 500 from the
     # catch-all.
     responses={
         400: {"description": "Unknown removal scope"},
         401: {"description": "Not authenticated with GitHub"},
-        403: {"description": "Session does not own the named user"},
-        404: {"description": "Account or ruleset not found"},
+        403: {"description": "Names another user, or cannot edit the ruleset's projects"},
+        404: {"description": "Ruleset not found, or on no project the caller can see"},
         500: {"description": "Error deleting ruleset"},
         502: {"description": "GitHub rejected part of the removal"},
     },
 )
 async def delete_ruleset(
     ruleset_id: int,
-    github_user: str,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
     scope: Annotated[str, Query(description="'project', 'github' or 'project_and_github'")] = _SCOPE_PROJECT,
 ):
     """Delete a ruleset from ActionsManager, and optionally from GitHub too"""
 
-    # github_user is client-supplied and proves nothing on its own. Scoping the
-    # query below to that account looks protective, but the caller picks the
-    # account — without this, any signed-in member could name someone else and
-    # delete their rulesets.
-    auth_module.assert_session_owns_user(github_user, request, db)
     # Deleting detaches the ruleset from its projects and, for the GitHub
     # scopes, removes it from their repositories.
-    _require_editor_on_rulesets_project(db, github_user, ruleset_id)
+    ruleset = _ruleset_for_caller(db, account, ruleset_id, edit=True)
 
     if scope not in _VALID_SCOPES:
         raise HTTPException(
@@ -688,24 +719,11 @@ async def delete_ruleset(
         )
 
     try:
-        # Get user account
-        user_account = db.query(Account).filter(Account.github_user == github_user).first()
-        if not user_account:
-            raise HTTPException(status_code=404, detail=ACCOUNT_NOT_FOUND)
-        
-        # Get ruleset
-        ruleset = db.query(Ruleset).filter(
-            and_(Ruleset.ruleset_id == ruleset_id, Ruleset.user_id == user_account.user_id)
-        ).first()
-        
-        if not ruleset:
-            raise HTTPException(status_code=404, detail=RULESET_NOT_FOUND)
-        
         ruleset_name = ruleset.ruleset_name
 
         removed_from: List[str] = []
         if scope in _SCOPES_REACHING_GITHUB:
-            removed_from = await _remove_ruleset_from_github(db, ruleset, github_user)
+            removed_from = await _remove_ruleset_from_github(db, ruleset, account.github_user)
 
         # A GitHub-only removal lifts the policy without forgetting it: the rows
         # stay so the same ruleset can be applied again from the same project.
@@ -737,12 +755,13 @@ async def delete_ruleset(
         }
         
     except HTTPException:
-        # Without this, the catch-all below turns the 404s raised above into a
-        # 500 — and would do the same to any auth failure raised inside the try.
+        # Without this, the catch-all below turns the GitHub half's 401 and 502
+        # into a 500.
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error deleting ruleset: {str(e)}")
+        print(f"❌ Error deleting ruleset: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting ruleset")
 
 
 async def apply_ruleset_to_repo(github_user: str, repo_name: str, ruleset_data: dict) -> bool:
@@ -776,7 +795,7 @@ async def apply_ruleset_to_repo(github_user: str, repo_name: str, ruleset_data: 
         # Transform the exported ruleset data to the format required by GitHub API
         # The exported format includes metadata that we need to strip for creation
         api_ruleset_data = {
-            "name": ruleset_data.get("name", "Imported Ruleset"),
+            "name": ruleset_data["name"],
             "target": ruleset_data.get("target", "branch"),
             "enforcement": ruleset_data.get("enforcement", "active"),
             "rules": ruleset_data.get("rules", []),

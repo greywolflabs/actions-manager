@@ -66,8 +66,7 @@ Welcome to the Actions Manager documentation! This guide will help you find the 
 - **[License Keys](../LICENSE_KEY_GUIDE.md)** - License key management (self-hosted)
 - **[Licensing Model](../LICENSING_MODEL.md)** - Open-source, commercial, EULA, SaaS terms, and privacy overview
 - **[Troubleshooting](TROUBLESHOOTING.md)** - Common issues and solutions
-- **[Workflow Delivery Modes](guides/WORKFLOW_DELIVERY_MODES.md)** - Direct commit vs PR-based delivery
-- **[Migration Guide](guides/MIGRATION_DIRECT_TO_PR.md)** - Moving from direct to PR-based workflow
+- **[PR Campaigns](https://actionsmanager.io/features/pr-campaigns.html)** - Delivering workflows to GitHub through pull requests
 
 ### For Developers
 
@@ -97,8 +96,7 @@ Welcome to the Actions Manager documentation! This guide will help you find the 
 - **Contribute code** → [Contributing Guide](../CONTRIBUTING.md)
 - **Report a security issue** → [Security Policy](../SECURITY.md)
 - **Understand the architecture** → [Architecture](ARCHITECTURE.md)
-- **Choose workflow delivery mode** → [Workflow Delivery Modes](guides/WORKFLOW_DELIVERY_MODES.md)
-- **Migrate to PR-based delivery** → [Migration Guide](guides/MIGRATION_DIRECT_TO_PR.md)
+- **Deliver workflows to GitHub** → [PR Campaigns](https://actionsmanager.io/features/pr-campaigns.html)
 
 ## 📖 Documentation Structure
 
@@ -117,8 +115,8 @@ docs/
 ├── SELF_HOSTED_INSTALL.md     # Self-hosted installation
 ├── ENVIRONMENT_VARIABLES.md   # Configuration reference
 ├── guides/
-│   ├── WORKFLOW_DELIVERY_MODES.md  # Direct commit vs PR-based delivery
-│   └── MIGRATION_DIRECT_TO_PR.md   # Migration guide
+│   ├── STAGING_TUNNEL.md       # Public HTTPS via Cloudflare Tunnel
+│   └── WEBHOOK_ENDPOINT.md     # GitHub webhook endpoint
 └── features/
     └── PR_BASED_DELIVERY.md        # PR-based delivery technical docs
 ```

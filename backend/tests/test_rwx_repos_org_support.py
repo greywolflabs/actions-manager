@@ -158,11 +158,8 @@ class TestGetRwxReposOrgSupport:
     def setup_method(self):
         _setup()
         self.db = next(_db())
-        self._auth_patch = patch('repos._assert_session_owns_user')
-        self._auth_patch.start()
 
     def teardown_method(self):
-        self._auth_patch.stop()
         self.db.close()
         _teardown()
 
@@ -193,7 +190,7 @@ class TestGetRwxReposOrgSupport:
         mock_get.side_effect = _gh_get
 
         result = asyncio.run(
-            get_rwx_repos("my-org", Mock(), self.db, None)
+            get_rwx_repos(self.db, Mock(github_user="my-org"), None)
         )
         # Only the am-rwx-topic repo should be returned.
         assert len(result) == 1
@@ -246,7 +243,7 @@ class TestGetRwxReposOrgSupport:
         mock_get.side_effect = _gh_get
 
         result = asyncio.run(
-            get_rwx_repos("alice", Mock(), self.db, None)
+            get_rwx_repos(self.db, Mock(github_user="alice"), None)
         )
         full_names = sorted(r["full_name"] for r in result)
         assert full_names == ["greywolflabs/my-rwx-workflow", "whatsupdawg/my-rwx"], (
@@ -280,7 +277,7 @@ class TestGetRwxReposOrgSupport:
         ])
 
         result = asyncio.run(
-            get_rwx_repos("alice", Mock(), self.db, None)
+            get_rwx_repos(self.db, Mock(github_user="alice"), None)
         )
         assert result == []
 
@@ -316,7 +313,7 @@ class TestGetRwxReposOrgSupport:
         mock_client_cls.return_value = mock_client
 
         result = asyncio.run(
-            get_rwx_repos("alice", Mock(), self.db, "my-org")
+            get_rwx_repos(self.db, Mock(github_user="alice"), "my-org")
         )
         assert len(result) == 1
         assert result[0]["full_name"] == "my-org/shared-flows"
@@ -338,7 +335,7 @@ class TestGetRwxReposOrgSupport:
         ]
         with pytest.raises(HTTPException) as exc:
             asyncio.run(
-                get_rwx_repos("alice", Mock(), self.db, "secret-org")
+                get_rwx_repos(self.db, Mock(github_user="alice"), "secret-org")
             )
         assert exc.value.status_code == 403
 
@@ -390,11 +387,11 @@ class TestCreateRwxRepoOrgSupport:
 
         request = Mock()
         request.json = AsyncMock(return_value={
-            "user": "alice", "repo_name": "shared-flows", "owner": "my-org"
+            "repo_name": "shared-flows", "owner": "my-org"
         })
 
         result = asyncio.run(
-            create_rwx_repo(request, self.db)
+            create_rwx_repo(request, self.db, account)
         )
         # POST should hit the org-scoped repo create endpoint, not /user/repos.
         assert post_calls[0][0] == "https://api.github.com/orgs/my-org/repos"
@@ -430,10 +427,10 @@ class TestCreateRwxRepoOrgSupport:
 
             request = Mock()
             request.json = AsyncMock(return_value={
-                "user": "alice", "repo_name": "flows"
+                "repo_name": "flows"
             })
             asyncio.run(
-                create_rwx_repo(request, self.db)
+                create_rwx_repo(request, self.db, account)
             )
             assert post_calls[0] == "https://api.github.com/user/repos"
 
@@ -452,10 +449,10 @@ class TestCreateRwxRepoOrgSupport:
         ]
         request = Mock()
         request.json = AsyncMock(return_value={
-            "user": "alice", "repo_name": "flows", "owner": "secret-org"
+            "repo_name": "flows", "owner": "secret-org"
         })
         result = asyncio.run(
-            create_rwx_repo(request, self.db)
+            create_rwx_repo(request, self.db, account)
         )
         # Endpoint catches HTTPException and returns a JSON error payload
         assert result.get("status") == 403
@@ -500,10 +497,10 @@ class TestCreateGithubRepoOrgSupport:
         mock_client_cls.return_value = mock_client
 
         request = Mock()
-        request.json = AsyncMock(return_value={"user": "alice", "owner": "my-org"})
+        request.json = AsyncMock(return_value={"owner": "my-org"})
 
         result = asyncio.run(
-            create_github_repo(request, self.db)
+            create_github_repo(request, self.db, account)
         )
         assert post_calls[0] == "https://api.github.com/orgs/my-org/repos"
         assert result.get("owner") == "my-org"

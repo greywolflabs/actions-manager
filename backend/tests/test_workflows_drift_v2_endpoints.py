@@ -30,6 +30,7 @@ from models import (  # noqa: E402
     ProjectPullRequest, ProjectPRCampaign,
 )
 from auth import user_tokens  # noqa: E402
+from tests.delivery_records import record_delivered  # noqa: E402
 
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -90,6 +91,8 @@ def db_state(authenticate_client):
         db.add(wf); db.commit(); db.refresh(wf)
         db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=wf.workflow_id))
         db.commit()
+        # Synced: what the delivery that synced it recorded.
+        record_delivered(db, wf, "alice/repo1", "main", sha="sha-old")
 
         # Provide auth token used by the endpoints
         user_tokens["alice"] = "test-token"
@@ -121,7 +124,7 @@ def db_state(authenticate_client):
 @patch('workflows.get_default_branch', return_value="main")
 @patch('workflows.fetch_workflow_tree', return_value=({"AM_P001_ci.yml": "sha-old"}, None))
 def test_project_drift_no_drift(_shas, _branch, db_state):
-    """Same SHA on both sides ⇒ project drift_count == 0."""
+    """GitHub holds the delivered SHA ⇒ project drift_count == 0."""
     resp = client.get(
         f"/api/projects/{db_state['project_id']}/drift",
         params={"github_user": "alice", "refresh": True},
@@ -337,6 +340,72 @@ def test_resolve_drift_use_github_overwrites_local(_g, db_state):
         db.close()
 
 
+def test_resolve_drift_use_github_adopts_from_the_drift_rows_branch(db_state):
+    """Adopt from the branch the drift was found on, not the repo default (#2300).
+
+    The UI sends the drift row's branch and the blob SHA it showed. Reading the
+    default branch instead fetched a different blob, so every attempt on a
+    release branch was refused as "changed since drift was checked".
+    """
+    blobs = {
+        "main": {"content": "name: AM_P001_ci\non: push", "sha": "sha-main"},
+        "release/1.x": {"content": "name: AM_P001_ci\non: pull_request", "sha": "sha-release"},
+    }
+    seen = []
+
+    def fake_github_fetch(owner, repo, filename, token, default_branch=None):
+        seen.append(default_branch)
+        return blobs[default_branch or "main"]
+
+    def detail(branch, has_drift, sha):
+        return WorkflowDriftDetail(
+            workflow_id=db_state["workflow_id"], workflow_name="ci", workflow_filename="AM_P001_ci.yml",
+            repo="alice/repo1", branch=branch, has_drift=has_drift, github_sha=sha,
+            last_checked="2024-01-01T00:00:00Z", message="drifted" if has_drift else "synced",
+        )
+
+    # main now differs from the adopted release content; the response must
+    # report the branch that was resolved, not the first row it finds.
+    rechecked = [detail("main", True, "sha-main"), detail("release/1.x", False, "sha-release")]
+    with patch('workflows.get_workflow_from_github', side_effect=fake_github_fetch), \
+         patch('workflows._collect_project_drift_details', return_value=rechecked):
+        resp = client.post(
+            f"/api/workflows/{db_state['workflow_id']}/resolve-drift",
+            json={
+                "github_user": "alice",
+                "repo": "alice/repo1",
+                "branch": "release/1.x",
+                "resolution": "use_github",
+                "expected_github_sha": "sha-release",
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "synced"
+    assert resp.json()["branch"] == "release/1.x"
+    assert resp.json()["github_hash"] == "sha-release"
+    assert seen == ["release/1.x"]
+
+    db = TestingSessionLocal()
+    try:
+        wf = db.query(Workflow).filter_by(workflow_id=db_state["workflow_id"]).first()
+        assert wf.workflow_git_hash == "sha-release"
+        assert "pull_request" in wf.workflow_yaml
+        assert wf.workflow_status == "synced_with_github"
+    finally:
+        db.close()
+
+
+def test_adopting_the_github_version_needs_a_branch():
+    """An empty branch would silently read the repo default (#2300)."""
+    from workflows import _apply_use_github_resolution
+
+    with patch('workflows.get_workflow_from_github') as fetch, pytest.raises(ValueError):
+        _apply_use_github_resolution(None, "alice", None, "alice/repo1", "AM_P001_ci.yml", "token", branch="")
+
+    fetch.assert_not_called()
+
+
 @patch('workflows.get_workflow_from_github', return_value=None)
 def test_resolve_drift_use_github_missing_on_github_returns_404(_g, db_state):
     resp = client.post(
@@ -511,6 +580,52 @@ def test_resolve_drift_restore_pr_creates_single_pr(mock_regular, _mock_reusable
         db.close()
 
 
+def _add_owned_reusable(project_id: int, name: str = "shared") -> int:
+    db = TestingSessionLocal()
+    try:
+        wf = Workflow(
+            workflow_name=name, workflow_yaml="on:\n  workflow_call:\n",
+            workflow_git_hash="sha-old-shared", reusable_workflow=True,
+            workflow_status="synced_with_github",
+        )
+        db.add(wf); db.commit(); db.refresh(wf)
+        db.add(ProjectWorkflow(project_id=project_id, workflow_id=wf.workflow_id))
+        db.commit()
+        return wf.workflow_id
+    finally:
+        db.close()
+
+
+@patch('workflows._process_reusable_workflows_update', return_value={})
+@patch('workflows._process_regular_workflows_update')
+def test_resolve_drift_restore_pr_delivers_an_owned_reusable_workflow(mock_regular, mock_reusable, db_state):
+    """#2085: drift reports a standard project's own reusable workflow against
+    its repos, so Restore via PR must deliver it there. Selecting it through
+    selected_workflows matched nothing and opened no pull request."""
+    shared_id = _add_owned_reusable(db_state["project_id"])
+    mock_regular.return_value = {"alice/repo1 on main": {
+        "status": "pr_created", "pr_number": 43,
+        "pr_url": "https://github.com/alice/repo1/pull/43",
+        "branch_name": "actions-manager/p001/alice-repo1/def-main",
+        "workflows_committed": ["AM_P001_shared.yml"],
+    }}
+
+    resp = client.post(
+        f"/api/workflows/{shared_id}/resolve-drift",
+        json={
+            "github_user": "alice", "repo": "alice/repo1", "branch": "main",
+            "resolution": "restore_actionsmanager", "delivery_mode": "pr",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert mock_regular.call_args.kwargs["repo_names"] == ["alice/repo1"]
+    assert [(w["name"], w["is_reusable"]) for w in mock_regular.call_args.kwargs["workflows"]] == [
+        ("shared", True),
+    ]
+    assert not mock_reusable.called
+
+
 @patch('workflows._process_reusable_workflows_update', return_value={})
 @patch('workflows._process_regular_workflows_update',
        side_effect=RuntimeError("GitHub API exploded"))
@@ -543,15 +658,20 @@ def test_resolve_drift_restore_pr_github_failure_rolls_back(mock_regular, _mock_
         db.close()
 
 
-def test_resolve_drift_wrong_user_returns_403(db_state):
+def test_resolve_drift_wrong_user_returns_403(db_state, authenticate_client):
     """A user who doesn't own the workflow's project is rejected before any
-    GitHub/PR work runs."""
+    GitHub/PR work runs. The caller is the session's (#2241), so mallory signs in."""
+    db = TestingSessionLocal()
+    db.add(Account(github_user="mallory", github_email="m@example.com", account_type="free"))
+    db.commit()
+    db.close()
+    mallory = TestClient(app)
+    authenticate_client(mallory, "mallory", TestingSessionLocal)
     user_tokens["mallory"] = "mallory-token"
     try:
-        resp = client.post(
+        resp = mallory.post(
             f"/api/workflows/{db_state['workflow_id']}/resolve-drift",
             json={
-                "github_user": "mallory",
                 "repo": "alice/repo1",
                 "branch": "main",
                 "resolution": "restore_actionsmanager",

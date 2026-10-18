@@ -13,7 +13,7 @@ pytest-cov
 pytest-asyncio
 pytest-xdist
 PyYAML
-cryptography>=50.0.1
+cryptography>=50.0.2
 
 # Runtime deps that were previously installed only inside backend/Dockerfile,
 # so local dev and CI never had them while the image did. Declared here so

@@ -1,6 +1,6 @@
 import axios from "axios";
 import apiClient from "./apiClient";
-import { getProjectDeletionSummary, deleteProjectEnhanced } from "./projectDeletion";
+import { getProjectDeletionSummary, deleteProjectEnhanced, deletionErrorMessage } from "./projectDeletion";
 
 import type { Mocked } from "vitest";
 
@@ -67,17 +67,17 @@ describe("projectDeletion API", () => {
   });
 
   describe("deleteProjectEnhanced", () => {
-    it("keeps GitHub resources and removes deployment environments by default", async () => {
-      mockedApiClient.delete.mockResolvedValueOnce({ data: { message: "done" } });
+    it("keeps the files and the secrets by default", async () => {
+      mockedApiClient.delete.mockResolvedValueOnce({ data: { project_deleted: true } });
 
-      await deleteProjectEnhanced("testuser", "My Project");
+      await deleteProjectEnhanced("My Project");
 
       expect(mockedApiClient.delete).toHaveBeenCalledWith(
         expect.stringContaining("/api/projects/My%20Project/enhanced"),
         {
           data: {
-            github_user: "testuser",
             project_name: "My Project",
+            remove_files: false,
             delete_github_resources: false,
             delete_deployment_environments: true,
           },
@@ -85,46 +85,77 @@ describe("projectDeletion API", () => {
       );
     });
 
-    it("forwards both flags when they are given explicitly", async () => {
-      mockedApiClient.delete.mockResolvedValueOnce({ data: {} });
+    it("sends the file and secrets choices separately", async () => {
+      mockedApiClient.delete.mockResolvedValueOnce({ data: { project_deleted: false } });
 
-      await deleteProjectEnhanced("testuser", "My Project", true, false);
+      await deleteProjectEnhanced("My Project", {
+        removeFiles: true,
+        deleteSecrets: true,
+        deleteDeploymentEnvironments: false,
+      });
 
-      expect(mockedApiClient.delete).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          data: expect.objectContaining({
-            delete_github_resources: true,
-            delete_deployment_environments: false,
-          }),
-        })
-      );
+      expect(mockedApiClient.delete).toHaveBeenCalledWith(expect.any(String), {
+        data: {
+          project_name: "My Project",
+          remove_files: true,
+          delete_github_resources: true,
+          delete_deployment_environments: false,
+        },
+      });
     });
 
-    it("returns the deletion details from the response", async () => {
+    it("never names the caller: the server takes it from the session", async () => {
+      mockedApiClient.delete.mockResolvedValueOnce({ data: { project_deleted: true } });
+
+      await deleteProjectEnhanced("My Project", { removeFiles: true });
+
+      expect(mockedApiClient.delete.mock.calls[0][1]?.data).not.toHaveProperty("github_user");
+    });
+
+    it("returns a deletion waiting on its pull requests", async () => {
       mockedApiClient.delete.mockResolvedValueOnce({
         data: {
-          message: "✅ Project deletion completed",
-          details: {
-            project_deleted: true,
-            github_resources_deleted: ["Repository Secret: FOO from org/repo"],
-            errors: [],
-          },
+          message: "Project is being deleted",
+          project_deleted: false,
+          pr_state: "deleting",
+          campaign_id: 7,
+          prs_created: 2,
+          results: {},
+          details: { project_deleted: false, github_resources_deleted: [], errors: [] },
         },
       });
 
-      const result = await deleteProjectEnhanced("testuser", "My Project", true);
+      const result = await deleteProjectEnhanced("My Project", { removeFiles: true });
 
-      expect(result.details?.project_deleted).toBe(true);
-      expect(result.details?.github_resources_deleted).toEqual([
-        "Repository Secret: FOO from org/repo",
-      ]);
+      expect(result.project_deleted).toBe(false);
+      expect(result.pr_state).toBe("deleting");
+      expect(result.prs_created).toBe(2);
     });
 
     it("throws on API error", async () => {
       mockedApiClient.delete.mockRejectedValueOnce(new Error("forbidden"));
 
-      await expect(deleteProjectEnhanced("testuser", "My Project")).rejects.toThrow("forbidden");
+      await expect(deleteProjectEnhanced("My Project")).rejects.toThrow("forbidden");
+    });
+  });
+
+  describe("deletionErrorMessage", () => {
+    it("reads a refusal's message, which names the open pull requests", () => {
+      const refusal = {
+        response: { data: { detail: { message: "Merge or close its open pull requests first: org/a#3.", open_prs: [] } } },
+      };
+
+      expect(deletionErrorMessage(refusal)).toBe("Merge or close its open pull requests first: org/a#3.");
+    });
+
+    it("reads a plain detail", () => {
+      expect(deletionErrorMessage({ response: { data: { detail: "already being deleted" } } })).toBe(
+        "already being deleted"
+      );
+    });
+
+    it("falls back to a generic message", () => {
+      expect(deletionErrorMessage(new Error("Network Error"))).toBe("Error deleting project. Please try again.");
     });
   });
 });

@@ -58,7 +58,7 @@ client = TestClient(app)
 
 
 @pytest.fixture()
-def db_session():
+def db_session(authenticate_client):
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -75,6 +75,7 @@ def db_session():
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+    authenticate_client(client, TEST_USER, TestingSessionLocal)
     db = TestingSessionLocal()
     try:
         yield db
@@ -233,7 +234,6 @@ def _preview(gh, campaign_id):
     with patch("workflows.user_tokens", {TEST_USER: "fake-token"}), \
          patch("campaign_rollback.github_get", gh):
         return client.post("/api/campaign-rollback-preview", json={
-            "github_user": TEST_USER,
             "project_name": TEST_PROJECT,
             "campaign_id": f"campaign-{campaign_id}",
         })
@@ -366,7 +366,7 @@ class TestNonInvertible:
         with patch("workflows.user_tokens", {TEST_USER: "fake-token"}), \
              patch("campaign_rollback.github_get", exhausted):
             response = client.post("/api/campaign-rollback-preview", json={
-                "github_user": TEST_USER, "project_name": TEST_PROJECT,
+                "project_name": TEST_PROJECT,
                 "campaign_id": f"campaign-{campaign.campaign_id}",
             })
 
@@ -384,7 +384,7 @@ class TestNonInvertible:
              patch("workflows._require_project_editor",
                    side_effect=HTTPException(status_code=403, detail="Insufficient project role")):
             response = client.post("/api/campaign-rollback", json={
-                "github_user": TEST_USER, "project_name": TEST_PROJECT,
+                "project_name": TEST_PROJECT,
                 "campaign_id": f"campaign-{campaign.campaign_id}", "am_action": "keep",
             })
 
@@ -394,15 +394,28 @@ class TestNonInvertible:
         _create_project(db_session)
         with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
             response = client.post("/api/campaign-rollback-preview", json={
-                "github_user": TEST_USER, "project_name": TEST_PROJECT,
+                "project_name": TEST_PROJECT,
                 "campaign_id": "legacy-1-ci-main-2026-01-01",
             })
         assert response.status_code == 400
         assert "predates campaign tracking" in response.json()["detail"]
 
+    @pytest.mark.parametrize("path", ["/api/campaign-rollback-preview", "/api/campaign-rollback"])
+    def test_naming_someone_else_in_the_query_is_refused(self, db_session, path):
+        """auth.current_account owns the legacy github_user query parameter (#2241)."""
+        _create_project(db_session)
+        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}), \
+             patch("campaign_rollback.github_get", side_effect=AssertionError("no GitHub call expected")):
+            # The body names the caller, as the frontend still sends it.
+            response = client.post(path, params={"github_user": "someone-else"}, json={
+                "github_user": TEST_USER, "project_name": TEST_PROJECT,
+                "campaign_id": "legacy-1-ci-main-2026-01-01",
+            })
+        assert response.status_code == 403, response.text
+
 
 class TestRollbackCampaignCreation:
-    def _create(self, gh, campaign_id, am_action="keep", protection=None):
+    def _create(self, gh, campaign_id, am_action="keep", protection=None, **body):
         finalize = MagicMock(return_value={
             "status": "pr_created", "pr_number": 101,
             "pr_url": f"https://github.com/{REPO}/pull/101",
@@ -422,10 +435,27 @@ class TestRollbackCampaignCreation:
                    return_value=([WORKFLOW_PATH], [])) as commit, \
              patch("workflows._finalize_pr_result", finalize):
             response = client.post("/api/campaign-rollback", json={
-                "github_user": TEST_USER, "project_name": TEST_PROJECT,
-                "campaign_id": f"campaign-{campaign_id}", "am_action": am_action,
+                "project_name": TEST_PROJECT,
+                "campaign_id": f"campaign-{campaign_id}", "am_action": am_action, **body,
             })
         return response, commit, finalize
+
+    def test_a_name_in_the_body_is_ignored(self, db_session):
+        """The caller comes from the session (#2241): a github_user the body still
+        carries changes nothing, and the rollback is recorded as the caller's."""
+        project = _create_project(db_session)
+        source = _add_campaign(db_session, project)
+        _add_pr(db_session, project, source)
+
+        response, _commit, _finalize = self._create(
+            _github_with_simple_change(), source.campaign_id, github_user="someone-else"
+        )
+
+        assert response.status_code == 200, response.text
+        rollback = db_session.query(ProjectPRCampaign).filter(
+            ProjectPRCampaign.campaign_id == response.json()["campaign_id"]
+        ).first()
+        assert rollback.created_by == TEST_USER
 
     def test_links_to_source_and_records_the_am_choice(self, db_session):
         project = _create_project(db_session)
@@ -511,7 +541,7 @@ class TestRollbackCampaignCreation:
                    return_value=([WORKFLOW_PATH], ["other.yml: HTTP 422"])), \
              patch("workflows._finalize_pr_result", finalize):
             response = client.post("/api/campaign-rollback", json={
-                "github_user": TEST_USER, "project_name": TEST_PROJECT,
+                "project_name": TEST_PROJECT,
                 "campaign_id": f"campaign-{source.campaign_id}", "am_action": "keep",
             })
 
@@ -559,7 +589,7 @@ class TestRollbackCampaignCreation:
                    return_value=([WORKFLOW_PATH], [])), \
              patch("workflows._finalize_pr_result", finalize):
             response = client.post("/api/campaign-rollback", json={
-                "github_user": TEST_USER, "project_name": TEST_PROJECT,
+                "project_name": TEST_PROJECT,
                 "campaign_id": f"campaign-{source.campaign_id}", "am_action": "keep",
             })
 

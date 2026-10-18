@@ -55,7 +55,9 @@ def update_drift_settings(
     _auth: Annotated[WorkspaceMember, Depends(require_role("admin"))],
 ):
     """Save the settings, creating the single row on first use."""
-    settings = db.query(DriftSettings).first()
+    # The same row every reader takes (drift_worker.get_settings), should a
+    # second ever exist.
+    settings = db.query(DriftSettings).order_by(DriftSettings.settings_id).first()
     if settings is None:
         settings = DriftSettings()
         db.add(settings)

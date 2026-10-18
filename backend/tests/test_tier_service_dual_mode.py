@@ -12,7 +12,6 @@ from unittest.mock import patch
 from tier_service import (
     get_effective_tier,
     check_new_project,
-    check_private_repo_access,
     check_repo_limit,
     secrets_limit,
     secrets_limit_message,
@@ -109,22 +108,6 @@ class TestSelfHostedMode:
             assert allowed is False
             assert "self-hosted beta" in error.lower()
     
-    def test_self_hosted_private_repo_access(self, monkeypatch):
-        """Private repo access is part of the core product on every tier."""
-        # Free tier: private repos are available (workflow-first model)
-        with patch('tier_service.license.get_installation_tier', return_value='free'):
-            account = MockAccount()
-            allowed, error = check_private_repo_access(account)
-            assert allowed is True
-            assert error is None
-
-        # Professional tier: also has private repo access
-        with patch('tier_service.license.get_installation_tier', return_value='professional'):
-            account = MockAccount()
-            allowed, error = check_private_repo_access(account)
-            assert allowed is True
-            assert error is None
-
     def test_self_hosted_repo_limits(self, monkeypatch):
         """Test repo limits in self-hosted mode"""
         # Free tier: 10 repos per project
@@ -198,11 +181,8 @@ class TestSelfHostedIgnoresCloudTierLimits:
     def test_professional_license_within_beta_limits(self):
         sh_account = MockAccount(account_type='professional')
         with patch('tier_service.license.get_installation_tier', return_value='professional'):
-            sh_private_check = check_private_repo_access(sh_account)
             sh_secret_limit = secrets_limit(sh_account)
 
-        # Private repo access is always True
-        assert sh_private_check == (True, None)
         # Beta secret limit is 6; exactly at the limit is allowed
         assert sh_secret_limit == 6
 

@@ -32,9 +32,11 @@ os.environ.setdefault("ENVIRONMENT", "development")
 from main import app  # noqa: E402
 import workflow_import  # noqa: E402
 from workflow_import import get_db as import_get_db  # noqa: E402
-from workflows import get_db as wf_get_db, _compare_workflow_content  # noqa: E402
+import deliveries  # noqa: E402
+from workflows import DriftCheckUnavailable, get_db as wf_get_db, _check_regular_workflow_in_repo  # noqa: E402
 from projects import get_db as proj_get_db  # noqa: E402
 from auth import user_tokens  # noqa: E402
+from tests.delivery_records import record_delivered  # noqa: E402
 from models import (  # noqa: E402
     Base, Account, Project, Repo, ProjectRepo, Workflow, ProjectWorkflow,
     WorkflowVersion, ProjectPullRequest, WorkspaceMember, ProjectMembership,
@@ -78,6 +80,16 @@ def _stub_github_blob_reads():
     workflow_import._REUSABLE_BLOB_CACHE.clear()
 
 
+def _check_on_repo1(db, project_id, wf, github_content):
+    """The drift check of *wf* on owner/repo1@main, GitHub holding *github_content* there (None: missing)."""
+    shas = {} if github_content is None else {"wf.yml": "gh-sha"}
+    with patch("workflows.get_workflow_from_github", return_value={"content": github_content, "sha": "gh-sha"}):
+        return _check_regular_workflow_in_repo(
+            db, wf, "owner/repo1", "owner", "repo1", "wf.yml", shas, "PROJ", "token", project_id, "main",
+            deliveries.targets_for(db, project_id),
+        )
+
+
 def _setup_project(db, *, use_prefix=True, project_code="TP01"):
     """Create a standard test project with a user and repo."""
     user = Account(github_user="testuser", github_email="test@example.com", account_type="free")
@@ -114,7 +126,7 @@ def _add_managed_workflow(db, project_id, workflow_name, workflow_yaml="name: ex
     workflow = Workflow(
         workflow_name=workflow_name,
         workflow_yaml=workflow_yaml,
-        workflow_git_hash="0" * 40,
+        workflow_git_hash=None,
         workflow_status="new",
     )
     db.add(workflow)
@@ -160,7 +172,7 @@ class TestDiscoverWorkflows:
              patch("workflow_import.get_default_branch", return_value="main"):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
@@ -180,13 +192,61 @@ class TestDiscoverWorkflows:
              patch("workflow_import.get_default_branch", return_value="main"):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
         data = resp.json()
         assert data["workflows_found"] == 0
         assert data["results"][0]["warning"] is not None
+
+    def test_discover_reports_a_repo_whose_default_branch_cannot_be_read(self):
+        """It used to guess "main" and report "no workflow files" for the repo (#2301)."""
+        db = TestingSessionLocal()
+        _user_id, project_id, _repo_id = _setup_project(db)
+        db.close()
+
+        unavailable = DriftCheckUnavailable("GitHub returned 403 resolving the default branch of owner/repo1", 403)
+        with patch("workflow_import.get_default_branch", side_effect=unavailable), \
+             patch("workflow_import.get_all_workflow_shas") as scan:
+            resp = client.get(
+                f"/api/projects/{project_id}/workflow-import/discover",
+                params={"project_name": "TestProject"},
+            )
+
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["error"] == (
+            "Could not read the repository's default branch: "
+            "GitHub returned 403 resolving the default branch of owner/repo1"
+        )
+        assert result["workflows"] == []
+        scan.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "error, expected",
+        [
+            (DriftCheckUnavailable("GitHub returned 404 listing o/r@main", status_code=404),
+             "Failed to scan repository: GitHub returned 404 listing o/r@main"),
+            (RuntimeError("secret-marker-2297"), "Failed to scan repository: unexpected error"),
+        ],
+        ids=["github-answer-shown", "unexpected-hidden"],
+    )
+    def test_discover_scan_failure_shows_only_githubs_answer(self, error, expected):
+        """A repository GitHub would not list says why; anything else is named by kind (#2297)."""
+        db = TestingSessionLocal()
+        user_id, project_id, repo_id = _setup_project(db)
+        db.close()
+
+        with patch("workflow_import.get_all_workflow_shas", side_effect=error), \
+             patch("workflow_import.get_default_branch", return_value="main"):
+            resp = client.get(
+                f"/api/projects/{project_id}/workflow-import/discover",
+                params={"project_name": "TestProject"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["results"][0]["error"] == expected
 
     def test_discover_unauthenticated(self):
         """Discover rejects unauthenticated users."""
@@ -198,7 +258,7 @@ class TestDiscoverWorkflows:
         try:
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
             assert resp.status_code == 401
         finally:
@@ -219,7 +279,7 @@ class TestDiscoverWorkflows:
         try:
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "otheruser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
             assert resp.status_code == 404
         finally:
@@ -237,7 +297,7 @@ class TestDiscoverWorkflows:
              patch("workflow_import.get_default_branch", return_value="main"):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
@@ -261,7 +321,7 @@ class TestDiscoverWorkflows:
              patch("workflow_import.get_default_branch", return_value="main"):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
@@ -285,7 +345,7 @@ class TestDiscoverWorkflows:
              patch("workflow_import.get_default_branch", return_value="main"):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
@@ -307,7 +367,7 @@ class TestDiscoverWorkflows:
              patch("workflow_import.get_default_branch", return_value="main"):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
@@ -330,7 +390,7 @@ class TestDiscoverWorkflows:
              patch("workflow_import.get_default_branch", return_value="main"):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
@@ -362,7 +422,6 @@ class TestPreviewWorkflow:
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/preview",
                 params={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "repo_name": "owner/repo1",
                     "branch": "main",
@@ -384,7 +443,6 @@ class TestPreviewWorkflow:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -402,7 +460,6 @@ class TestPreviewWorkflow:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -436,7 +493,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -455,7 +511,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -476,7 +531,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -496,7 +550,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -515,7 +568,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -537,7 +589,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -557,7 +608,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -575,7 +625,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -596,7 +645,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -617,7 +665,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -637,7 +684,6 @@ class TestWorkflowPathValidationRegression:
         resp = client.get(
             f"/api/projects/{project_id}/workflow-import/preview",
             params={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "repo_name": "owner/repo1",
                 "branch": "main",
@@ -672,7 +718,6 @@ class TestImportWorkflows:
             resp = client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "workflows": [{
                         "source_repo": "owner/repo1",
@@ -695,8 +740,8 @@ class TestImportWorkflows:
         wf = db2.query(Workflow).filter(Workflow.workflow_name.ilike("ci")).first()
         assert wf is not None
         assert wf.workflow_yaml.strip() == content.strip()
-        # workflow_git_hash should be zeros (local only, no baseline)
-        assert wf.workflow_git_hash == "0" * 40
+        # No workflow_git_hash: nothing was committed to GitHub
+        assert wf.workflow_git_hash is None
         # workflow_status should be new (first save)
         assert wf.workflow_status == "new"
         db2.close()
@@ -719,7 +764,6 @@ class TestImportWorkflows:
             client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "workflows": [{
                         "source_repo": "owner/repo1",
@@ -730,14 +774,15 @@ class TestImportWorkflows:
                 },
             )
 
-        # Now check drift: workflow with hash=zeros and no open PR → no drift
+        # Now check drift: nothing delivered, so neither missing nor
+        # different content is drift
         db2 = TestingSessionLocal()
         wf = db2.query(Workflow).filter(Workflow.workflow_name.ilike("ci")).first()
         assert wf is not None
-        # Simulate what drift detection does:
-        # _compare_workflow_content returns None when no real hash exists
-        result = _compare_workflow_content(wf, None, "owner/repo1", "TP01")
-        assert result is None  # No drift result for never-synced workflow
+        for github in (None, "name: CI\non: pull_request\n"):
+            result = _check_on_repo1(db2, project_id, wf, github)
+            assert result.has_drift is False
+            assert "not delivered" in result.message
         db2.close()
 
     def test_import_all_failures_do_not_transition_project_state(self):
@@ -749,7 +794,6 @@ class TestImportWorkflows:
         resp = client.post(
             f"/api/projects/{project_id}/workflow-import",
             json={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "workflows": [{
                     "source_repo": "owner/repo1",
@@ -781,7 +825,6 @@ class TestImportWorkflows:
         resp = client.post(
             f"/api/projects/{project_id}/workflow-import",
             json={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "workflows": [{
                     "source_repo": "owner/repo1",
@@ -802,7 +845,6 @@ class TestImportWorkflows:
         resp = client.post(
             f"/api/projects/{project_id}/workflow-import",
             json={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "workflows": [{
                     "source_repo": "owner/repo1",
@@ -826,7 +868,6 @@ class TestImportWorkflows:
         resp = client.post(
             f"/api/projects/{project_id}/workflow-import",
             json={
-                "github_user": "testuser",
                 "project_name": "TestProject",
                 "workflows": [{
                     "source_repo": "owner/repo1",
@@ -854,7 +895,6 @@ class TestImportWorkflows:
             resp = client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "workflows": [{
                         "source_repo": "owner/repo1",
@@ -881,57 +921,72 @@ class TestDriftBehaviorWithImport:
     trigger drift before a real GitHub baseline is established.
     """
 
-    def test_no_hash_no_pr_means_no_drift(self):
-        """workflow_git_hash=None + no open PR → no drift result."""
-        wf = MagicMock()
-        wf.workflow_git_hash = None
-        wf.workflow_yaml = "name: test\non: push"
-        wf.workflow_name = "test"
-        wf.workflow_status = "new"
+    def _workflow(self, db, **columns):
+        _, project_id, _ = _setup_project(db)
+        wf = Workflow(workflow_yaml="name: test\non: push", workflow_name="test", **columns)
+        db.add(wf)
+        db.flush()
+        db.add(ProjectWorkflow(project_id=project_id, workflow_id=wf.workflow_id))
+        db.commit()
+        return project_id, wf
 
-        result = _compare_workflow_content(wf, None, "owner/repo1", "PROJ")
-        assert result is None
+    def test_no_hash_no_pr_means_no_drift(self):
+        """workflow_git_hash=None, never delivered → not drift."""
+        db = TestingSessionLocal()
+        try:
+            project_id, wf = self._workflow(db, workflow_git_hash=None, workflow_status="new")
+            result = _check_on_repo1(db, project_id, wf, None)
+        finally:
+            db.close()
+        assert result.has_drift is False
+        assert "not delivered" in result.message
 
     def test_zeros_hash_no_pr_means_no_drift(self):
-        """workflow_git_hash=40 zeros + no open PR → no drift result."""
-        wf = MagicMock()
-        wf.workflow_git_hash = "0" * 40
-        wf.workflow_yaml = "name: test\non: push"
-        wf.workflow_name = "test"
-        wf.workflow_status = "committed_locally"
-
-        result = _compare_workflow_content(wf, None, "owner/repo1", "PROJ")
-        assert result is None
+        """The 40-zero hash rows from before NULL replaced it: never delivered → not drift."""
+        db = TestingSessionLocal()
+        try:
+            project_id, wf = self._workflow(db, workflow_git_hash="0" * 40, workflow_status="committed_locally")
+            result = _check_on_repo1(db, project_id, wf, None)
+        finally:
+            db.close()
+        assert result.has_drift is False
+        assert "not delivered" in result.message
 
     def test_real_hash_missing_github_is_drift(self):
         """workflow_git_hash=real SHA + missing from GitHub → drift."""
-        wf = MagicMock()
-        wf.workflow_git_hash = "abc123def456789012345678901234567890abcd"
-        wf.workflow_yaml = "name: test\non: push"
-        wf.workflow_name = "test"
-        wf.workflow_status = "synced_with_github"
+        db = TestingSessionLocal()
+        try:
+            _, project_id, _ = _setup_project(db)
+            wf = Workflow(
+                workflow_git_hash="abc123def456789012345678901234567890abcd",
+                workflow_yaml="name: test\non: push",
+                workflow_name="test",
+                workflow_status="synced_with_github",
+            )
+            db.add(wf)
+            db.flush()
+            db.add(ProjectWorkflow(project_id=project_id, workflow_id=wf.workflow_id))
+            # Synced: what that delivery recorded.
+            record_delivered(db, wf, "owner/repo1", "main")
 
-        result = _compare_workflow_content(wf, None, "owner/repo1", "PROJ")
-        assert result is not None
+            result = _check_on_repo1(db, project_id, wf, None)
+        finally:
+            db.close()
         assert result.has_drift is True
 
     def test_committed_locally_different_content_no_drift(self):
-        """workflow_status=committed_locally means local modification, not drift.
-        
-        Note: _compare_workflow_content checks the content. But the caller
-        (_process_regular_workflows) already filters out workflows with
-        no real hash (zeros/None). So this workflow wouldn't reach content comparison.
-        We verify the hash-based filtering here.
-        """
-        wf = MagicMock()
-        wf.workflow_git_hash = "0" * 40
-        wf.workflow_yaml = "name: test\non: push"
-        wf.workflow_name = "test"
-        wf.workflow_status = "committed_locally"
+        """A workflow edited locally and never delivered: GitHub's different file is not drift.
 
-        # Even if GitHub has different content, no real hash means no drift
-        result = _compare_workflow_content(wf, None, "owner/repo1", "PROJ")
-        assert result is None
+        Not because of the status or the hash: nothing was delivered there, which
+        the delivery record says.
+        """
+        db = TestingSessionLocal()
+        try:
+            project_id, wf = self._workflow(db, workflow_git_hash=None, workflow_status="committed_locally")
+            result = _check_on_repo1(db, project_id, wf, "name: test\non: pull_request\n")
+        finally:
+            db.close()
+        assert result.has_drift is False
 
     def test_creating_project_does_not_create_drift(self):
         """Creating a project alone does not trigger drift."""
@@ -982,7 +1037,6 @@ class TestDriftBehaviorWithImport:
             client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "workflows": [{
                         "source_repo": "owner/repo1",
@@ -1050,7 +1104,6 @@ class TestImportPermissions:
         resp = client.post(
             f"/api/projects/{project_id}/workflow-import",
             json={
-                "github_user": "vieweruser",
                 "project_name": "TestProject",
                 "workflows": [{
                     "source_repo": "owner/repo1",
@@ -1108,7 +1161,6 @@ class TestImportPermissions:
             resp = client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "editoruser",
                     "project_name": "TestProject",
                     "workflows": [{
                         "source_repo": "owner/repo1",
@@ -1149,7 +1201,6 @@ class TestImportDefaultTargetRepos:
             resp = client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "workflows": [{
                         "source_repo": "owner/repo1",
@@ -1166,6 +1217,37 @@ class TestImportDefaultTargetRepos:
         assert mock_create_prs.called
         pr_request_arg = mock_create_prs.call_args[0][0]
         assert "owner/repo1" in pr_request_arg.selected_repos
+
+    def test_a_campaign_refusal_written_for_the_user_is_shown(self):
+        """The preflight gate says what to fix; only unexpected errors are hidden (#2297)."""
+        from fastapi import HTTPException
+
+        db = TestingSessionLocal()
+        _user_id, project_id, _repo_id = _setup_project(db)
+        db.close()
+
+        content = base64.b64encode(b"name: CI\non: push").decode()
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"content": content, "sha": "shaABC"}
+        gate = HTTPException(status_code=400, detail="Preflight validation must pass before creating this PR Campaign.")
+
+        with patch("workflow_import.requests.get", return_value=mock_resp), \
+             patch("workflows.create_pull_requests", side_effect=gate):
+            resp = client.post(
+                f"/api/projects/{project_id}/workflow-import",
+                json={
+                    "project_name": "TestProject",
+                    "workflows": [{
+                        "source_repo": "owner/repo1",
+                        "source_branch": "main",
+                        "workflow_path": ".github/workflows/ci.yml",
+                    }],
+                    "import_mode": "save_and_create_pr_campaign",
+                },
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["pr_results"] == {"error": "Preflight validation must pass before creating this PR Campaign."}
 
 
 class TestImportCampaignActuallyRuns:
@@ -1202,7 +1284,6 @@ class TestImportCampaignActuallyRuns:
             resp = client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "workflows": [{
                         "source_repo": "owner/repo1",
@@ -1266,7 +1347,6 @@ class TestImportCampaignActuallyRuns:
             resp = client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "workflows": [{
                         "source_repo": "owner/repo1",
@@ -1287,6 +1367,43 @@ class TestImportCampaignActuallyRuns:
 
         # Not shipped to a separate reusable-workflow repository as well.
         assert not mock_reusable.called
+
+    def test_an_unchanged_reimport_is_routed_as_the_kind_it_was_saved_as(self):
+        """#2318: a re-import that changes nothing keeps the row's kind, even
+        where the YAML alone would say otherwise, so the campaign has to route
+        the workflow by the kind it was saved as, not by its trigger."""
+        body = "name: Shared\non: push"
+        db = TestingSessionLocal()
+        _user_id, project_id, _repo_id = _setup_project(db)
+        workflow_id = _add_managed_workflow(db, project_id, "shared", workflow_yaml=body)
+        db.query(Workflow).filter_by(workflow_id=workflow_id).update({"reusable_workflow": True})
+        db.commit()
+        db.close()
+
+        blob = MagicMock(status_code=200)
+        blob.json.return_value = {"content": base64.b64encode(body.encode()).decode(), "sha": "shaSAME"}
+
+        with patch("workflow_import.requests.get", return_value=blob), \
+             patch("workflows._process_reusable_workflows_update", return_value={}), \
+             patch("workflows._process_regular_workflows_update", return_value={}) as mock_deliver:
+            resp = client.post(
+                f"/api/projects/{project_id}/workflow-import",
+                json={
+                    "project_name": "TestProject",
+                    "workflows": [{
+                        "source_repo": "owner/repo1",
+                        "source_branch": "main",
+                        "workflow_path": ".github/workflows/shared.yml",
+                    }],
+                    "import_mode": "save_and_create_pr_campaign",
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["results"][0]["status"] == "success"
+        assert mock_deliver.called, "the reusable row was looked for among regular workflows"
+        delivered = mock_deliver.call_args.kwargs["workflows"]
+        assert [(w["name"], w["is_reusable"]) for w in delivered] == [("shared", True)]
 
     def test_campaign_mode_delivers_both_kinds_together(self):
         """A mixed import puts both kinds in the same campaign, same repos."""
@@ -1313,7 +1430,6 @@ class TestImportCampaignActuallyRuns:
             resp = client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "workflows": [
                         {"source_repo": "owner/repo1", "source_branch": "main",
@@ -1348,7 +1464,6 @@ class TestImportCampaignActuallyRuns:
             resp = client.post(
                 f"/api/projects/{project_id}/workflow-import",
                 json={
-                    "github_user": "testuser",
                     "project_name": "TestProject",
                     "workflows": [{
                         "source_repo": "owner/repo1",
@@ -1407,7 +1522,6 @@ def _add_rwx_project(db, user_id, name="SharedWorkflows", code="RWX1"):
 
 def _import_payload(**overrides):
     payload = {
-        "github_user": "testuser",
         "project_name": "TestProject",
         "workflows": [{
             "source_repo": "owner/repo1",
@@ -1442,7 +1556,7 @@ class TestDiscoveryFlagsReusableWorkflows:
              patch("workflow_import.requests.get", side_effect=fake_get):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
@@ -1472,7 +1586,7 @@ class TestDiscoveryFlagsReusableWorkflows:
              patch("workflow_import.requests.get", mock_get):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
@@ -1491,7 +1605,7 @@ class TestDiscoveryFlagsReusableWorkflows:
                    side_effect=requests.RequestException("boom")):
             resp = client.get(
                 f"/api/projects/{project_id}/workflow-import/discover",
-                params={"github_user": "testuser", "project_name": "TestProject"},
+                params={"project_name": "TestProject"},
             )
 
         assert resp.status_code == 200
@@ -1527,6 +1641,50 @@ class TestImportReusableIntoCallerProject:
         assert saved.workflow_name == "shared-workflow"
         assert saved.reusable_workflow is True
         db.close()
+
+
+class TestCallerComesFromTheSession:
+    """The caller is the session's account (#2241), never a name the request carries."""
+
+    def test_a_name_in_the_body_is_ignored(self):
+        db = TestingSessionLocal()
+        _user_id, project_id, _repo_id = _setup_project(db)
+        db.close()
+
+        with patch("workflow_import.requests.get",
+                   return_value=_blob_response(REUSABLE_YAML)):
+            resp = client.post(
+                f"/api/projects/{project_id}/workflow-import",
+                json=_import_payload(github_user="someone-else"),
+            )
+
+        assert resp.status_code == 200, resp.text
+        db = TestingSessionLocal()
+        saved = (
+            db.query(Workflow)
+            .join(ProjectWorkflow, ProjectWorkflow.workflow_id == Workflow.workflow_id)
+            .filter(ProjectWorkflow.project_id == project_id)
+            .one()
+        )
+        assert saved.last_modified_by == "testuser"
+        db.close()
+
+    def test_naming_someone_else_in_the_query_is_refused(self):
+        """auth.current_account owns the legacy github_user query parameter."""
+        db = TestingSessionLocal()
+        _user_id, project_id, _repo_id = _setup_project(db)
+        db.close()
+
+        with patch("workflow_import.requests.get",
+                   return_value=_blob_response(REUSABLE_YAML)):
+            # The body names the caller, as the frontend still sends it.
+            resp = client.post(
+                f"/api/projects/{project_id}/workflow-import",
+                params={"github_user": "someone-else"},
+                json=_import_payload(github_user="testuser"),
+            )
+
+        assert resp.status_code == 403, resp.text
 
 
 class TestImportRedirectedToReusableProject:
@@ -1672,7 +1830,7 @@ class TestBlobClassificationCache:
         db.close()
 
         mock_get = MagicMock(return_value=_blob_response(REUSABLE_YAML))
-        params = {"github_user": "testuser", "project_name": "TestProject"}
+        params = {"project_name": "TestProject"}
         with patch("workflow_import.get_all_workflow_shas",
                    return_value={"shared-workflow.yml": "shaREUSE"}), \
              patch("workflow_import.get_default_branch", return_value="main"), \
@@ -1693,7 +1851,7 @@ class TestBlobClassificationCache:
         _user_id, project_id, _repo_id = _setup_project(db)
         db.close()
 
-        params = {"github_user": "testuser", "project_name": "TestProject"}
+        params = {"project_name": "TestProject"}
         responses = [MagicMock(status_code=500, json=MagicMock(return_value={})),
                      _blob_response(REUSABLE_YAML)]
         with patch("workflow_import.get_all_workflow_shas",

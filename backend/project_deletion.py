@@ -1,13 +1,13 @@
 """
 Project Deletion API Module
 
-Provides endpoints for enhanced project deletion functionality including:
-- Listing all GitHub resources associated with a project
-- Deleting GitHub resources (workflows, secrets, environment variables)
+Deleting a project either keeps its files in GitHub or removes them by a last
+PR Campaign (workflows.start_project_removal). Separately, and at once, it can
+delete the project's secrets, variables and deployment environments, which no
+pull request can carry. The summary lists both before the user chooses.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query, Request
-from sqlalchemy import func
+from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from typing import Annotated, List, Dict, Any, Optional, Set
 import requests
@@ -16,8 +16,19 @@ from pydantic import BaseModel
 from database import get_db
 import auth as auth_module
 from auth import user_tokens
-from models import Project, Account, Repo, Workflow, ProjectRepo, ProjectWorkflow, ProjectSecret, ProjectEnvVar, ProjectDisplayOrder
-from workflows import GITHUB_TIMEOUT_SECONDS, cleanup_orphaned_workflows
+from models import Project, Account, Repo, Workflow, ProjectRepo, ProjectWorkflow, ProjectSecret, ProjectEnvVar
+from authorization import PROJECT_DELETING, find_project_by_name, has_project_role
+from workflows import (
+    GITHUB_TIMEOUT_SECONDS,
+    ProjectDeletionOutcome,
+    _deleted_now,
+    _responses,
+    project_hint,
+    project_removal_blocker,
+    project_removal_plan,
+    start_project_removal,
+)
+from error_detail import failure_kind
 
 router = APIRouter()
 
@@ -27,7 +38,12 @@ GITHUB_API_URL = "https://api.github.com"
 
 
 class ProjectDeletionSummary(BaseModel):
-    """Summary of resources that would be deleted for a project"""
+    """What deleting a project would affect.
+
+    ``removal_targets`` and ``unrecorded_files`` are workflows.project_removal_plan's,
+    read from the database alone. ``removal_blocked_reason`` says why the project
+    cannot be deleted with its files now (workflows.project_removal_blocker).
+    """
     project_name: str
     project_code: str
     workflows: List[Dict[str, Any]]
@@ -35,13 +51,33 @@ class ProjectDeletionSummary(BaseModel):
     secrets: List[Dict[str, Any]]
     environment_variables: List[Dict[str, Any]]
     deployment_environments: List[Dict[str, Any]]
+    removal_targets: List[Dict[str, Any]] = []
+    unrecorded_files: List[Dict[str, Any]] = []
+    removal_blocked_reason: Optional[str] = None
 
 class DeleteProjectRequest(BaseModel):
-    """Request model for project deletion"""
-    github_user: str
+    """Request model for project deletion.
+
+    ``remove_files`` removes the project's files from GitHub by pull request
+    before it goes. ``delete_github_resources`` deletes its secrets, variables
+    and, unless ``delete_deployment_environments`` is False, its deployment
+    environments, directly and at once.
+    """
     project_name: str
+    remove_files: bool = False
     delete_github_resources: bool = False
     delete_deployment_environments: bool = True
+
+
+ALREADY_DELETING = "This project is already being deleted: merge or close its removal pull requests."
+
+
+def _github_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
 
 
 def _tracked_names_for_project(project: Optional[Project], db: Optional[Session], model, name_attr: str) -> Optional[Set[str]]:
@@ -326,144 +362,6 @@ def _process_repository_resources(repo_name: str, headers: Dict[str, str], proje
     return all_secrets, all_variables, environments
 
 
-def _get_tracked_workflow_names(project: Project, db: Session) -> Set[str]:
-    """Return a set of normalized workflow filenames tracked in the DB for a no_prefix project.
-
-    Workflow names may be stored with or without a .yml/.yaml suffix.  Both the
-    '.yml' and '.yaml' variants of each base name are included so that the set
-    matches whatever extension GitHub happens to use in the repository path.
-    """
-    print(f"🔍 Debug: Using database lookup for no_prefix project workflows")
-    tracked: Set[str] = set()
-    # Single join query – avoids N+1 per-row Workflow lookups
-    rows = (
-        db.query(Workflow.workflow_name)
-        .join(ProjectWorkflow, ProjectWorkflow.workflow_id == Workflow.workflow_id)
-        .filter(ProjectWorkflow.project_id == project.project_id)
-        .all()
-    )
-    for (raw_name,) in rows:
-        raw_name = raw_name or ""
-        # Strip any existing suffix to obtain the base name
-        if raw_name.endswith(".yaml"):
-            base_name = raw_name[:-5]
-        elif raw_name.endswith(".yml"):
-            base_name = raw_name[:-4]
-        else:
-            base_name = raw_name
-        # Include both variants so we match regardless of the extension on disk
-        tracked.add(f"{base_name}.yml")
-        tracked.add(f"{base_name}.yaml")
-    print(f"🔍 Debug: Tracked workflow names in database: {tracked}")
-    return tracked
-
-
-def _workflow_belongs_to_project(
-    filename: str,
-    project_prefix: str,
-    project: Optional[Project],
-    tracked_workflow_names: Set[str],
-) -> bool:
-    """Return True if the workflow file belongs to the given project.
-
-    For no_prefix projects the filename is checked against the set of workflow
-    filenames tracked in the database.  For prefix-based projects the filename
-    must start with project_prefix (empty prefix never matches anything).
-    """
-    if project and not project.use_prefix:
-        belongs = filename in tracked_workflow_names
-        print(f"  - Filename in tracked workflows: {belongs}")
-        return belongs
-    if not project_prefix:
-        print(f"  - ⚠️  Warning: Empty project_prefix - skipping workflow")
-        return False
-    belongs = filename.startswith(project_prefix)
-    print(f"  - Filename starts with prefix: {belongs}")
-    return belongs
-
-
-def _delete_workflow_file(
-    repo_name: str,
-    headers: Dict[str, str],
-    filename: str,
-    workflow_path: str,
-    deletion_results: Dict[str, Any],
-) -> None:
-    """Fetch file metadata and delete a single workflow file from GitHub.
-
-    On success a human-readable summary string is appended to
-    deletion_results['github_resources_deleted'].
-    On failure the error message is appended to deletion_results['errors'].
-    """
-    file_url = f"{GITHUB_API_URL}/repos/{repo_name}/contents/{workflow_path}"
-    file_response = requests.get(file_url, headers=headers, timeout=GITHUB_TIMEOUT_SECONDS)
-    if file_response.status_code != 200:
-        error_msg = f"Failed to get workflow file data for {filename} from {repo_name}: HTTP {file_response.status_code}"
-        deletion_results["errors"].append(error_msg)
-        print(f"❌ {error_msg}")
-        return
-    file_data = file_response.json()
-    sha = file_data.get("sha")
-    if not sha:
-        error_msg = f"Missing SHA for workflow file {filename} from {repo_name} – cannot delete"
-        deletion_results["errors"].append(error_msg)
-        print(f"❌ {error_msg}")
-        return
-    delete_response = requests.delete(
-        file_url,
-        headers=headers,
-        json={
-            "message": f"Delete workflow {filename} (ActionsManager project deletion)",
-            "sha": sha,
-        },
-        timeout=GITHUB_TIMEOUT_SECONDS,
-    )
-    if delete_response.status_code == 200:
-        deletion_results["github_resources_deleted"].append(f"Workflow: {filename} from {repo_name}")
-        print(f"✅ Successfully deleted workflow {filename} from {repo_name}")
-    else:
-        error_msg = f"Failed to delete workflow {filename} from {repo_name}: HTTP {delete_response.status_code}"
-        deletion_results["errors"].append(error_msg)
-        print(f"❌ {error_msg}")
-        print(f"   Response: {delete_response.text}")
-
-
-def _delete_project_workflows(repo_name: str, headers: Dict[str, str], project_prefix: str, deletion_results: Dict[str, Any], project: Optional[Project] = None, db: Optional[Session] = None) -> None:
-    """Delete GitHub workflows that match the project prefix or are tracked in database."""
-    workflows_url = f"{GITHUB_API_URL}/repos/{repo_name}/actions/workflows"
-    try:
-        workflows_response = requests.get(workflows_url, headers=headers, timeout=GITHUB_TIMEOUT_SECONDS)
-        if workflows_response.status_code != 200:
-            return
-        workflows_data = workflows_response.json()
-
-        # For no_prefix projects, build the set of tracked workflow filenames once
-        tracked_workflow_names: Set[str] = set()
-        if project and db and not project.use_prefix:
-            tracked_workflow_names = _get_tracked_workflow_names(project, db)
-
-        for workflow in workflows_data.get("workflows", []):
-            workflow_name = workflow["name"]
-            workflow_path = workflow.get("path", "")
-            filename = workflow_path.split("/")[-1] if workflow_path else ""
-
-            print(f"🔍 Debug: Checking workflow for deletion:")
-            print(f"  - Workflow name (from YAML): {workflow_name}")
-            print(f"  - Workflow path: {workflow_path}")
-            print(f"  - Filename: {filename}")
-            print(f"  - Project prefix: {project_prefix}")
-
-            if _workflow_belongs_to_project(filename, project_prefix, project, tracked_workflow_names):
-                print(f"✅ Workflow {filename} identified for deletion from {repo_name}")
-                _delete_workflow_file(repo_name, headers, filename, workflow_path, deletion_results)
-            else:
-                print(f"⚪ Skipping workflow {filename} - does not belong to project")
-    except Exception as e:
-        error_msg = f"Error deleting workflows from {repo_name}: {str(e)}"
-        deletion_results["errors"].append(error_msg)
-        print(f"❌ {error_msg}")
-
-
 def _delete_repository_secrets(repo_name: str, headers: Dict[str, str], project_prefix: str, deletion_results: Dict[str, Any], project: Project = None, db: Session = None) -> None:
     """Delete repository secrets that match the project prefix or are tracked in database."""
     secrets_url = f"{GITHUB_API_URL}/repos/{repo_name}/actions/secrets"
@@ -486,9 +384,8 @@ def _delete_repository_secrets(repo_name: str, headers: Dict[str, str], project_
                 else:
                     deletion_results["errors"].append(f"Failed to delete repository secret {secret['name']} from {repo_name}")
     except Exception as e:
-        error_msg = f"Error deleting repository secrets from {repo_name}: {str(e)}"
-        deletion_results["errors"].append(error_msg)
-        print(f"❌ {error_msg}")
+        print(f"❌ Error deleting repository secrets from {repo_name}: {e}")
+        deletion_results["errors"].append(f"Error deleting repository secrets from {repo_name}: {failure_kind(e)}")
 
 
 def _delete_repository_variables(repo_name: str, headers: Dict[str, str], project_prefix: str, deletion_results: Dict[str, Any], project: Project = None, db: Session = None) -> None:
@@ -513,9 +410,8 @@ def _delete_repository_variables(repo_name: str, headers: Dict[str, str], projec
                 else:
                     deletion_results["errors"].append(f"Failed to delete repository variable {variable['name']} from {repo_name}")
     except Exception as e:
-        error_msg = f"Error deleting repository variables from {repo_name}: {str(e)}"
-        deletion_results["errors"].append(error_msg)
-        print(f"❌ {error_msg}")
+        print(f"❌ Error deleting repository variables from {repo_name}: {e}")
+        deletion_results["errors"].append(f"Error deleting repository variables from {repo_name}: {failure_kind(e)}")
 
 
 def _delete_deployment_environments(repo_name: str, headers: Dict[str, str], deletion_results: Dict[str, Any]) -> None:
@@ -536,9 +432,8 @@ def _delete_deployment_environments(repo_name: str, headers: Dict[str, str], del
                 else:
                     deletion_results["errors"].append(f"Failed to delete deployment environment {env['name']} from {repo_name}")
     except Exception as e:
-        error_msg = f"Error deleting deployment environments from {repo_name}: {str(e)}"
-        deletion_results["errors"].append(error_msg)
-        print(f"❌ {error_msg}")
+        print(f"❌ Error deleting deployment environments from {repo_name}: {e}")
+        deletion_results["errors"].append(f"Error deleting deployment environments from {repo_name}: {failure_kind(e)}")
 
 
 def _delete_environment_secrets(repo_name: str, headers: Dict[str, str], project_prefix: str, deletion_results: Dict[str, Any], project: Project = None, db: Session = None) -> None:
@@ -571,18 +466,17 @@ def _delete_environment_secrets(repo_name: str, headers: Dict[str, str], project
                     else:
                         deletion_results["errors"].append(f"Failed to delete environment secret {secret['name']} from {repo_name}/{env['name']}")
     except Exception as e:
-        error_msg = f"Error deleting environment secrets from {repo_name}: {str(e)}"
-        deletion_results["errors"].append(error_msg)
-        print(f"❌ {error_msg}")
+        print(f"❌ Error deleting environment secrets from {repo_name}: {e}")
+        deletion_results["errors"].append(f"Error deleting environment secrets from {repo_name}: {failure_kind(e)}")
 
 
 def _delete_github_resources_for_repository(repo_name: str, headers: Dict[str, str], project_prefix: str, deletion_results: Dict[str, Any], project: Project = None, db: Session = None, delete_deployment_environments: bool = True) -> None:
-    """Delete all GitHub resources for a single repository."""
+    """Delete the project's secrets, variables and deployment environments in one repository.
+
+    Never its files: those are removed only by pull request (workflows.start_project_removal).
+    """
     try:
         print(f"🔍 Processing repository: {repo_name}")
-
-        # Delete workflows that match project prefix or are tracked in database
-        _delete_project_workflows(repo_name, headers, project_prefix, deletion_results, project, db)
 
         # Delete repository secrets with project prefix or tracked in database
         _delete_repository_secrets(repo_name, headers, project_prefix, deletion_results, project, db)
@@ -598,7 +492,8 @@ def _delete_github_resources_for_repository(repo_name: str, headers: Dict[str, s
         _delete_environment_secrets(repo_name, headers, project_prefix, deletion_results, project, db)
 
     except Exception as e:
-        deletion_results["errors"].append(f"Error deleting GitHub resources from {repo_name}: {str(e)}")
+        print(f"❌ Error deleting GitHub resources from {repo_name}: {e}")
+        deletion_results["errors"].append(f"Error deleting GitHub resources from {repo_name}: {failure_kind(e)}")
 
 
 def _delete_all_github_resources(repo_names: List[str], headers: Dict[str, str], project_code: str, deletion_results: Dict[str, Any], project: Project = None, db: Session = None, delete_deployment_environments: bool = True) -> None:
@@ -623,7 +518,7 @@ def _debug_resource_summary(github_secrets: List[Dict[str, Any]], github_env_var
 
 def _build_deletion_summary(project: Project, workflows: List[Dict[str, Any]], reusable_workflows: List[Dict[str, Any]], 
                            github_secrets: List[Dict[str, Any]], github_env_vars: List[Dict[str, Any]], 
-                           github_environments: List[Dict[str, Any]]) -> ProjectDeletionSummary:
+                           github_environments: List[Dict[str, Any]], removal: Dict[str, Any]) -> ProjectDeletionSummary:
     """Build the final deletion summary response."""
     print(f"🔍 Debug: Final summary:")
     print(f"  - Workflows: {len(workflows)}")
@@ -639,24 +534,25 @@ def _build_deletion_summary(project: Project, workflows: List[Dict[str, Any]], r
         reusable_workflows=reusable_workflows,
         secrets=github_secrets,
         environment_variables=github_env_vars,
-        deployment_environments=github_environments
+        deployment_environments=github_environments,
+        **removal,
     )
 
 
 def _get_project_and_user(project_name: str, github_user: str, db: Session) -> tuple[Account, Project]:
-    """Get and validate user and project from database."""
+    """The caller's account and the project to delete. Deletion is owner-only.
+
+    The page may show another owner's project of this name (#2240). Deleting
+    the caller's own instead would destroy one they are not looking at, so it
+    is the page's project or nothing.
+    """
     user = db.query(Account).filter(Account.github_user == github_user.strip()).first()
     if not user:
         raise HTTPException(status_code=404, detail="GitHub user not found")
 
-    project = db.query(Project).filter(
-        func.lower(Project.project_name) == project_name.strip().lower(),
-        Project.user_id == user.user_id
-    ).first()
-
-    if not project:
+    project = find_project_by_name(db, user, project_name, hint=project_hint())
+    if not project or project.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="Project not found or access denied")
-    
     return user, project
 
 
@@ -719,12 +615,7 @@ def _collect_github_resources_for_deletion_summary(
         print(f"  - repo_names: {repo_names}")
         return github_secrets, github_env_vars, github_environments
 
-    token = user_tokens[github_user]
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
+    headers = _github_headers(user_tokens[github_user])
     project_prefix = f"AM_{project.project_code}_" if project.use_prefix else ""
     print(f"🔍 Debug: Starting GitHub API calls, use_prefix={project.use_prefix}, prefix='{project_prefix}'")
 
@@ -743,18 +634,19 @@ def _collect_github_resources_for_deletion_summary(
     return github_secrets, github_env_vars, github_environments
 
 
-@router.get("/projects/{project_name}/deletion-summary")
+@router.get("/projects/{project_name}/deletion-summary", responses=_responses(401, 403, 404, 500))
 async def get_project_deletion_summary(
     project_name: str,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(description="GitHub username is required")],
+    account: auth_module.CurrentAccount,
 ):
     """
     Get a summary of all resources that would be affected when deleting a project.
-    This includes database records and GitHub resources.
+
+    The files a removal would take off GitHub, and whether it may, come from
+    the database alone. Secrets, variables and environments are read from GitHub.
     """
-    auth_module.assert_session_owns_user(github_user, request, db)
+    github_user = account.github_user
     try:
         # Get user and project from database
         user, project = _get_project_and_user(project_name, github_user, db)
@@ -771,78 +663,110 @@ async def get_project_deletion_summary(
         github_secrets, github_env_vars, github_environments = _collect_github_resources_for_deletion_summary(
             project, github_user, repo_names, db
         )
+        blocker = project_removal_blocker(db, user, project)
+        removal = {**project_removal_plan(db, project),
+                   "removal_blocked_reason": blocker["message"] if blocker else None}
 
-        # Build and return the deletion summary
         return _build_deletion_summary(
             project, workflows, reusable_workflows, 
-            github_secrets, github_env_vars, github_environments
+            github_secrets, github_env_vars, github_environments, removal
         )
 
+    except HTTPException:
+        # The lookup's 404 is the answer, not a server error.
+        raise
     except Exception as e:
         print(f"Error getting project deletion summary: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving project deletion summary: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error retrieving project deletion summary")
 
 
-@router.delete("/projects/{project_name}/enhanced")
+def _require_deletable(db: Session, user: Account, project: Project, remove_files: bool) -> None:
+    """Refuse a deletion that cannot go ahead.
+
+    409 when the project is already being deleted, which its removal pull
+    requests finish or call off, and when its files cannot be removed now
+    (workflows.project_removal_blocker). 403 without editor access.
+    """
+    if project.pr_state == PROJECT_DELETING:
+        raise HTTPException(status_code=409, detail=ALREADY_DELETING)
+    if not has_project_role(db, user, project, "project_editor"):
+        raise HTTPException(status_code=403, detail="Insufficient project permissions. Required: project_editor")
+    blocker = project_removal_blocker(db, user, project) if remove_files else None
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+
+
+def _delete_secrets_and_variables(project: Project, github_user: str, db: Session, deletion_results: Dict[str, Any],
+                                  delete_deployment_environments: bool) -> None:
+    """Delete the project's secrets, variables and deployment environments directly: no pull request can carry them."""
+    token = user_tokens.get(github_user)
+    if not token:
+        return
+    _delete_all_github_resources(_get_project_repositories(project, db), _github_headers(token), project.project_code,
+                                 deletion_results, project, db, delete_deployment_environments)
+
+
+def _delete_or_start_removal(db: Session, project: Project, github_user: str, remove_files: bool,
+                             deletion_results: Dict[str, Any]) -> ProjectDeletionOutcome:
+    """Delete *project* now keeping its files, or start removing them (workflows.start_project_removal)."""
+    if not remove_files:
+        return _deleted_now(db, project, {})
+    try:
+        return start_project_removal(db, project, github_user)
+    except HTTPException as e:
+        # Secrets deleted before the removal failed stay deleted: say which.
+        if e.status_code == 502:
+            e.detail = {**e.detail, "details": deletion_results}
+        raise
+
+
+def _failed(result) -> bool:
+    return isinstance(result, dict) and result.get("status") == "error" and not result.get("nothing_to_deliver")
+
+
+def _deletion_response(outcome: ProjectDeletionOutcome, deletion_results: Dict[str, Any]) -> Dict[str, Any]:
+    failures = [f"{key}: {result.get('error')}" for key, result in outcome.results.items() if _failed(result)]
+    message = ("✅ Project deletion completed" if outcome.project_deleted
+               else "Project is being deleted: it goes once its pull requests have all merged")
+    details = {**deletion_results, "project_deleted": outcome.project_deleted,
+               "errors": deletion_results["errors"] + failures}
+    return {"message": message, **outcome._asdict(), "details": details}
+
+
+@router.delete("/projects/{project_name}/enhanced", responses=_responses(401, 403, 404, 409, 500, 502))
 async def delete_project_enhanced(
     project_name: str,
     request: DeleteProjectRequest,
-    http_request: Request,
-    db: Annotated[Session, Depends(get_db)]
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     """
-    Enhanced project deletion that can optionally delete GitHub resources.
+    Delete a project, keeping its files in GitHub or removing them by pull request.
+
+    Owner-only: the project is looked up among the session caller's own (#2241).
+    With ``remove_files`` the project is Deleting until its removal pull
+    requests merge, unless there was nothing to remove (``project_deleted``).
+    Secrets, variables and environments, when asked for, are deleted first and
+    at once, and stay deleted if the deletion is called off.
     """
-    # github_user selects whose project is deleted, so it has to be the caller.
-    # Checked outside the try: its generic handler would turn the 403 into a 500.
-    auth_module.assert_session_owns_user(request.github_user, http_request, db)
+    github_user = account.github_user
     try:
-        # Get user and project from database
-        user, project = _get_project_and_user(project_name, request.github_user, db)
+        user, project = _get_project_and_user(project_name, github_user, db)
+        _require_deletable(db, user, project, request.remove_files)
+        deletion_results = {"github_resources_deleted": [], "errors": []}
+        if request.delete_github_resources:
+            _delete_secrets_and_variables(project, github_user, db, deletion_results,
+                                          request.delete_deployment_environments)
+        outcome = _delete_or_start_removal(db, project, github_user, request.remove_files, deletion_results)
+        return _deletion_response(outcome, deletion_results)
 
-        deletion_results = {
-            "project_deleted": False,
-            "github_resources_deleted": [],
-            "errors": []
-        }
-
-        # If requested, delete GitHub resources first
-        if request.delete_github_resources and request.github_user in user_tokens:
-            token = user_tokens[request.github_user]
-            headers = {
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28"
-            }
-
-            # Get repositories for this project
-            repo_names = _get_project_repositories(project, db)
-            
-            # Delete GitHub resources across all repositories
-            _delete_all_github_resources(repo_names, headers, project.project_code, deletion_results, project, db, request.delete_deployment_environments)
-
-        # Delete the project from the database (this will cascade to related records)
-        # Cascade covers this now that SQLite foreign keys are enforced
-        # (issue #1811); kept explicit so the cleanup is visible at the call site.
-        db.query(ProjectDisplayOrder).filter(
-            ProjectDisplayOrder.project_id == project.project_id
-        ).delete(synchronize_session=False)
-        db.delete(project)
-        db.commit()
-        deletion_results["project_deleted"] = True
-
-        # Clean up any orphaned workflows that are no longer associated with any projects
-        cleanup_orphaned_workflows(db)
-
-        return {
-            "message": "✅ Project deletion completed",
-            "details": deletion_results
-        }
-
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         print(f"Error in enhanced project deletion: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error deleting project: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error deleting project")
 
     finally:
         db.close()

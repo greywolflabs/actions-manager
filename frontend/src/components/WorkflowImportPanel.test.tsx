@@ -4,7 +4,6 @@
 import React from 'react';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { WorkflowImportPanel } from './WorkflowImportPanel';
-import { deriveWorkflowStatusLabel } from '../utils/workflowImportStatus';
 import { discoverWorkflows, previewWorkflow, importWorkflows } from '../api/workflowImport';
 import { fetchProjects } from '../api/projects';
 
@@ -480,93 +479,6 @@ describe('WorkflowImportPanel', () => {
 
     fireEvent.click(screen.getByTestId('import-modal-close'));
     expect(defaultProps.onClose).toHaveBeenCalled();
-  });
-});
-
-describe('deriveWorkflowStatusLabel', () => {
-  it('returns "Local Draft" for draft project with new workflow', () => {
-    expect(
-      deriveWorkflowStatusLabel({
-        workflowStatus: 'new',
-        workflowGitHash: '0'.repeat(40),
-        projectPrState: 'draft',
-        hasOpenPR: false,
-        hasDrift: false,
-      })
-    ).toBe('Local Draft');
-  });
-
-  it('returns "Imported Locally" when import metadata present', () => {
-    expect(
-      deriveWorkflowStatusLabel({
-        workflowStatus: 'new',
-        workflowGitHash: null,
-        projectPrState: 'draft',
-        hasOpenPR: false,
-        hasDrift: false,
-        hasImportMetadata: true,
-      })
-    ).toBe('Imported Locally');
-  });
-
-  it('returns "Under Review" when open PR exists', () => {
-    expect(
-      deriveWorkflowStatusLabel({
-        workflowStatus: 'under_review',
-        workflowGitHash: null,
-        projectPrState: 'open',
-        hasOpenPR: true,
-        hasDrift: false,
-      })
-    ).toBe('Under Review');
-  });
-
-  it('returns "Synced" when synced with real hash', () => {
-    expect(
-      deriveWorkflowStatusLabel({
-        workflowStatus: 'synced_with_github',
-        workflowGitHash: 'abc123def456789012345678901234567890abcd',
-        projectPrState: 'synced',
-        hasOpenPR: false,
-        hasDrift: false,
-      })
-    ).toBe('Synced');
-  });
-
-  it('returns "Drift Detected" when drift with real hash', () => {
-    expect(
-      deriveWorkflowStatusLabel({
-        workflowStatus: 'synced_with_github',
-        workflowGitHash: 'abc123def456789012345678901234567890abcd',
-        projectPrState: 'synced',
-        hasOpenPR: false,
-        hasDrift: true,
-      })
-    ).toBe('Drift Detected');
-  });
-
-  it('returns "Pending Sync" for workflow without baseline', () => {
-    expect(
-      deriveWorkflowStatusLabel({
-        workflowStatus: 'committed_locally',
-        workflowGitHash: null,
-        projectPrState: 'new',
-        hasOpenPR: false,
-        hasDrift: false,
-      })
-    ).toBe('Pending Sync');
-  });
-
-  it('does NOT return "Drift Detected" when no real hash exists', () => {
-    // Even if hasDrift is somehow true, without a real hash it shouldn't show drift
-    const label = deriveWorkflowStatusLabel({
-      workflowStatus: 'new',
-      workflowGitHash: '0'.repeat(40),
-      projectPrState: 'draft',
-      hasOpenPR: false,
-      hasDrift: true,
-    });
-    expect(label).not.toBe('Drift Detected');
   });
 });
 

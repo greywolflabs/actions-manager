@@ -176,7 +176,7 @@ class TestSelfHostedLicenseTypes:
             
             # Should return enterprise from license, not free from database
             assert result["account_type"] == "enterprise"
-            assert result["installation_mode"] == "self-hosted"
+            assert "installation_mode" not in result
             assert result["github_user"] == "api_test_user"
             assert result["connected_github_account"] == "api_test_user"
             assert result["connected_github_account_type"] == "User"

@@ -29,6 +29,7 @@ let capturedPRModalProps: any = null;
 // The badge/notice inputs, so a save can be asserted to update them in place.
 let capturedPendingDeliveryRepos: string[] | undefined;
 let capturedSidebarPendingCount: number | undefined;
+let capturedOnReposDelivered: ((repos: string[]) => void) | undefined;
 
 vi.mock("react-router", () => ({
   useNavigate: () => mockNavigate,
@@ -73,7 +74,7 @@ vi.mock("./api/pullRequests", () => ({ getProjectPRStatus: vi.fn() }));
 vi.mock("./api/actionsProjects", () => ({ listActionsProjects: vi.fn().mockResolvedValue([]) }));
 vi.mock("./api/actionGroups", () => ({ listActionGroups: vi.fn().mockResolvedValue([]) }));
 vi.mock("./api/codeowners", () => ({
-  getProjectCodeownersStatuses: vi.fn().mockResolvedValue({ statuses: [] }),
+  getProjectCodeowners: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("./components/Sidebar", () => ({
@@ -126,7 +127,8 @@ vi.mock("./components/Secrets", () => ({
 }));
 
 vi.mock("./components/UnifiedWorkflows", () => ({
-  default: function UnifiedWorkflows() {
+  default: function UnifiedWorkflows(props: any) {
+    capturedOnReposDelivered = props.onReposDelivered;
     return <div data-testid="unified-workflows" />;
   },
 }));
@@ -318,6 +320,7 @@ describe("ProjectMgmt – delivery prompt when a repository is added", () => {
     capturedPRModalProps = null;
     capturedPendingDeliveryRepos = undefined;
     capturedSidebarPendingCount = undefined;
+    capturedOnReposDelivered = undefined;
 
     mockUseParams.mockReturnValue({ user: "alice", projectName: "proj-a" });
     (fetchProjects as Mock).mockResolvedValue([
@@ -472,6 +475,25 @@ describe("ProjectMgmt – delivery prompt when a repository is added", () => {
     act(() => capturedPRModalProps.onSuccess([], [], [], [], [NEW_REPO]));
 
     await waitFor(() => expect(capturedPendingDeliveryRepos).toEqual([SAVED_REPO]));
+  });
+
+  test("a commit-and-update push clears the repos it opened a pull request in", async () => {
+    // The push runs as a campaign now, and the server records the PR it opens,
+    // so the repo stops waiting there; the editor has to say so in place.
+    (loadProject as Mock).mockResolvedValue(
+      projectPayload({
+        selected_repos: [SAVED_REPO, NEW_REPO],
+        pending_delivery_repos: [SAVED_REPO, NEW_REPO],
+      }),
+    );
+
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+    await waitFor(() => expect(capturedSidebarPendingCount).toBe(2));
+    await waitFor(() => expect(capturedOnReposDelivered).toBeDefined());
+
+    act(() => capturedOnReposDelivered!([NEW_REPO]));
+
+    await waitFor(() => expect(capturedSidebarPendingCount).toBe(1));
   });
 
   test("saving without adding a repo does not prompt", async () => {

@@ -156,7 +156,8 @@ def validate_uploaded_backup(
     try:
         path = _staging_dir() / f"{token}.tar.gz"
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Could not stage the upload: {exc}") from exc
+        print(f"❌ Could not stage the upload: {exc}")
+        raise HTTPException(status_code=500, detail="Could not stage the upload.") from exc
 
     written = 0
     try:
@@ -175,7 +176,8 @@ def validate_uploaded_backup(
         raise
     except OSError as exc:
         _discard(path)
-        raise HTTPException(status_code=500, detail=f"Could not store the upload: {exc}") from exc
+        print(f"❌ Could not store the upload: {exc}")
+        raise HTTPException(status_code=500, detail="Could not store the upload.") from exc
 
     try:
         report = validate_backup(path, db)

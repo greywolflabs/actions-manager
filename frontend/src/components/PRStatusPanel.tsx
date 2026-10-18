@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { getProjectPRStatus, ProjectPRStatus, mergePullRequest, closePullRequest } from "../api/pullRequests";
+import { getProjectPRStatus, ProjectPRStatus, PRStatus, mergePullRequest, closePullRequest } from "../api/pullRequests";
 import { Button } from "./ui/button";
 import { formatRelativeTime } from "../utils/timeFormat";
 import ConfirmDialog from "./ConfirmDialog";
@@ -10,6 +10,8 @@ interface PRStatusPanelProps {
   onClose: () => void;
   refreshProjectsList?: () => Promise<void>;
   onProjectStateChange?: (state: string) => void;
+  /** A merge finished the project's deletion: its last removal pull request merged. */
+  onProjectDeleted?: () => void;
 }
 
 interface MergeAllResult {
@@ -19,7 +21,7 @@ interface MergeAllResult {
   message: string;
 }
 
-const PRStatusPanel: React.FC<PRStatusPanelProps> = ({ user, projectName, onClose, refreshProjectsList, onProjectStateChange }) => {
+const PRStatusPanel: React.FC<PRStatusPanelProps> = ({ user, projectName, onClose, refreshProjectsList, onProjectStateChange, onProjectDeleted }) => {
   const [prStatus, setPrStatus] = useState<ProjectPRStatus | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -87,6 +89,11 @@ const PRStatusPanel: React.FC<PRStatusPanelProps> = ({ user, projectName, onClos
       setError(null);
       setMergeWarning(null);
       const result = await mergePullRequest(user, projectName, repoName, prNumber);
+      // The project is gone, so there is nothing left here to refresh.
+      if (result?.project_deleted && onProjectDeleted) {
+        onProjectDeleted();
+        return;
+      }
       if (result?.branch_delete_warning) {
         setMergeWarning(
           `PR merged successfully, but ActionsManager could not delete the source branch. You may need to delete it manually in GitHub. (${result.branch_delete_warning})`
@@ -126,6 +133,22 @@ const PRStatusPanel: React.FC<PRStatusPanelProps> = ({ user, projectName, onClos
     setPendingAction({ type: 'mergeAll', count: openPRs.length });
   };
 
+  // Merges *pr* for Merge All, noting the outcome in *results*; true when it
+  // was the last removal pull request of a project being deleted.
+  const mergeOneOfAll = async (pr: PRStatus, results: MergeAllResult[]): Promise<boolean> => {
+    try {
+      const result = await mergePullRequest(user, projectName, pr.repo_name, pr.pr_number);
+      const msg = result?.branch_delete_warning
+        ? `Merged successfully (branch cleanup warning: ${result.branch_delete_warning})`
+        : "Merged successfully";
+      results.push({ prNumber: pr.pr_number, repoName: pr.repo_name, success: true, message: msg });
+      return Boolean(result?.project_deleted);
+    } catch (err: any) {
+      results.push({ prNumber: pr.pr_number, repoName: pr.repo_name, success: false, message: err.message || "Failed to merge" });
+      return false;
+    }
+  };
+
   const doMergeAll = async () => {
     const openPRs = prStatus?.pull_requests.filter((pr) => pr.pr_state === "open" && pr.can_merge !== false) ?? [];
     if (openPRs.length === 0) return;
@@ -140,15 +163,11 @@ const PRStatusPanel: React.FC<PRStatusPanelProps> = ({ user, projectName, onClos
       for (let i = 0; i < openPRs.length; i++) {
         const pr = openPRs[i];
         setMergingAllProgress(`Merging ${i + 1} of ${openPRs.length}...`);
-        try {
-          setProcessingPR(pr.pr_number);
-          const result = await mergePullRequest(user, projectName, pr.repo_name, pr.pr_number);
-          const msg = result?.branch_delete_warning
-            ? `Merged successfully (branch cleanup warning: ${result.branch_delete_warning})`
-            : "Merged successfully";
-          results.push({ prNumber: pr.pr_number, repoName: pr.repo_name, success: true, message: msg });
-        } catch (err: any) {
-          results.push({ prNumber: pr.pr_number, repoName: pr.repo_name, success: false, message: err.message || "Failed to merge" });
+        setProcessingPR(pr.pr_number);
+        if (await mergeOneOfAll(pr, results) && onProjectDeleted) {
+          // The project is gone, so there is nothing left here to refresh.
+          onProjectDeleted();
+          return;
         }
       }
 

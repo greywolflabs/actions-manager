@@ -4,17 +4,59 @@ This test verifies that the cognitive complexity reduction didn't break function
 """
 import pytest
 from unittest.mock import MagicMock, patch
+import deliveries
 from workflows import (
-    detect_workflow_drift, 
+    detect_workflow_drift,
     _validate_user_and_get_project,
     _get_project_workflows,
-    _compare_workflow_content,
+    _check_regular_workflow_in_repo,
     _process_regular_workflows,
     _process_reusable_workflows,
     _handle_deployment_variables,
     _create_drift_status
 )
-from models import Account, Project, Workflow, ProjectWorkflow
+from models import Account, Base, Project, Workflow, ProjectWorkflow
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from tests.delivery_records import record_delivered
+
+
+FILENAME = "AM_TEST_test-workflow.yml"
+
+
+def _workflow_db(yaml="test content", delivered=False, git_hash="def456"):
+    """A workflow, in a database of its own, optionally with the delivery
+    record a merge to test/repo@main writes."""
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    db = sessionmaker(bind=engine, autoflush=False)()
+    account = Account(github_user="drift-refactor", github_email="d@example.com", account_type="free")
+    db.add(account)
+    db.flush()
+    project = Project(project_name="drift-refactor", project_code="TEST", user_id=account.user_id)
+    workflow = Workflow(workflow_name="test-workflow", workflow_yaml=yaml, workflow_git_hash=git_hash)
+    db.add_all([project, workflow])
+    db.flush()
+    db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=workflow.workflow_id))
+    db.commit()
+    if delivered:
+        record_delivered(db, workflow, "test/repo", "main")
+    return db, workflow, project.project_id
+
+
+def _check(github, **workflow):
+    """The drift check of the workflow on test/repo@main, GitHub holding *github* ({content, sha}) or nothing."""
+    db, wf, project_id = _workflow_db(**workflow)
+    shas = {} if github is None else {FILENAME: github["sha"]}
+    try:
+        with patch("workflows.get_workflow_from_github", return_value=github):
+            return _check_regular_workflow_in_repo(
+                db, wf, "test/repo", "test", "repo", FILENAME, shas, "TEST", "token", project_id, "main",
+                deliveries.targets_for(db, project_id),
+            )
+    finally:
+        db.close()
 from fastapi import HTTPException
 
 
@@ -62,7 +104,7 @@ class TestWorkflowDriftRefactor:
         assert token == 'test_token'
         assert project == mock_project
         assert project_code == 'TEST'
-        mock_find_project.assert_called_once_with(mock_db, 'test_user', 'test_project')
+        mock_find_project.assert_called_once_with(mock_db, 'test_user', 'test_project', None)
     
     @patch('workflows.user_tokens', {})
     def test_validate_user_and_get_project_auth_failure(self):
@@ -75,30 +117,37 @@ class TestWorkflowDriftRefactor:
         assert exc_info.value.status_code == 401
         assert "User not authenticated" in str(exc_info.value.detail)
     
-    def test_get_project_workflows(self):
-        """Test workflow retrieval and separation by type."""
+    def _split(self, project_type):
         mock_db = MagicMock()
         mock_project = MagicMock()
         mock_project.project_id = 1
-        
-        # Create mock workflows
+        mock_project.project_type = project_type
+
         regular_workflow = MagicMock()
         regular_workflow.reusable_workflow = False
-        
         reusable_workflow = MagicMock()
         reusable_workflow.reusable_workflow = True
-        
-        mock_workflows = [regular_workflow, reusable_workflow]
-        
-        # Configure query mock
-        mock_db.query.return_value.join.return_value.filter.return_value.all.return_value = mock_workflows
-        
+
+        mock_db.query.return_value.join.return_value.filter.return_value.all.return_value = [
+            regular_workflow, reusable_workflow,
+        ]
         regular, reusable = _get_project_workflows(mock_db, mock_project)
-        
-        assert len(regular) == 1
-        assert len(reusable) == 1
-        assert regular[0] == regular_workflow
-        assert reusable[0] == reusable_workflow
+        return regular, reusable, regular_workflow, reusable_workflow
+
+    def test_get_project_workflows(self):
+        """An RWX project's reusable workflows are checked in its reusable repo."""
+        regular, reusable, regular_workflow, reusable_workflow = self._split("rwx")
+
+        assert regular == [regular_workflow]
+        assert reusable == [reusable_workflow]
+
+    def test_get_project_workflows_checks_owned_reusable_in_the_projects_repos(self):
+        """#2085: a standard project delivers its own reusable workflows to its
+        own repositories, so drift must read them there, not the reusable repo."""
+        regular, reusable, regular_workflow, reusable_workflow = self._split("standard")
+
+        assert regular == [regular_workflow, reusable_workflow]
+        assert reusable == []
     
     def test_handle_deployment_variables_disabled(self):
         """Test deployment variables handling when disabled."""
@@ -113,90 +162,36 @@ class TestWorkflowDriftRefactor:
         assert result[0].has_drift == True
         assert result[0].drift_type == "deployment_vars"
     
-    @patch('workflows.get_workflow_from_github')
-    @patch('workflows.verify_workflow_belongs_to_project')
-    def test_compare_workflow_content_no_drift(self, mock_verify, mock_get_github):
-        """Test content comparison when there's no drift."""
-        # Set up mocks
-        mock_verify.return_value = True
-        github_data = {"content": "test content", "sha": "abc123"}
-        mock_get_github.return_value = github_data
-        
-        # Create mock workflow
-        mock_workflow = MagicMock()
-        mock_workflow.workflow_name = "test-workflow"
-        mock_workflow.workflow_yaml = "test content"
-        mock_workflow.workflow_git_hash = "def456"
-        
-        # Test comparison
-        result = _compare_workflow_content(
-            mock_workflow, github_data, "test/repo", "TEST", "workflow"
-        )
-        
-        assert result is not None
+    def test_matching_content_is_no_drift(self):
+        result = _check({"content": "test content", "sha": "abc123"})
+
         assert result.workflow_name == "test-workflow"
-        assert result.has_drift == False
+        assert result.has_drift is False
         assert "synchronized" in result.message
-    
-    @patch('workflows.get_workflow_from_github')
-    @patch('workflows.verify_workflow_belongs_to_project')
-    def test_compare_workflow_content_with_drift(self, mock_verify, mock_get_github):
-        """Test content comparison when there is drift."""
-        # Set up mocks
-        mock_verify.return_value = True
-        github_data = {"content": "different content", "sha": "abc123"}
-        mock_get_github.return_value = github_data
-        
-        # Create mock workflow
-        mock_workflow = MagicMock()
-        mock_workflow.workflow_name = "test-workflow"
-        mock_workflow.workflow_yaml = "original content"
-        mock_workflow.workflow_git_hash = "def456"
-        
-        # Test comparison
-        result = _compare_workflow_content(
-            mock_workflow, github_data, "test/repo", "TEST", "workflow"
-        )
-        
-        assert result is not None
+
+    def test_different_content_where_it_was_delivered_is_drift(self):
+        result = _check({"content": "different content", "sha": "abc123"}, yaml="original content", delivered=True)
+
         assert result.workflow_name == "test-workflow"
-        assert result.has_drift == True
+        assert result.has_drift is True
         assert "differs" in result.message
-    
-    def test_compare_workflow_content_github_none(self):
-        """Test content comparison when workflow doesn't exist on GitHub."""
-        # Create mock workflow with git hash (previously synced)
-        mock_workflow = MagicMock()
-        mock_workflow.workflow_name = "test-workflow"
-        mock_workflow.workflow_yaml = "test content"
-        mock_workflow.workflow_git_hash = "def456"
-        
-        # Test comparison with None from GitHub
-        result = _compare_workflow_content(
-            mock_workflow, None, "test/repo", "TEST", "workflow"
-        )
-        
-        assert result is not None
+
+    def test_a_missing_file_where_it_was_delivered_is_a_deletion(self):
+        result = _check(None, delivered=True)
+
         assert result.workflow_name == "test-workflow"
-        assert result.has_drift == True
+        assert result.has_drift is True
         assert "deleted" in result.message
-    
-    def test_compare_workflow_content_github_none_no_hash(self):
-        """Test content comparison when workflow was never synced."""
-        # Create mock workflow without git hash (never synced)
-        mock_workflow = MagicMock()
-        mock_workflow.workflow_name = "test-workflow"
-        mock_workflow.workflow_yaml = "test content"
-        mock_workflow.workflow_git_hash = None
-        
-        # Test comparison with None from GitHub
-        result = _compare_workflow_content(
-            mock_workflow, None, "test/repo", "TEST", "workflow"
-        )
-        
-        # Should return None as this is not drift, just not synced yet
-        assert result is None
-    
+
+    def test_a_missing_file_never_delivered_is_reported_as_such(self):
+        """Not drift, just not delivered yet. Reported rather than dropped, so a
+        check can clear what an earlier one recorded there. (No blob SHA: one
+        could be a delivery made before the record existed.)"""
+        result = _check(None, git_hash=None)
+
+        assert result.has_drift is False
+        assert "not delivered" in result.message
+
     @patch('workflows._validate_user_and_get_project')
     @patch('workflows._get_project_workflows')
     @patch('workflows._process_regular_workflows')

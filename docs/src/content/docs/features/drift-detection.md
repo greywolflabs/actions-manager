@@ -43,8 +43,10 @@ delivers the file exactly as stored. When content matches despite a different SH
 committed the same bytes another way), the workflow is in sync and ActionsManager quietly re-records
 GitHub's SHA so the file isn't re-fetched on the next check.
 
-The file compared is the one ActionsManager would deliver: the project's workflow, under the
-filename the project's prefix setting produces. Workflow files in the repository that this project
+The file compared is the one ActionsManager delivered there: the project's workflow, read at the
+path it was delivered to on that repository and branch. A workflow renamed in ActionsManager but not
+yet delivered under its new name is still read at its old path, so a pending rename is never
+reported as a deletion. Workflow files in the repository that this project
 does not manage are never examined, and a file carrying a different project's code is skipped rather
 than reported as drift.
 
@@ -133,7 +135,8 @@ panel explains why:
 A project whose checks keep failing — an expired token, a rate limit, a repository that can no
 longer be read — is retried progressively less often: the wait doubles with each consecutive
 failure, up to 32× that project's own schedule. The first successful check restores the normal
-cadence.
+cadence. A pause is not a failure, so it clears that count: once the owner's credential is back, a
+paused project returns to its normal schedule instead of waiting out a stretched one.
 
 ## What Counts as Drift
 
@@ -143,15 +146,23 @@ pollutes that list.
 
 | Situation | Reported as drift? | What you see instead |
 |---|---|---|
-| The file in GitHub differs from the managed version | **Yes** | Drift detected, with a diff |
-| The managed file is gone from GitHub | **Yes** | Deleted in GitHub |
-| You edited the workflow in ActionsManager and haven't delivered it yet | No | Workflow status **Committed Locally** — pending delivery |
+| The file in GitHub is not the version ActionsManager delivered there | **Yes** | Drift detected, with a diff |
+| The delivered file is gone from GitHub | **Yes** | Deleted in GitHub |
+| You edited the workflow in ActionsManager and haven't delivered it yet, and GitHub still holds what was delivered | No | Workflow status **Committed Locally** — pending delivery |
 | The workflow is in an open ActionsManager pull request that changes it | No | Workflow status **Under Review** |
 | The workflow is missing from the branch, but an open ActionsManager PR would add it | No | Pending merge |
-| The workflow has never been delivered to that repository | No | Nothing — there is no delivered file to compare against |
+| The workflow has never been delivered to that repository or branch, even if a different file is there | No | Not delivered yet — there is no delivered file to compare against |
 | The file differs only in line endings, trailing spaces or its final newline | No | In sync |
 | The repository has a repo-specific override and matches it | No | In sync — compared against the override |
 | GitHub could not be queried | No | "Couldn't check …" in the status row / *Needs attention* on the project badge — never reported as in sync |
+
+A local edit neither creates drift nor hides it: drift compares GitHub with what ActionsManager
+delivered, and your edit is shown by the workflow's status. A file someone changed on GitHub stays
+reported while your edit waits to be delivered. The one edit that resolves drift is one that makes
+the workflow exactly GitHub's copy — whether you **Commit Locally**, restore an earlier version or
+import over it: that drift is resolved at once, and GitHub's copy counts as delivered there. A
+repository with a repo-specific override keeps its drift, because it is compared against the
+override, which the edit does not change.
 
 An open pull request suppresses drift only for the workflows that PR actually carries, in that one
 repository. Everything else in the project is still checked normally. Closing a fix PR without
@@ -185,8 +196,8 @@ recency window — and drift honours that override exactly as delivery does.
 If pattern mode matches nothing (no branch matches, or every match is too old), ActionsManager falls
 back to the repository's default branch rather than checking nothing at all.
 
-Reusable workflow files are the exception: they are compared in the repository that publishes them,
-on **that repository's default branch** — the branch pattern configured for a project applies to the
+Reusable workflow files published by a Reusable Workflow Project are the exception: they are compared in
+the repository that publishes them, on **that repository's default branch** — the branch pattern configured for a project applies to the
 caller workflows it delivers, not to published reusable workflow files.
 
 If ActionsManager cannot determine which branches to check — an expired token, a rate limit, a
@@ -209,6 +220,9 @@ and it does:
   a branch that has just become active is picked up immediately.
 - Full file content is fetched only for workflows whose SHA changed, and GitHub's side of a diff is
   fetched only when you open that diff.
+- CODEOWNERS and each custom file are read one conditional call per branch. A custom file is read
+  only on the branches ActionsManager delivered it to, or has an open pull request carrying it to:
+  anywhere else it is not delivered yet, whatever GitHub holds, so asking would cost for nothing.
 
 In practice a re-check of an untouched project costs roughly one conditional call per repository,
 which is what makes checking every project on a schedule affordable.
@@ -247,7 +261,8 @@ Until you choose one, the workflow keeps being reported as drifted — ActionsMa
 file that no longer exists in the repository.
 
 **Deleted means a file that was really there is gone.** ActionsManager only reports a workflow as
-deleted from a repository and branch where a drift check has actually seen the file. A workflow
+deleted from a repository and branch where it has a record of the file being there: a pull request
+that delivered it merged, a direct commit wrote it, or a drift check saw it. A workflow
 whose pull request is still open has never been on the target branch, so its absence there is
 pending merge — opening a campaign does not put the project into drift. The same holds for a
 repository or branch newly added to an existing project: nothing has been delivered there yet, so
@@ -407,11 +422,11 @@ Drift checks raise notification events, so nobody has to sit watching the dashbo
 
 | Event | Raised when |
 |-------|-------------|
-| `drift.detected` | A workflow went from in sync to drifted |
-| `drift.resolved` | A drifted workflow returned to in sync |
+| `drift.detected` | A workflow, CODEOWNERS or custom file went from in sync to drifted |
+| `drift.resolved` | A drifted file returned to in sync |
 | `drift.check_failed` | A drift check could not complete |
 
-They fire on **transitions only**, per (workflow, repository, branch). A project that stays drifted
+They fire on **transitions only**, per (file, repository, branch). A project that stays drifted
 across many checks notifies once, not on every check; drift appearing on a second branch is its own
 notification rather than a duplicate of the first. A check that could not complete never raises
 `drift.resolved` — an unknown state is not a clean one.
@@ -429,6 +444,9 @@ the **Reusable Workflow Project** — on that repository's default branch. If a 
 workflow is edited or deleted there, it appears in that project's drift list with the same states
 and the same resolution actions as any other workflow.
 
+A reusable workflow that a Caller Workflow Project owns itself is delivered to that project's own
+repositories, so it is checked there, on the same branches as the project's other workflows.
+
 Caller workflows are checked the usual way, in their own project's repositories and branches. A
 caller whose `uses:` reference was hand-edited in GitHub is drift. A caller that is merely *behind*
 because the reusable workflow changed is not drift — the update hasn't been delivered yet, so it is
@@ -438,6 +456,86 @@ those PRs merge, the callers report in sync again.
 Linked projects see each other's open pull requests: if a reusable workflow is carried by an open PR
 against a repository, it is treated as `under_review` in both the reusable-workflow project and the
 caller projects linked to it — not as drift — until that PR is merged or closed.
+
+## CODEOWNERS Drift
+
+A project has one CODEOWNERS file (**Project Files → CODEOWNERS**). Its PR campaigns deliver that
+file to every repository in the campaign, the same way they deliver custom files, so there is no
+separate copy per repository to manage.
+
+Its drift is checked with the project's workflows, by **Check Now** and the automatic checks, on
+every branch the project delivers to, and follows the same rules:
+
+- **Commit Locally neither makes drift nor hides it.** Saving a change marks the file as modified
+  locally — pending sync — and it reads **Draft changes** until a PR campaign delivers it. Drift the
+  last check reported stays reported, unless the saved file is exactly GitHub's copy on that branch:
+  that drift is resolved at once.
+- **Drift means GitHub no longer holds what ActionsManager delivered.** On a branch where the file
+  differs from the project's copy, or was removed after a check had seen it there, CODEOWNERS is
+  reported as drifted.
+- **An open pull request carrying the file is under review**, not drift, until it is merged or closed.
+- **A branch the file never reached is not a deletion.** It reads as not delivered yet.
+- Differences only in line endings or trailing whitespace are not drift.
+
+CODEOWNERS drift appears everywhere workflow drift does:
+
+- the drift banner and the **Review Drift** list;
+- the project's badge on the Projects list;
+- drift notifications;
+- the **CODEOWNERS** row under **Project Files**;
+- the CODEOWNERS editor.
+
+As for a workflow, a change someone makes to the file on GitHub is reported as drift even while a
+local change waits to be delivered. Delivering your change replaces it.
+
+![CODEOWNERS editor showing a "Drift detected" badge next to "Synced", and a banner reading "the CODEOWNERS file on GitHub has changed on acme-corp/payments-service @ main since ActionsManager last delivered it" with a Load GitHub version button](../assets/screenshots/drift-detection/codeowners-drift.png)
+
+The editor's drift banner names each repository and branch that changed. To resolve it:
+
+- **Keep the change made on GitHub.** Choose **Load GitHub version** in the banner (**Load from** a
+  repository and branch, when more than one changed), review it in the editor, and choose
+  **Commit Locally**. The project's file then becomes that version, drift on that branch is resolved
+  at once, and the other repositories receive it with your next PR campaign.
+- **Put the project's version back.** Include **CODEOWNERS** in a
+  [PR campaign](pr-campaigns.html). The campaign offers it ticked when it has changes to deliver,
+  and unticked when it is already synced, so you can still include it to overwrite a change made
+  on GitHub. A CODEOWNERS change on its own is enough to start a campaign.
+
+**Open CODEOWNERS** in the **Review Drift** list takes you to the editor.
+
+A project with no CODEOWNERS file yet can start from one of its repositories' files: choose the
+repository in the editor and **Load from repository**, then **Commit Locally**.
+
+:::note[Projects from before one file per project]
+CODEOWNERS used to be kept per repository. On upgrade, each project keeps its most recently saved
+copy. If its repositories held different copies, the project's file reads **Draft changes** until a
+PR campaign delivers it to all of them.
+:::
+
+## Custom File Drift
+
+A project's custom files (**Project Files → Custom Files**) drift by the same rules as CODEOWNERS:
+a custom file has drifted on a branch when GitHub no longer holds what ActionsManager delivered
+there, changed or deleted. An open pull request carrying it is under review, not drift; a branch
+it never reached is not delivered yet; and a merged pull request that delivered it clears its
+drift on that branch.
+
+Each file is checked where it was delivered, at the path it was delivered at, so moving a file to
+a new path locally is a change waiting to be delivered, not a deletion. The campaign that delivers
+the move removes the copy at the old path on each branch it was delivered to, in the same pull
+request, and so does one delivering a moved CODEOWNERS.
+
+Custom file drift appears in the drift banner, the **Review Drift** list, the project's badge, drift
+notifications, the file's row under **Project Files**, and the file's editor. The editor's banner
+names each repository and branch that changed. To resolve it:
+
+- **Keep the change made on GitHub.** Choose **Load GitHub version** (**Load from** a repository and
+  branch, when more than one changed), review it, and choose **Commit Locally**. Drift on that
+  branch is resolved at once.
+- **Put the project's version back.** Include the file in a [PR campaign](pr-campaigns.html).
+
+Deleting a custom file from the project, or starting the campaign that removes it from GitHub,
+stops its drift counting towards the project.
 
 ## Related Topics
 

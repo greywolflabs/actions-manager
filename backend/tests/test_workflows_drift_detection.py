@@ -17,7 +17,6 @@ from workflows import (
     create_or_update_workflow,
     cleanup_orphaned_workflows,
     count_project_workflows,
-    count_project_reusable_workflows,
     _process_regular_workflows,
     _process_reusable_workflows,
     get_all_workflow_shas,
@@ -25,6 +24,7 @@ from workflows import (
 )
 from models import Base, Account, Project, Workflow, ProjectWorkflow
 from auth import user_tokens
+from tests.delivery_records import record_delivered
 
 # Create in-memory SQLite database for testing
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test_drift_extended.db"
@@ -419,16 +419,6 @@ class TestWorkflowDriftDetectionExtended:
         # Should return 0 since test database isn't accessible by the function
         assert count == 0
 
-    @patch('workflows.user_tokens', {'testuser': 'test_token'})
-    def test_count_project_reusable_workflows_success(self):
-        """Test counting reusable workflows for a project."""
-        # The count_project_reusable_workflows function creates its own session,
-        # so we test it directly without database isolation issues
-        # by testing that it doesn't crash with valid inputs
-        count = count_project_reusable_workflows("testuser", "test_project")
-        # Should return 0 since test database isn't accessible by the function
-        assert count == 0
-
     def test_count_project_workflows_unauthenticated(self):
         """Test counting workflows with unauthenticated user."""
         count = count_project_workflows("unknown_user", "test_project")
@@ -589,9 +579,10 @@ class TestWorkflowDriftDetectionExtended:
                     db, workflows, ["owner/repo"], "TEST", "test_token"
                 )
 
-            # When workflow doesn't exist in GitHub and has no git hash,
-            # _compare_workflow_content returns None, so no drift is reported
-            assert len(results) == 0
+            # Never delivered there, so its absence is not drift. Reported
+            # rather than dropped, so a check can clear what an earlier one stored.
+            assert [(r.has_drift, r.deleted_in_github) for r in results] == [(False, False)]
+            assert "not delivered" in results[0].message
         finally:
             db.close()
 
@@ -611,6 +602,9 @@ class TestWorkflowDriftDetectionExtended:
             db.add(workflow)
             db.commit()
             db.refresh(workflow)
+            # Previously synced: what that delivery recorded.
+            db.add(ProjectWorkflow(project_id=self.project_id, workflow_id=workflow.workflow_id))
+            record_delivered(db, workflow, "owner/repo", "main")
             
             workflows = [workflow]
             
@@ -625,7 +619,7 @@ class TestWorkflowDriftDetectionExtended:
             with patch('workflows.fetch_workflow_tree', return_value=({}, None)), \
                  patch('workflows.get_default_branch', return_value="main"):
                 results = _process_regular_workflows(
-                    db, workflows, ["owner/repo"], "TEST", "test_token"
+                    db, workflows, ["owner/repo"], "TEST", "test_token", project_id=self.project_id,
                 )
 
             # Workflow was synced before but now deleted, should report drift
@@ -858,7 +852,7 @@ class TestBatchSHAComparison:
     @patch('workflows.get_default_branch')
     @patch('workflows.get_workflow_from_github')
     def test_batch_sha_comparison_no_fetch_when_sha_matches(self, mock_get_workflow, mock_get_branch, mock_get_shas):
-        """Test that get_workflow_from_github is NOT called when SHA matches."""
+        """Test that get_workflow_from_github is NOT called when the SHA is the one delivered there."""
         db = TestingSessionLocal()
         try:
             # Create workflow with git hash
@@ -871,19 +865,21 @@ class TestBatchSHAComparison:
             db.add(workflow)
             db.commit()
             db.refresh(workflow)
-            
+            db.add(ProjectWorkflow(project_id=self.project_id, workflow_id=workflow.workflow_id))
+            record_delivered(db, workflow, "owner/repo", "main", sha="abc123")
+
             workflows = [workflow]
-            
+
             # Mock get_default_branch
             mock_get_branch.return_value = "main"
-            
+
             # Mock get_all_workflow_shas to return the same SHA
             mock_get_shas.return_value = ({
-                "AM_TEST_test.yml": "abc123"  # Same SHA as in DB
+                "AM_TEST_test.yml": "abc123"  # Same SHA as delivered
             }, None)
-            
+
             results = _process_regular_workflows(
-                db, workflows, ["owner/repo"], "TEST", "test_token"
+                db, workflows, ["owner/repo"], "TEST", "test_token", project_id=self.project_id,
             )
             
             # Verify get_all_workflow_shas was called once
@@ -969,6 +965,9 @@ class TestBatchSHAComparison:
             db.add(workflow)
             db.commit()
             db.refresh(workflow)
+            # Previously synced: what that delivery recorded.
+            db.add(ProjectWorkflow(project_id=self.project_id, workflow_id=workflow.workflow_id))
+            record_delivered(db, workflow, "owner/repo", "main")
             
             workflows = [workflow]
             
@@ -977,11 +976,11 @@ class TestBatchSHAComparison:
             
             # Mock get_all_workflow_shas to NOT include this workflow
             mock_get_shas.return_value = ({}, None)  # Workflow not in GitHub
-            
+
             # get_workflow_from_github should not be called since SHA is None
-            
+
             results = _process_regular_workflows(
-                db, workflows, ["owner/repo"], "TEST", "test_token"
+                db, workflows, ["owner/repo"], "TEST", "test_token", project_id=self.project_id,
             )
             
             # Verify result shows drift (workflow was deleted)
@@ -1021,9 +1020,10 @@ class TestBatchSHAComparison:
             results = _process_regular_workflows(
                 db, workflows, ["owner/repo"], "TEST", "test_token"
             )
-            
+
             # Verify no drift reported (workflow was never synced, not deleted)
-            assert len(results) == 0
+            assert [(r.has_drift, r.deleted_in_github) for r in results] == [(False, False)]
+            assert "not delivered" in results[0].message
             
         finally:
             db.close()
@@ -1032,10 +1032,10 @@ class TestBatchSHAComparison:
     @patch('workflows.fetch_workflow_tree')
     @patch('workflows.get_default_branch')
     def test_reusable_workflows_batch_sha_comparison(self, mock_get_branch, mock_get_shas):
-        """Test batch SHA comparison for reusable workflows."""
+        """Test batch SHA comparison for reusable workflows: the delivered SHA reads nothing more."""
         db = TestingSessionLocal()
         try:
-            # Create reusable workflow with matching SHA
+            # Create reusable workflow, delivered as the SHA GitHub lists
             workflow = Workflow(
                 workflow_name="reusable",
                 workflow_yaml="name: Reusable\non: workflow_call",
@@ -1045,6 +1045,8 @@ class TestBatchSHAComparison:
             db.add(workflow)
             db.commit()
             db.refresh(workflow)
+            db.add(ProjectWorkflow(project_id=self.project_id, workflow_id=workflow.workflow_id))
+            record_delivered(db, workflow, "testuser/am-reuseable-workflow", "main", sha="xyz789")
             
             workflows = [workflow]
             
@@ -1056,12 +1058,14 @@ class TestBatchSHAComparison:
                 "AM_TEST_reusable.yml": "xyz789"
             }, None)
             
-            results = _process_reusable_workflows(
-                db, workflows, "testuser", "TEST", "test_token"
-            )
-            
-            # Verify get_all_workflow_shas was called once
+            with patch('workflows.get_workflow_from_github') as mock_get_workflow:
+                results = _process_reusable_workflows(
+                    db, workflows, "testuser", "TEST", "test_token", project_id=self.project_id,
+                )
+
+            # Verify get_all_workflow_shas was called once, and the content never
             assert mock_get_shas.call_count == 1
+            assert mock_get_workflow.call_count == 0
             
             # Verify no drift
             assert len(results) == 1

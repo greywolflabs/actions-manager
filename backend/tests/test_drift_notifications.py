@@ -6,6 +6,7 @@ pairs and assert which events fire, plus the dedup-key behavior the
 acceptance criteria hinge on (repeated unchanged scans don't re-emit).
 """
 
+import json
 import sys
 import os
 
@@ -16,9 +17,18 @@ from sqlalchemy.pool import StaticPool
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from models import Base, Account, Project, Workflow, Repo, NotificationEvent, WorkflowDriftState
-from workflows import WorkflowDriftDetail
-from drift_notifications import record_drift_transitions, record_drift_check_failed
+import deliveries  # noqa: E402
+from models import Base, Account, Codeowners, FileDelivery, Project, ProjectWorkflow, Workflow, Repo, NotificationEvent  # noqa: E402
+from workflows import CodeownersDriftDetail, WorkflowDriftDetail  # noqa: E402
+from drift_notifications import DriftObservation, _content_hash, record_drift_check_failed  # noqa: E402
+from drift_notifications import record_drift_transitions as _record_observations  # noqa: E402
+
+
+def record_drift_transitions(db, project, details):
+    """Record workflow details, as run_project_drift_check observes them."""
+    _record_observations(db, project, [
+        DriftObservation(deliveries.WORKFLOW, d.workflow_id, d.workflow_name, d) for d in details
+    ])
 
 
 @pytest.fixture()
@@ -52,6 +62,8 @@ def _setup_project(db):
     db.add(workflow)
     db.commit()
     db.refresh(workflow)
+    db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=workflow.workflow_id))
+    db.commit()
 
     repo = Repo(repo_name="acme/widgets")
     db.add(repo)
@@ -89,7 +101,7 @@ class TestRecordDriftTransitions:
         assert len(events) == 1
         assert events[0].event_type == "drift.detected"
 
-        state = db_session.query(WorkflowDriftState).one()
+        state = db_session.query(FileDelivery).one()
         assert state.has_drift is True
 
     def test_first_scan_without_drift_emits_nothing(self, db_session):
@@ -99,8 +111,8 @@ class TestRecordDriftTransitions:
         record_drift_transitions(db_session, project, [detail])
 
         assert db_session.query(NotificationEvent).count() == 0
-        state = db_session.query(WorkflowDriftState).one()
-        assert state.has_drift is False
+        # Clean where nothing is recorded: nothing to keep, so no row either.
+        assert db_session.query(FileDelivery).count() == 0
 
     def test_repeated_unchanged_drift_does_not_reemit(self, db_session):
         project, workflow, repo = _setup_project(db_session)
@@ -145,7 +157,47 @@ class TestRecordDriftTransitions:
         record_drift_transitions(db_session, project, [detail])
 
         assert db_session.query(NotificationEvent).count() == 0
-        assert db_session.query(WorkflowDriftState).count() == 0
+        assert db_session.query(FileDelivery).count() == 0
+
+    def test_the_dedup_keys_and_payloads_keep_their_shape(self, db_session):
+        project, workflow, repo = _setup_project(db_session)
+        drifted = _detail(workflow, repo, project, has_drift=True)
+        resolved = _detail(workflow, repo, project, has_drift=False)
+
+        record_drift_transitions(db_session, project, [drifted])
+        record_drift_transitions(db_session, project, [resolved])
+
+        detected, cleared = db_session.query(NotificationEvent).order_by(NotificationEvent.event_id).all()
+        place = f"{project.project_id}:{repo.repo_id}:{workflow.workflow_id}:main"
+        assert detected.dedup_key == f"drift.detected:{place}:{_content_hash(drifted)}:1"
+        assert cleared.dedup_key == f"drift.resolved:{place}:{_content_hash(resolved)}:1"
+        assert json.loads(detected.payload) == {
+            "project_name": "drift_project", "repo": "acme/widgets", "branch": "main",
+            "workflow_name": "ci.yml", "message": "content differs",
+        }
+        assert json.loads(cleared.payload) == {
+            "project_name": "drift_project", "repo": "acme/widgets", "branch": "main", "workflow_name": "ci.yml",
+        }
+
+    def test_codeowners_is_recorded_and_named_as_codeowners(self, db_session):
+        project, _, repo = _setup_project(db_session)
+        record = Codeowners(project_id=project.project_id, content="* @a")
+        db_session.add(record)
+        db_session.commit()
+        detail = CodeownersDriftDetail(file_path=".github/CODEOWNERS", repo=repo.repo_name, repo_id=repo.repo_id,
+                                       branch="main", has_drift=True, github_sha="sha-a",
+                                       last_checked="2026-01-01T00:00:00Z", message="content differs")
+
+        _record_observations(db_session, project, [
+            DriftObservation(deliveries.CODEOWNERS, record.id, "CODEOWNERS", detail, etag='W/"e"'),
+        ])
+
+        event = db_session.query(NotificationEvent).one()
+        assert event.dedup_key == (f"drift.detected:{project.project_id}:{repo.repo_id}:codeowners:main:"
+                                   f"{_content_hash(detail)}:1")
+        assert json.loads(event.payload)["workflow_name"] == "CODEOWNERS"
+        row = db_session.query(FileDelivery).one()
+        assert (row.codeowners_id, row.has_drift, row.etag) == (record.id, True, 'W/"e"')
 
 
 class TestRecordDriftCheckFailed:

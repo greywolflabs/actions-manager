@@ -3,8 +3,8 @@ import apiClient from "./apiClient";
 import config from "../config";
 import { Workflow } from "../types/workflow";
 import { WorkflowUpdateResponse } from "../types/workflowResponse";
+import type { WorkflowKindChange } from "../utils/workflowKindChanges";
 import type { RemovalDelivery } from "../components/RemovalScopeDialog";
-import { toast } from "../utils/toast";
 
 const BACKEND_URL = config.BACKEND_URL;
 
@@ -16,10 +16,14 @@ interface SaveWorkflowsResponse {
   project_code?: string;
   pr_state?: string;
   state_changed?: boolean;
+  /** Workflows this save gave the other kind, by their trigger (#2318). */
+  kind_changes?: WorkflowKindChange[];
 }
 
-interface UpdateWorkflowsResponse extends WorkflowUpdateResponse {
+export interface UpdateWorkflowsResponse extends WorkflowUpdateResponse {
   status?: number;
+  /** Requested repositories outside the project, which got nothing (#2316). */
+  skipped_repos?: string[];
 }
 
 interface DeleteWorkflowResponse {
@@ -88,14 +92,7 @@ export const getRenameImpact = async (
   const response: AxiosResponse<RenameImpact> = await apiClient.post(
     `${BACKEND_URL}/api/workflows/rename-impact`,
     {
-      // Belt and braces only. The server's own middleware strips any client
-      // X-GitHub-User and re-pins it to the session user before the route runs,
-      // and the route prefers that header over this field — so this never
-      // decides identity in a configured instance. (An earlier comment here
-      // claimed apiClient sets no header and the route 401s without this; the
-      // first half is true of apiClient, the second is not, since the header
-      // arrives from the middleware. saveWorkflows posts to a route with the
-      // identical pattern and sends nothing.)
+      // Ignored: the route takes the caller from the session (#2241).
       github_user: user,
       project_name: projectName,
       workflow_name: workflowName,
@@ -141,30 +138,33 @@ export const saveWorkflows = async (
 };
 
 // Run workflow for selected repositories
+/** The saved project files a push delivers to the project's pull requests. */
+export interface PushedFiles {
+  workflows?: Workflow[];
+  rxworkflows?: Workflow[];
+  customFileIds?: number[];
+  includeCodeowners?: boolean;
+}
+
 export const updateWorkflows = async (
-  user: string,
+  projectName: string,
   selectedRepos: string[],
-  workflows: Workflow[],
-  rxworkflows: Workflow[],
-  regexPattern: string,
-  branchOption: string,
-  projectName: string
+  files: PushedFiles
 ): Promise<UpdateWorkflowsResponse> => {
   try {
     const requestBody = {
-      user,
-      repo_names: selectedRepos,
-      workflows,
-      rxworkflows,
-      regex_pattern: regexPattern,
-      branch_option: branchOption,
       project_name: projectName,
+      repo_names: selectedRepos,
+      workflows: files.workflows ?? [],
+      rxworkflows: files.rxworkflows ?? [],
+      custom_file_ids: files.customFileIds ?? [],
+      include_codeowners: files.includeCodeowners ?? false,
     };
 
     console.log("📌 Debug: Sending Workflow Update Request:", requestBody);
 
     const response: AxiosResponse<UpdateWorkflowsResponse> = await apiClient.post(
-      `${BACKEND_URL}/api/update-workflow`,
+      `${BACKEND_URL}/api/update-project-files`,
       requestBody
     );
 
@@ -296,46 +296,6 @@ export const deleteReusableWorkflowFromGitHub = async (
   } catch (error) {
     console.error("❌ Error deleting reusable workflow from GitHub:", error);
     throw error;
-  }
-};
-
-// Legacy function for backward compatibility - delete from both GitHub and database
-export const handleDeleteWorkflow = async (
-  user: string,
-  workflows: Workflow[],
-  selectedRepos: string[],
-  projectName: string,
-  setWorkflows: (workflows: Workflow[]) => void,
-  index: number,
-  regexPattern: string = ""
-): Promise<void> => {
-  const workflowToDelete = workflows[index];
-
-  if (!workflowToDelete?.name?.trim()) {
-    console.log("🛑 Skipping delete for empty workflow entry.");
-    setWorkflows(workflows.filter((_, i) => i !== index));
-    return;
-  }
-
-  try {
-    // Delete from GitHub first
-    await deleteWorkflowFromGitHub(
-      user,
-      selectedRepos,
-      workflowToDelete.name,
-      regexPattern,
-      projectName,
-      "direct"
-    );
-
-    // Then delete from database
-    await deleteWorkflowFromDatabase(user, projectName, workflowToDelete.name);
-
-    console.log(`✅ Successfully deleted workflow: ${workflowToDelete.name}`);
-    setWorkflows(workflows.filter((_, i) => i !== index));
-  } catch (error) {
-    console.error("❌ Error deleting workflow:", error);
-    toast.error("Error deleting workflow. Check console for details.");
   }
 };
 

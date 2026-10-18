@@ -59,6 +59,16 @@ describe("envVars API", () => {
       const result = await updateEnvVars("user", ["org/repo"], [], "proj");
       expect(result).toEqual({ error: "timeout" });
     });
+
+    it("returns the server's reason rather than the status code", async () => {
+      mockedApiClient.post.mockRejectedValueOnce({
+        message: "Request failed with status code 400",
+        response: { status: 400, data: { detail: "Repository 'org/new' is not part of project 'P' yet: save the project first" } },
+      });
+
+      const result = await updateEnvVars("user", ["org/new"], [{ key: "K", value: "v" }], "P");
+      expect(result).toEqual({ error: "Repository 'org/new' is not part of project 'P' yet: save the project first" });
+    });
   });
 
   describe("getEnvVars", () => {
@@ -92,13 +102,22 @@ describe("envVars API", () => {
   });
 
   describe("handleDeleteEnvVars", () => {
-    it("calls toast.error and skips API call when user is missing", async () => {
-      const { toast } = await import("../utils/toast");
+    it("rejects and skips the API call when user is missing", async () => {
+      await expect(
+        handleDeleteEnvVars("", "proj", ["repo"], [{ env_key: "KEY" }]),
+      ).rejects.toThrow(/Missing required fields/);
 
-      await handleDeleteEnvVars("", "proj", ["repo"], [{ env_key: "KEY" }]);
-
-      expect(toast.error).toHaveBeenCalled();
       expect(mockedApiClient.delete).not.toHaveBeenCalled();
+    });
+
+    it("rejects with the server's reason, so the panel does not report a delete that failed", async () => {
+      mockedApiClient.delete.mockRejectedValueOnce({
+        response: { status: 400, data: { detail: "Repository 'org/new' is not part of project 'P' yet: save the project first" } },
+      });
+
+      await expect(
+        handleDeleteEnvVars("testuser", "P", ["org/repo1", "org/new"], [{ env_key: "PORT" }]),
+      ).rejects.toThrow("Repository 'org/new' is not part of project 'P' yet: save the project first");
     });
 
     it("deletes env vars via apiClient", async () => {
@@ -134,6 +153,17 @@ describe("envVars API", () => {
       mockedApiClient.post.mockRejectedValueOnce(new Error("failed"));
 
       await expect(syncEnvVar("user", "proj", ["repo"], "KEY")).rejects.toThrow("failed");
+    });
+
+    it("throws the server's reason rather than the status code", async () => {
+      mockedApiClient.post.mockRejectedValueOnce({
+        message: "Request failed with status code 400",
+        response: { status: 400, data: { detail: "Invalid variable name 'K?x': use letters, digits and underscores" } },
+      });
+
+      await expect(syncEnvVar("user", "proj", ["org/repo"], "K?x")).rejects.toThrow(
+        "Invalid variable name 'K?x': use letters, digits and underscores",
+      );
     });
   });
 

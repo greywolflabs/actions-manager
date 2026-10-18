@@ -99,6 +99,10 @@ The UI never shows the raw token after you save it. It only shows masked states 
 - **Configured**
 - **Invalid or expired**
 - **Missing required permissions**
+- **No repository access**
+- **Blocked by organization policy**
+- **Not verified** (the permission check could not be completed; it runs again when you sign in or reopen ActionsManager)
+- **Saved but unreadable** (the token can no longer be decrypted, usually because `SECRET_KEY` changed; save it again)
 
 ## Credential Resolution Order
 

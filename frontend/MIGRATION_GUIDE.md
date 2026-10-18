@@ -346,7 +346,7 @@ Use Tailwind's responsive prefixes:
 **Tailwind Version:**
 ```jsx
 <input 
-  className="w-full p-md border border-input-border rounded-md bg-input-bg text-text-primary transition-all duration-200 focus:outline-none focus:border-input-focus focus:ring-2 focus:ring-primary/10"
+  className="w-full p-3 border border-input-border rounded-md bg-input-bg text-text-primary transition-all duration-200 focus:outline-hidden focus:border-input-focus focus:ring-2 focus:ring-primary/10"
   type="text"
 />
 ```
@@ -359,7 +359,7 @@ Use Tailwind's responsive prefixes:
 1. Is the class name spelled correctly?
 2. Is Tailwind CSS properly imported in index.tsx?
 3. Are there conflicting styles from CSS modules?
-4. Is the component file path included in tailwind.config.js content array?
+4. Is the component under `src/`? (Tailwind v4 scans the source automatically.)
 
 **Solution:**
 ```bash
@@ -373,7 +373,7 @@ CI=false npm run build
 **Check:**
 1. Is `.dark-theme` class on body element?
 2. Are you using the dark mode prefix correctly?
-3. Is darkMode configured correctly in tailwind.config.js?
+3. Is the `dark` variant still bound to `.dark-theme` (`@custom-variant dark` in `src/index.css`)?
 
 **Solution:**
 ```jsx
@@ -387,7 +387,7 @@ console.log(document.body.className); // Should include 'dark-theme' when dark
 ### Issue: Custom colors not available
 
 **Check:**
-1. Are colors defined in tailwind.config.js theme.extend.colors?
+1. Are colors defined in the `@theme` block of `src/index.css`?
 2. Is color name correctly referenced?
 
 **Solution:**
@@ -451,7 +451,7 @@ After migrating a component:
 
 - [Tailwind CSS Documentation](https://tailwindcss.com/docs)
 - [Tailwind CSS Cheat Sheet](https://nerdcave.com/tailwind-cheat-sheet)
-- Project-specific config: `frontend/tailwind.config.js`
+- Project-specific config: the `@theme` block in `frontend/src/index.css`
 - Theme reference: `frontend/TAILWIND_SETUP.md`
 
 ---

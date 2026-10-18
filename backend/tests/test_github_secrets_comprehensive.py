@@ -20,6 +20,8 @@ from sqlalchemy.orm import Session
 # Add the backend directory to the Python path
 sys.path.insert(0, os.path.dirname(__file__))
 
+from types import SimpleNamespace
+
 from github_secrets import (
     router,
     count_project_secrets,
@@ -28,19 +30,27 @@ from github_secrets import (
     _process_repository_secrets
 )
 
+# The routes take the caller from the session (#2241); called directly, they
+# are handed the account auth.current_account would have resolved.
+CALLER = SimpleNamespace(github_user="testuser")
+
 
 class TestSecretsCRUD:
     """Test secrets CRUD operations"""
     
     @pytest.mark.asyncio
     @patch('github_secrets.user_tokens', {'testuser': 'fake_token'})
-    async def test_create_secrets_success(self):
+    @patch('github_secrets.require_project_write_access')
+    @patch('github_secrets._find_project_by_name')
+    async def test_create_secrets_success(self, mock_find, mock_write):
         """Test successful secret creation"""
         # Mock database
         mock_db = MagicMock()
         
         mock_project = Mock()
         mock_project.project_code = "TEST"
+        mock_write.return_value = mock_project
+        mock_find.return_value = mock_project
         mock_account = Mock()
         mock_account.account_type = "pro"
         
@@ -83,20 +93,21 @@ class TestSecretsCRUD:
             mock_client.return_value.__aenter__.return_value.put = mock_put
             
             from github_secrets import create_secrets
-            result = await create_secrets(mock_request, mock_db)
+            result = await create_secrets(mock_request, mock_db, CALLER)
             
             assert "message" in result
             assert "results" in result
     
     @pytest.mark.asyncio
     @patch('github_secrets.user_tokens', {'testuser': 'fake_token'})
-    async def test_get_secrets_success(self):
+    @patch('github_secrets._find_project_by_name')
+    async def test_get_secrets_success(self, mock_find):
         """Test successful retrieval of secrets"""
         # Mock database
         mock_db = MagicMock()
         mock_project = Mock()
         mock_project.project_code = "TEST"
-        mock_db.query.return_value.filter.return_value.first.return_value = mock_project
+        mock_find.return_value = mock_project
         
         with patch('github_secrets.httpx.AsyncClient') as mock_client:
             mock_response = Mock()
@@ -113,19 +124,21 @@ class TestSecretsCRUD:
             mock_client.return_value.__aenter__.return_value.get = mock_get
             
             from github_secrets import get_secrets
-            result = await get_secrets("testuser", "test/repo1", "TestProject", mock_db)
+            result = await get_secrets("test/repo1", "TestProject", mock_db, CALLER)
             
             assert "secrets" in result
             assert len(result["secrets"]) == 2  # Only AM_TEST_* secrets
     
     @pytest.mark.asyncio
     @patch('github_secrets.user_tokens', {'testuser': 'fake_token'})
-    async def test_delete_secrets_success(self):
+    @patch('github_secrets.require_project_write_access')
+    async def test_delete_secrets_success(self, mock_write):
         """Test successful deletion of secrets"""
         # Mock database
         mock_db = MagicMock()
         mock_project = Mock()
         mock_project.project_code = "TEST"
+        mock_write.return_value = mock_project
         mock_db.query.return_value.filter.return_value.first.return_value = mock_project
         
         # Mock request
@@ -145,7 +158,7 @@ class TestSecretsCRUD:
             mock_client.return_value.__aenter__.return_value.delete = mock_delete
             
             from github_secrets import delete_secrets
-            result = await delete_secrets(mock_request, mock_db)
+            result = await delete_secrets(mock_request, mock_db, CALLER)
             
             assert "message" in result
             assert "deleted" in result["message"]
@@ -221,13 +234,17 @@ class TestBatchOperations:
     
     @pytest.mark.asyncio
     @patch('github_secrets.user_tokens', {'testuser': 'fake_token'})
-    async def test_create_multiple_secrets_multiple_repos(self):
+    @patch('github_secrets.require_project_write_access')
+    @patch('github_secrets._find_project_by_name')
+    async def test_create_multiple_secrets_multiple_repos(self, mock_find, mock_write):
         """Test creating multiple secrets across multiple repositories"""
         # Mock database
         mock_db = MagicMock()
         
         mock_project = Mock()
         mock_project.project_code = "TEST"
+        mock_write.return_value = mock_project
+        mock_find.return_value = mock_project
         mock_account = Mock()
         mock_account.account_type = "pro"
         
@@ -273,7 +290,7 @@ class TestBatchOperations:
             mock_client.return_value.__aenter__.return_value.put = mock_put
             
             from github_secrets import create_secrets
-            result = await create_secrets(mock_request, mock_db)
+            result = await create_secrets(mock_request, mock_db, CALLER)
             
             assert "results" in result
             # Should have results for 2 repos
@@ -325,20 +342,21 @@ class TestErrorHandling:
         mock_db = MagicMock()
         
         from github_secrets import create_secrets
-        result = await create_secrets(mock_request, mock_db)
+        result = await create_secrets(mock_request, mock_db, SimpleNamespace(github_user="nonexistent_user"))
         
         assert "error" in result
         assert result["status"] == 401
     
     @pytest.mark.asyncio
     @patch('github_secrets.user_tokens', {'testuser': 'fake_token'})
-    async def test_get_secrets_project_not_found(self):
+    @patch('github_secrets._find_project_by_name')
+    async def test_get_secrets_project_not_found(self, mock_find):
         """Test get secrets fails with invalid project"""
         mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_find.return_value = None
         
         from github_secrets import get_secrets
-        result = await get_secrets("testuser", "test/repo1", "NonexistentProject", mock_db)
+        result = await get_secrets("test/repo1", "NonexistentProject", mock_db, CALLER)
         
         assert "error" in result
         assert result["status"] == 404
@@ -360,7 +378,7 @@ class TestErrorHandling:
             mock_client.return_value.__aenter__.return_value.get = mock_get
             
             from github_secrets import get_secrets
-            result = await get_secrets("testuser", "test/repo1", "TestProject", mock_db)
+            result = await get_secrets("test/repo1", "TestProject", mock_db, CALLER)
             
             assert "error" in result
     
@@ -436,12 +454,13 @@ class TestSecretValidation:
     
     @pytest.mark.asyncio
     @patch('github_secrets.user_tokens', {'testuser': 'fake_token'})
-    async def test_get_secrets_filters_by_project_code(self):
+    @patch('github_secrets._find_project_by_name')
+    async def test_get_secrets_filters_by_project_code(self, mock_find):
         """Test that get secrets only returns secrets for the specific project"""
         mock_db = MagicMock()
         mock_project = Mock()
         mock_project.project_code = "TEST"
-        mock_db.query.return_value.filter.return_value.first.return_value = mock_project
+        mock_find.return_value = mock_project
         
         with patch('github_secrets.httpx.AsyncClient') as mock_client:
             mock_response = Mock()
@@ -459,7 +478,7 @@ class TestSecretValidation:
             mock_client.return_value.__aenter__.return_value.get = mock_get
             
             from github_secrets import get_secrets
-            result = await get_secrets("testuser", "test/repo1", "TestProject", mock_db)
+            result = await get_secrets("test/repo1", "TestProject", mock_db, CALLER)
             
             assert "secrets" in result
             assert len(result["secrets"]) == 2
@@ -470,11 +489,13 @@ class TestSecretValidation:
     
     @pytest.mark.asyncio
     @patch('github_secrets.user_tokens', {'testuser': 'fake_token'})
-    async def test_delete_secrets_with_prefix(self):
+    @patch('github_secrets.require_project_write_access')
+    async def test_delete_secrets_with_prefix(self, mock_write):
         """Test deleting secret that already has prefix"""
         mock_db = MagicMock()
         mock_project = Mock()
         mock_project.project_code = "TEST"
+        mock_write.return_value = mock_project
         mock_db.query.return_value.filter.return_value.first.return_value = mock_project
         
         mock_request = AsyncMock()
@@ -493,7 +514,7 @@ class TestSecretValidation:
             mock_client.return_value.__aenter__.return_value.delete = mock_delete
             
             from github_secrets import delete_secrets
-            result = await delete_secrets(mock_request, mock_db)
+            await delete_secrets(mock_request, mock_db, CALLER)
             
             # Should use the provided name as-is
             mock_delete.assert_called()
@@ -502,11 +523,13 @@ class TestSecretValidation:
     
     @pytest.mark.asyncio
     @patch('github_secrets.user_tokens', {'testuser': 'fake_token'})
-    async def test_delete_secrets_without_prefix(self):
+    @patch('github_secrets.require_project_write_access')
+    async def test_delete_secrets_without_prefix(self, mock_write):
         """Test deleting secret without prefix"""
         mock_db = MagicMock()
         mock_project = Mock()
         mock_project.project_code = "TEST"
+        mock_write.return_value = mock_project
         mock_db.query.return_value.filter.return_value.first.return_value = mock_project
         
         mock_request = AsyncMock()
@@ -525,40 +548,12 @@ class TestSecretValidation:
             mock_client.return_value.__aenter__.return_value.delete = mock_delete
             
             from github_secrets import delete_secrets
-            result = await delete_secrets(mock_request, mock_db)
+            await delete_secrets(mock_request, mock_db, CALLER)
             
             # Should add prefix
             mock_delete.assert_called()
             call_args = mock_delete.call_args
             assert "AM_TEST_SECRET1" in call_args[0][0]
-
-
-class TestSyncOperations:
-    """Test sync operations for secrets"""
-    
-    @pytest.mark.asyncio
-    @patch('github_secrets.user_tokens', {'testuser': 'fake_token'})
-    async def test_sync_secret_not_supported(self):
-        """Test that sync_secret returns appropriate error"""
-        mock_db = MagicMock()
-        mock_project = Mock()
-        mock_project.project_code = "TEST"
-        mock_db.query.return_value.filter.return_value.first.return_value = mock_project
-        
-        mock_request = AsyncMock()
-        mock_request.json = AsyncMock(return_value={
-            "user": "testuser",
-            "project_name": "TestProject",
-            "secret_key": "SECRET1"
-        })
-        
-        from github_secrets import sync_secret
-        result = await sync_secret(mock_request, mock_db)
-        
-        # Should return error because GitHub API doesn't allow reading secret values
-        assert "error" in result
-        assert result["status"] == 400
-        assert "Cannot sync secrets" in result["error"]
 
 
 class TestCountingFunctions:
@@ -635,10 +630,11 @@ class TestCountingFunctions:
         mock_project.project_code = "TEST"
         mock_db.query.return_value.filter.return_value.first.return_value = mock_project
         
-        with patch('github_secrets.count_project_secrets', return_value=5):
+        with patch('github_secrets.count_project_secrets', return_value=5), \
+                patch('github_secrets._find_project_by_name', return_value=mock_project):
             from github_secrets import get_secrets_count
             result = await get_secrets_count(
-                "testuser", "TestProject", "test/repo1,test/repo2", mock_db
+                "TestProject", "test/repo1,test/repo2", mock_db, CALLER
             )
             
             assert "count" in result

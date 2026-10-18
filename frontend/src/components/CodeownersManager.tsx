@@ -1,47 +1,36 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import PlainFileEditor from './PlainFileEditor';
 import WorkflowStatusBadge from './WorkflowStatusBadge';
-import {
-  getCodeowners,
-  saveCodeownersDraft,
-  getCodeownersDrift,
-  CodeownersGetResponse,
-  CodeownersDriftResponse,
-} from '../api/codeowners';
+import { UnlockOverlay, UnlockUnderReviewDialog } from './UnlockUnderReview';
+import { updateWorkflows } from '../api/workflows';
+import { assertPushed } from '../utils/workflowOperations';
+import { getCodeowners, saveProjectCodeowners, CodeownersRecord } from '../api/codeowners';
+import type { CodeownersDriftDetail } from '../api/drift';
+import { FileDriftBadge, FileDriftBanner, driftTargetLabel } from './FileDriftBanner';
 
 interface CodeownersManagerProps {
   readonly user: string;
   readonly projectName: string;
+  readonly projectId: number;
+  /** The project's repositories: every one receives this file, and any can be imported from. */
   readonly selectedRepos: string[];
   readonly isReadOnly?: boolean;
-  /** Pre-select this repo when the editor opens (from the unified nav). */
-  readonly initialRepo?: string;
-  /** Bump to force a reload of CODEOWNERS data (e.g. after a campaign completes). */
-  readonly refreshCounter?: number;
-  /** Called after a successful local draft save so the parent can refresh status. */
-  readonly onSave?: () => void;
+  /** The project's CODEOWNERS file, owned by the page; null when it has none. */
+  readonly codeowners: CodeownersRecord | null;
+  /** Each (repo, branch) where the last drift check found the file changed on GitHub. */
+  readonly drift?: CodeownersDriftDetail[];
+  /** Called with what the server saved and the project's resulting pr_state. */
+  readonly onSaved?: (record: CodeownersRecord, prState?: string) => void;
+  /** The repositories whose pull request Commit and Update PR reached. */
+  readonly onReposDelivered?: (repos: string[]) => void;
 }
+
+const DEFAULT_PATH = '.github/CODEOWNERS';
 
 const FILE_PATH_OPTIONS = [
   { value: '.github/CODEOWNERS', label: '.github/CODEOWNERS (recommended)' },
   { value: 'CODEOWNERS', label: 'CODEOWNERS (repository root)' },
 ];
-
-const DRIFT_BADGE_STYLES: Record<string, string> = {
-  synced: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300',
-  content_mismatch: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300',
-  missing_locally: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300',
-  missing_on_github: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300',
-  absent: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
-};
-
-const DRIFT_LABELS: Record<string, string> = {
-  synced: 'Synced',
-  content_mismatch: 'Drift detected',
-  missing_locally: 'Missing locally',
-  missing_on_github: 'Draft (not on GitHub)',
-  absent: 'No CODEOWNERS file',
-};
 
 const STATUS_LABELS: Record<string, string> = {
   new: 'New',
@@ -50,67 +39,84 @@ const STATUS_LABELS: Record<string, string> = {
   synced_with_github: 'Synced',
 };
 
+const NO_CHANGES = 'No changes to save';
+
+const errorDetail = (err: unknown, fallback: string): string => {
+  const e = err as { response?: { data?: { detail?: string } }; message?: string };
+  return e?.response?.data?.detail ?? e?.message ?? fallback;
+};
+
+interface PrimaryActionProps {
+  readonly unlockedPR: boolean;
+  readonly locked: boolean;
+  readonly saving: boolean;
+  readonly disabled: boolean;
+  readonly isDirty: boolean;
+  readonly onCommitLocally: () => void;
+  readonly onCommitAndUpdatePR: () => void;
+}
+
+// Commit and Update PR only once a file under review is unlocked; otherwise Commit Locally, greyed while locked.
+const PrimaryAction: React.FC<PrimaryActionProps> = ({ unlockedPR, locked, saving, disabled, isDirty, onCommitLocally, onCommitAndUpdatePR }) => {
+  if (unlockedPR) {
+    return (
+      <button type="button" onClick={onCommitAndUpdatePR} disabled={disabled} className="btn btn-primary" data-testid="update-pr-button">
+        {saving ? 'Saving…' : '🔄 Commit and Update PR'}
+      </button>
+    );
+  }
+  let title: string | undefined;
+  if (locked) title = 'Locked while its pull request is open. Unlock the file below to edit it.';
+  else if (!isDirty) title = 'No unsaved changes';
+  return (
+    <button type="button" onClick={onCommitLocally} disabled={disabled} title={title} className="btn btn-primary">
+      {saving ? 'Saving…' : '💾 Commit Locally'}
+    </button>
+  );
+};
+
 const CodeownersManager: React.FC<CodeownersManagerProps> = ({
   user,
   projectName,
+  projectId,
   selectedRepos,
   isReadOnly = false,
-  initialRepo,
-  refreshCounter,
-  onSave,
+  codeowners,
+  drift = [],
+  onSaved,
+  onReposDelivered,
 }) => {
-  const [activeRepo, setActiveRepo] = useState<string>(initialRepo ?? selectedRepos[0] ?? '');
-  const [targetRepos, setTargetRepos] = useState<Set<string>>(new Set(selectedRepos));
-  const [content, setContent] = useState<string>('');
-  const [filePath, setFilePath] = useState<string>('.github/CODEOWNERS');
-  const [info, setInfo] = useState<CodeownersGetResponse | null>(null);
-  const [drift, setDrift] = useState<CodeownersDriftResponse | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
+  const [content, setContent] = useState<string>(codeowners?.content ?? '');
+  const [filePath, setFilePath] = useState<string>(codeowners?.file_path ?? DEFAULT_PATH);
+  const [isDirty, setIsDirty] = useState<boolean>(false);
   const [saving, setSaving] = useState<boolean>(false);
+  // Which GitHub copy is loading into the editor, if any.
+  const [loadingFrom, setLoadingFrom] = useState<string | null>(null);
+  const [importRepo, setImportRepo] = useState<string>(selectedRepos[0] ?? '');
   const [warnings, setWarnings] = useState<string[]>([]);
   const [message, setMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
-  const [isDirty, setIsDirty] = useState<boolean>(false);
-  const [repoDropdownOpen, setRepoDropdownOpen] = useState<boolean>(false);
   const messageTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const repoDropdownRef = useRef<HTMLDivElement | null>(null);
 
-  // Close repo dropdown when clicking outside
-  useEffect(() => {
-    if (!repoDropdownOpen) return;
-    const handleClickOutside = (event: MouseEvent) => {
-      if (repoDropdownRef.current && !repoDropdownRef.current.contains(event.target as Node)) {
-        setRepoDropdownOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [repoDropdownOpen]);
+  // Read when the page hands over a new copy of the file: synced before that
+  // effect runs, which a passive effect would not be.
+  const isDirtyRef = useRef(isDirty);
+  useLayoutEffect(() => { isDirtyRef.current = isDirty; }, [isDirty]);
 
-  // Keep the active repo valid when the parent selection changes.
-  useEffect(() => {
-    if (selectedRepos.length > 0 && !selectedRepos.includes(activeRepo)) {
-      setActiveRepo(selectedRepos[0]);
-    } else if (selectedRepos.length === 0) {
-      setActiveRepo('');
-    }
-  }, [selectedRepos, activeRepo]);
+  const isUnderReview = codeowners?.status === 'under_review';
+  // Unlocked for editing while its PR is open; locked again once the status moves.
+  const [unlocked, setUnlocked] = useState(false);
+  const [confirmingUnlock, setConfirmingUnlock] = useState(false);
+  useEffect(() => { setUnlocked(false); }, [codeowners?.status]);
+  const isLocked = isUnderReview && !unlocked;
 
-  // Reconcile target repos with the parent selection without overwriting
-  // user toggles. We drop any targets that are no longer in selectedRepos,
-  // and default to "all selected" when the user has no remaining targets.
+  // The editor follows the page's copy, keeping an unsaved edit unless the
+  // file went under review meanwhile: it locks, showing what the PR carries.
   useEffect(() => {
-    setTargetRepos(prev => {
-      if (selectedRepos.length === 0) {
-        return new Set();
-      }
-      const allowed = new Set(selectedRepos);
-      const next = new Set(Array.from(prev).filter(repo => allowed.has(repo)));
-      if (next.size === 0) {
-        return new Set(selectedRepos);
-      }
-      return next;
-    });
-  }, [selectedRepos]);
+    if (isDirtyRef.current && codeowners?.status !== 'under_review') return;
+    setContent(codeowners?.content ?? '');
+    setFilePath(codeowners?.file_path ?? DEFAULT_PATH);
+    setIsDirty(false);
+  }, [codeowners]);
 
   useEffect(() => {
     return () => {
@@ -124,262 +130,116 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
     messageTimeoutRef.current = setTimeout(() => setMessage(null), 5000);
   };
 
-  const handleToggleRepo = (repoName: string) => {
-    setTargetRepos(prev => {
-      const next = new Set(prev);
-      if (next.has(repoName)) {
-        next.delete(repoName);
-      } else {
-        next.add(repoName);
-      }
-      return next;
-    });
+  const edit = (nextContent: string, nextPath: string) => {
+    setContent(nextContent);
+    setFilePath(nextPath);
+    setIsDirty(true);
   };
 
-  const handleSelectAllRepos = () => {
-    setTargetRepos(new Set(selectedRepos));
-  };
-
-  const handleDeselectAllRepos = () => {
-    setTargetRepos(new Set());
-  };
-
-  const loadCodeowners = useCallback(async (repoName: string) => {
-    if (!repoName) return;
-    setLoading(true);
-    setWarnings([]);
+  const loadFromGitHub = async (repo: string, key: string, options: { branch?: string; path?: string } = {}) => {
+    setLoadingFrom(key);
     try {
-      const data = await getCodeowners(repoName, user, projectName);
-      setInfo(data);
-      // Prefer the local draft when present, otherwise the GitHub copy.
-      const initial = data.local?.content ?? data.github.content ?? '';
-      setContent(initial);
-      setFilePath(
-        data.local?.file_path ?? data.github.path ?? '.github/CODEOWNERS'
-      );
-      setIsDirty(false);
-
-      // Trigger drift check in parallel
-      try {
-        const driftData = await getCodeownersDrift(repoName, user, projectName);
-        setDrift(driftData);
-      } catch (err) {
-        console.warn('Failed to load CODEOWNERS drift:', err);
-        setDrift(null);
+      const data = await getCodeowners(repo, user, projectName, options);
+      if (!data.github.exists) {
+        showMessage(`${key} has no CODEOWNERS file`, 'error');
+        return;
       }
-    } catch (err: any) {
-      const detail = err?.response?.data?.detail ?? err?.message ?? 'Failed to load CODEOWNERS';
-      showMessage(detail, 'error');
-      setInfo(null);
-      setDrift(null);
+      edit(data.github.content ?? '', data.github.path ?? filePath);
+      showMessage(`Loaded the CODEOWNERS file from ${key}. Commit Locally to keep it.`, 'success');
+    } catch (err) {
+      showMessage(errorDetail(err, 'Failed to load CODEOWNERS from GitHub'), 'error');
     } finally {
-      setLoading(false);
+      setLoadingFrom(null);
     }
-  }, [user, projectName]);
-
-  useEffect(() => {
-    if (activeRepo) {
-      loadCodeowners(activeRepo);
-    }
-  }, [activeRepo, loadCodeowners]);
-
-  useEffect(() => {
-    if (refreshCounter && activeRepo) {
-      loadCodeowners(activeRepo);
-    }
-  }, [refreshCounter]);
-
-  const handleContentChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setContent(e.target.value);
-    setIsDirty(true);
   };
 
-  const handleFilePathChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    setFilePath(e.target.value);
-    setIsDirty(true);
-  };
-
-  const handleSaveDraft = async () => {
-    if (targetRepos.size === 0) {
-      showMessage('Please select at least one target repository', 'error');
-      return;
-    }
+  const handleSave = async () => {
     setSaving(true);
-    const targetRepoList = Array.from(targetRepos);
-    const results: { repo: string; success: boolean; error?: string }[] = [];
-
     try {
-      // Save to all target repos sequentially
-      for (const repo of targetRepoList) {
-        try {
-          const result = await saveCodeownersDraft(
-            repo, user, projectName, content, filePath
-          );
-          results.push({ repo, success: true });
-
-          // Update state for activeRepo if it was saved
-          if (repo === activeRepo) {
-            setInfo(prev => prev ? { ...prev, local: result.codeowners } : prev);
-            setWarnings(result.validation_warnings ?? []);
-          }
-        } catch (err: any) {
-          const detail = err?.response?.data?.detail ?? err?.message ?? 'Failed to save';
-          results.push({ repo, success: false, error: detail });
-        }
-      }
-
-      const successCount = results.filter(r => r.success).length;
-      const failCount = results.length - successCount;
-
-      if (failCount === 0) {
-        setIsDirty(false);
-        showMessage(`Draft saved to ${successCount} ${successCount === 1 ? 'repository' : 'repositories'}`, 'success');
-        onSave?.();
-      } else {
-        showMessage(`Saved to ${successCount} repos, ${failCount} failed`, 'error');
-      }
-
-      // Refresh drift status for active repo
-      if (activeRepo && results.find(r => r.repo === activeRepo && r.success)) {
-        try {
-          const driftData = await getCodeownersDrift(activeRepo, user, projectName);
-          setDrift(driftData);
-        } catch (e) { console.error('drift refresh failed', e); }
-      }
+      const result = await saveProjectCodeowners(projectId, content, filePath);
+      setWarnings(result.validation_warnings ?? []);
+      // Before the page hands the saved copy back, so the editor takes it.
+      isDirtyRef.current = false;
+      setIsDirty(false);
+      showMessage(
+        result.message === NO_CHANGES
+          ? NO_CHANGES
+          : 'CODEOWNERS saved locally. Include it in a PR campaign to deliver it to every repository.',
+        'success'
+      );
+      onSaved?.(result.codeowners, result.pr_state);
+    } catch (err) {
+      showMessage(errorDetail(err, 'Failed to save CODEOWNERS'), 'error');
     } finally {
       setSaving(false);
     }
   };
 
-  const handleDiscard = () => {
-    if (info) {
-      const initial = info.local?.content ?? info.github.content ?? '';
-      setContent(initial);
-      setFilePath(info.local?.file_path ?? info.github.path ?? '.github/CODEOWNERS');
+  // Saves, then adds the save to the open pull request; a failed push leaves it committed locally.
+  const handleCommitAndUpdatePR = async () => {
+    setSaving(true);
+    try {
+      const result = await saveProjectCodeowners(projectId, content, filePath);
+      setWarnings(result.validation_warnings ?? []);
+      isDirtyRef.current = false;
       setIsDirty(false);
-      setWarnings([]);
+      try {
+        assertPushed(
+          await updateWorkflows(projectName, selectedRepos, { includeCodeowners: true }),
+          onReposDelivered
+        );
+      } catch (err) {
+        showMessage(`CODEOWNERS committed locally, but its pull request was not updated: ${errorDetail(err, 'push failed')}`, 'error');
+        onSaved?.(result.codeowners, result.pr_state);
+        return;
+      }
+      setUnlocked(false);
+      showMessage('CODEOWNERS committed and pull request updated.', 'success');
+      onSaved?.({ ...result.codeowners, status: 'under_review' }, result.pr_state);
+    } catch (err) {
+      showMessage(errorDetail(err, 'Failed to save CODEOWNERS'), 'error');
+    } finally {
+      setSaving(false);
     }
+  };
+
+  const handleRevert = () => {
+    setContent(codeowners?.content ?? '');
+    setFilePath(codeowners?.file_path ?? DEFAULT_PATH);
+    setIsDirty(false);
+    setWarnings([]);
   };
 
   if (selectedRepos.length === 0) {
     return (
       <div className="rounded-md border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
-        📭 Select one or more repositories in <strong>Repositories &amp; Branches</strong> to manage their CODEOWNERS file.
+        📭 Select one or more repositories in <strong>Repositories &amp; Branches</strong> to manage the project's CODEOWNERS file.
       </div>
     );
   }
 
-  const driftStatus = drift?.drift_status ?? 'absent';
-  const driftLabel = DRIFT_LABELS[driftStatus] ?? driftStatus;
-  const localStatus = info?.local?.status;
+  const canEdit = !isReadOnly && !isLocked;
+  const importFrom = selectedRepos.includes(importRepo) ? importRepo : selectedRepos[0];
+  const editorLabel = (
+    // Descriptive text, not a form label — PlainFileEditor is not a native control, labeled via aria-label instead.
+    <div className="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300">
+      CODEOWNERS content
+    </div>
+  );
 
   return (
     <div className="space-y-4">
-      {/* Repository selection dropdown */}
-      <div className="relative" ref={repoDropdownRef}>
-        <button
-          type="button"
-          onClick={() => setRepoDropdownOpen((open) => !open)}
-          aria-haspopup="listbox"
-          aria-expanded={repoDropdownOpen}
-          className="flex w-full items-center justify-between rounded-md border border-slate-200 bg-white px-4 py-2.5 text-left text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
-        >
-          <span>
-            Target Repositories ({targetRepos.size} of {selectedRepos.length} selected)
-            {activeRepo && (
-              <span className="ml-2 text-xs font-normal text-slate-500 dark:text-slate-400">
-                · Viewing: <span className="font-medium text-blue-700 dark:text-blue-300">{activeRepo}</span>
-              </span>
-            )}
-          </span>
-          <svg
-            className={`h-4 w-4 text-slate-500 transition-transform ${repoDropdownOpen ? 'rotate-180' : ''}`}
-            fill="none"
-            stroke="currentColor"
-            viewBox="0 0 24 24"
-          >
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-          </svg>
-        </button>
-
-        {repoDropdownOpen && (
-          <div className="absolute z-10 mt-1 w-full rounded-md border border-slate-200 bg-white p-3 shadow-lg dark:border-slate-700 dark:bg-slate-800">
-            <div className="mb-2 flex items-center justify-end gap-2">
-              <button
-                onClick={handleSelectAllRepos}
-                disabled={isReadOnly}
-                className="rounded border border-slate-300 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-700"
-              >
-                Select All
-              </button>
-              <button
-                onClick={handleDeselectAllRepos}
-                disabled={isReadOnly}
-                className="rounded border border-slate-300 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-700"
-              >
-                Deselect All
-              </button>
-            </div>
-
-            <div className="max-h-64 space-y-1 overflow-y-auto">
-              {selectedRepos.map((repo) => {
-                const isTarget = targetRepos.has(repo);
-                const isActive = repo === activeRepo;
-                return (
-                  <div
-                    key={repo}
-                    className={`flex items-center gap-2 rounded p-2 ${
-                      isActive ? 'bg-blue-50 dark:bg-blue-900/20' : ''
-                    } ${isTarget ? 'border border-slate-300 dark:border-slate-600' : 'border border-transparent'}`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={isTarget}
-                      onChange={() => handleToggleRepo(repo)}
-                      disabled={isReadOnly}
-                      className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
-                    />
-                    <button
-                      onClick={() => setActiveRepo(repo)}
-                      className={`flex-1 text-left text-sm ${
-                        isActive
-                          ? 'font-medium text-blue-700 dark:text-blue-300'
-                          : 'text-slate-700 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100'
-                      }`}
-                      title="Click to view this repository's CODEOWNERS"
-                    >
-                      {repo}
-                    </button>
-                    {isActive && (
-                      <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
-                        Viewing
-                      </span>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-
-            <p className="mt-3 text-xs text-slate-600 dark:text-slate-400">
-              💡 Check repositories to deploy CODEOWNERS changes. Click a repository name to view its current content.
-            </p>
-          </div>
-        )}
-      </div>
+      <p className="text-sm text-slate-600 dark:text-slate-400">
+        One CODEOWNERS file for the project, delivered to all {selectedRepos.length}{' '}
+        {selectedRepos.length === 1 ? 'repository' : 'repositories'} by its PR campaigns.
+      </p>
 
       {/* Status badges + action buttons in one row */}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
-          {drift && (
-            <span
-              className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${DRIFT_BADGE_STYLES[driftStatus] ?? DRIFT_BADGE_STYLES.absent}`}
-              title={drift.reason}
-            >
-              {driftLabel}
-            </span>
-          )}
-          {localStatus && (
-            <WorkflowStatusBadge status={localStatus} label={STATUS_LABELS[localStatus] ?? localStatus} />
+          {drift.length > 0 && <FileDriftBadge drift={drift} />}
+          {codeowners && (
+            <WorkflowStatusBadge status={codeowners.status} label={STATUS_LABELS[codeowners.status] ?? codeowners.status} />
           )}
           {isDirty && (
             <span className="rounded-full bg-yellow-100 px-2.5 py-0.5 text-xs font-medium text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300">
@@ -389,28 +249,19 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
         </div>
         <div className="flex flex-wrap gap-2">
           {isDirty && (
-            <button
-              type="button"
-              onClick={handleDiscard}
-              disabled={saving}
-              className="btn btn-secondary"
-            >
+            <button type="button" onClick={handleRevert} disabled={saving} className="btn btn-secondary">
               Revert
             </button>
           )}
-          <button
-            type="button"
-            onClick={handleSaveDraft}
-            disabled={saving || loading || isReadOnly || !isDirty || targetRepos.size === 0}
-            title={
-              targetRepos.size === 0 ? 'Select at least one target repository' :
-              !isDirty ? 'No unsaved changes' :
-              undefined
-            }
-            className="btn btn-primary"
-          >
-            {saving ? 'Saving…' : '💾 Commit Locally'}
-          </button>
+          <PrimaryAction
+            unlockedPR={isUnderReview && unlocked}
+            locked={isLocked}
+            saving={saving}
+            disabled={saving || loadingFrom !== null || !canEdit || !isDirty}
+            isDirty={isDirty}
+            onCommitLocally={handleSave}
+            onCommitAndUpdatePR={handleCommitAndUpdatePR}
+          />
         </div>
       </div>
 
@@ -422,8 +273,8 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
         <select
           id="codeowners-path-select"
           value={filePath}
-          onChange={handleFilePathChange}
-          disabled={isReadOnly}
+          onChange={(e) => edit(content, e.target.value)}
+          disabled={!canEdit}
           className="rounded border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 disabled:opacity-60"
         >
           {FILE_PATH_OPTIONS.map(o => (
@@ -432,52 +283,66 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
         </select>
       </div>
 
-      {/* Drift warning if managed externally */}
-      {drift?.drift_status === 'missing_locally' && (
-        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
-          ⚠️ A CODEOWNERS file already exists on GitHub but is not managed by Actions Manager.
-          Saving and deploying will start tracking it locally.
-        </div>
-      )}
-      {drift?.drift_status === 'content_mismatch' && (
-        <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-900 dark:border-red-700 dark:bg-red-900/20 dark:text-red-200">
-          ⚠️ Drift detected — the GitHub copy differs from the locally-managed CODEOWNERS.
-          Review the GitHub content below and either re-deploy your draft or pull the
-          remote version into the editor.
+      {!codeowners && !isReadOnly && (
+        <div
+          className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700 dark:border-slate-700 dark:bg-slate-800/50 dark:text-slate-300"
+          data-testid="codeowners-import"
+        >
+          <span>No CODEOWNERS file yet. Write one below, or start from a repository's:</span>
+          <select
+            aria-label="Repository to import CODEOWNERS from"
+            value={importFrom}
+            onChange={(e) => setImportRepo(e.target.value)}
+            className="rounded border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+          >
+            {selectedRepos.map(repo => <option key={repo} value={repo}>{repo}</option>)}
+          </select>
+          <button
+            type="button"
+            onClick={() => loadFromGitHub(importFrom, importFrom)}
+            disabled={loadingFrom !== null}
+            className="btn btn-secondary"
+          >
+            {loadingFrom === importFrom ? 'Loading…' : 'Load from repository'}
+          </button>
         </div>
       )}
 
-      {/* Editor — locked when under review */}
-      {localStatus === 'under_review' ? (
+      {drift.length > 0 && (
+        <FileDriftBanner
+          drift={drift}
+          subject="the CODEOWNERS file"
+          restoreHint="include CODEOWNERS in a PR campaign"
+          canLoad={canEdit}
+          loadingFrom={loadingFrom}
+          onLoad={(d) => loadFromGitHub(d.repo, driftTargetLabel(d), { branch: d.branch, path: d.file_path })}
+          testId="codeowners-drift-banner"
+        />
+      )}
+
+      {/* Editor — locked while under review, until unlocked */}
+      {isLocked ? (
         <div>
-          {/* Descriptive text, not a form label — PlainFileEditor is not a native control, labeled via aria-label instead. */}
-          <div className="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300">
-            CODEOWNERS content
-          </div>
+          {editorLabel}
           <div className="workflow-editor-content workflow-editor-content--lockable relative h-[400px] overflow-hidden rounded-md">
-            <div className="workflow-lock-overlay">
-              <div className="workflow-lock-btn workflow-lock-btn-static">
-                <span className="workflow-lock-icon" aria-hidden="true">🔒</span>
-                <span className="workflow-lock-label">
-                  <span className="workflow-lock-label-strong">Under Review</span>
-                  {" — merge or close the PR to edit"}
-                </span>
-              </div>
-            </div>
+            {!isReadOnly && (
+              <UnlockOverlay
+                title="CODEOWNERS has an open pull request. Click to unlock editing."
+                onRequestUnlock={() => setConfirmingUnlock(true)}
+                buttonTestId="unlock-codeowners-button"
+              />
+            )}
             <PlainFileEditor value={content} language="plain" readOnly height="400px" theme="dark" ariaLabel="CODEOWNERS content" />
           </div>
         </div>
       ) : (
         <div>
-          {/* Descriptive text, not a form label — PlainFileEditor is not a native control, labeled via aria-label instead. */}
-          <div className="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300">
-            CODEOWNERS content
-          </div>
+          {editorLabel}
           <PlainFileEditor
             value={content}
-            onChange={(v) => { setContent(v); setIsDirty(true); }}
+            onChange={(v) => edit(v, filePath)}
             language="plain"
-            readOnly={loading || isReadOnly}
+            readOnly={saving || loadingFrom !== null || isReadOnly}
             height="400px"
             theme="dark"
             ariaLabel="CODEOWNERS content"
@@ -532,6 +397,14 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
           </li>
         </ul>
       </div>
+
+      {confirmingUnlock && (
+        <UnlockUnderReviewDialog
+          subject="CODEOWNERS file"
+          onCancel={() => setConfirmingUnlock(false)}
+          onUnlock={() => { setUnlocked(true); setConfirmingUnlock(false); }}
+        />
+      )}
     </div>
   );
 };

@@ -352,6 +352,33 @@ describe("DeployEnvironments Redesign", () => {
 
     expect(screen.getByTestId("deploy-env-add-name")).toHaveValue("staging");
   });
+
+  test("shows the server's reason when it refuses the name", async () => {
+    vi.mocked(createEnvironment).mockRejectedValueOnce({
+      message: "Request failed with status code 400",
+      response: { status: 400, data: { detail: "Missing or invalid environment name" } },
+    });
+
+    const Wrapper = () => {
+      const [manualEnvironments, setManualEnvironments] = React.useState([{ name: ".." }]);
+      return (
+        <DeployEnvironments
+          {...defaultProps}
+          selectedRepos={["repo1"]}
+          manualEnvironments={manualEnvironments}
+          setManualEnvironments={setManualEnvironments}
+        />
+      );
+    };
+
+    render(<Wrapper />);
+    fireEvent.click(screen.getByTestId("deploy-env-add-submit"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Missing or invalid environment name")).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/created in GitHub/)).not.toBeInTheDocument();
+  });
 });
 
 describe("DeployEnvironments Sorting", () => {

@@ -1,8 +1,8 @@
-from fastapi import APIRouter, HTTPException, Request, Depends, Header, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Request, Depends, BackgroundTasks
 
 import requests
-import httpx
 import base64
+import functools
 import json
 import numbers
 import re
@@ -12,32 +12,34 @@ import os
 import uuid
 from datetime import datetime, timezone, timedelta
 import ipaddress
+import contextvars
 from urllib.parse import quote, urlsplit
 from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 from sqlalchemy.exc import SQLAlchemyError
 from config import GITHUB_TIMEOUT_SECONDS
 from database import SessionLocal, get_db
 import auth as auth_module
 from auth import user_tokens, get_github_api_endpoints
-from models import Project, Workflow, ProjectWorkflow, Account, ProjectPullRequest, ProjectPRCampaign, Repo, ProjectRepo, WorkflowVersion, LinkedReusableWorkflow, WorkspaceMember, ProjectMembership, RepoWorkflowOverride, CustomFile, Codeowners, WorkflowDriftState, WorkflowTreeCache
+from models import Project, Workflow, ProjectWorkflow, Account, ProjectPullRequest, ProjectPRCampaign, Repo, ProjectRepo, WorkflowVersion, LinkedReusableWorkflow, RepoWorkflowOverride, CustomFile, Codeowners, WorkflowTreeCache, ProjectDisplayOrder
 from pydantic import BaseModel, Field, field_validator
-from typing import Annotated, List, Optional
-from authorization import is_project_admin, check_project_access
+from typing import Annotated, Callable, List, NamedTuple, Optional
+from authorization import PROJECT_DELETING, PROJECT_ROLE_LEVEL, find_project_by_name, project_role
 from mode_validation import resolve_app_url, _host_is_loopback
 from reusable_workflow_visibility import validate_reusable_workflow_link
-from reusable_workflow_detection import is_reusable_workflow_yaml
-from workflow_templates import (
-    generate_template_set, 
-    generate_standard_workflow_template,
-    generate_reusable_workflow_template,
-    get_available_template_types
-)
-from github_api_tracker import github_get, github_put, github_patch
+from reusable_workflow_detection import declared_reusable
+from workflow_templates import generate_template_set
+from github_api_tracker import RateLimitExceeded, github_get, github_put, github_patch
+from error_detail import failure_kind
+import deliveries
 from drift_notifications import (
+    CODEOWNERS_NAME,
+    DriftObservation,
     record_drift_transitions,
     record_drift_check_failed,
-    clear_workflow_drift,
+    clear_drift,
+    resolve_drift_for_local_edit,
     recompute_project_drift_summary,
     drop_workflow_drift,
 )
@@ -56,19 +58,24 @@ class WorkflowSchema(BaseModel):
     original_name: Optional[str] = None  # Previous name when renaming a workflow
 
 class SaveProjectWorkflowsRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
     workflows: List[WorkflowSchema]
     rxworkflows: List[WorkflowSchema] = []
 
+# Past a 32-bit integer column the database raises rather than finding nothing.
+_MAX_PROJECT_ID = 2**31 - 1
+
+
 class CreatePullRequestsRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
+    # Picks between same-named projects of different owners (#2240).
+    project_id: Optional[int] = Field(default=None, gt=0, le=_MAX_PROJECT_ID)
     selected_repos: Optional[List[str]] = None  # If None, create PRs for all repos in project
     selected_workflows: Optional[List[str]] = None  # If None, include all workflows in the PR
     selected_reusable_workflows: Optional[List[str]] = None  # If None, no reusable workflows included
     selected_custom_file_ids: Optional[List[int]] = None  # None = all changed, [] = none
-    selected_codeowners_repos: Optional[List[str]] = None  # Repos to deploy CODEOWNERS via PR
+    # The project's CODEOWNERS goes to every repository in the campaign, as custom files do.
+    include_codeowners: bool = False
     async_mode: Optional[bool] = False
     # Bounded here rather than in the UI — this endpoint is reachable directly.
     campaign_name: Optional[str] = Field(default=None, max_length=200)
@@ -84,28 +91,23 @@ class CreatePullRequestsRequest(BaseModel):
 
 
 class RunPreflightRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
     selected_workflows: Optional[List[str]] = None
 
 class ClosePreflightValidationRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
     cleanup_branch: bool = True
 
 class MergePreflightValidationRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
     cleanup_branch: bool = True
 
 class MergePullRequestRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
     repo_name: str
     pr_number: int
 
 class ClosePullRequestRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
     repo_name: str
     pr_number: int
@@ -146,7 +148,7 @@ class ProjectPRStatusResponse(BaseModel):
     locked_workflow_ids: List[int] = []
 
 class PRHistoryItemResponse(BaseModel):
-    """A single historical (merged or closed) pull request record.
+    """A single pull request record: the base of each PR row /api/project-pr-campaigns returns.
 
     ``source_project_name`` is only set when the PR was created by a *different*
     project that is linked to the queried project via a ``LinkedReusableWorkflow``
@@ -157,7 +159,7 @@ class PRHistoryItemResponse(BaseModel):
     repo_name: str
     pr_number: int
     pr_url: str
-    pr_state: str  # "merged" or "closed"
+    pr_state: str  # "open", "merged" or "closed"
     branch_name: str
     target_branch: str
     title: Optional[str] = None
@@ -177,14 +179,6 @@ class PRHistoryItemResponse(BaseModel):
     merge_block_reason: Optional[str] = None
     can_close: Optional[bool] = None
     close_block_reason: Optional[str] = None
-
-class PRHistoryResponse(BaseModel):
-    """Response envelope for the PR history endpoint."""
-    pull_requests: List[PRHistoryItemResponse]
-    total: int
-    merged_count: int
-    closed_count: int
-
 
 class PRCampaignPRResponse(PRHistoryItemResponse):
     """A pull request row included in a derived PR Campaign."""
@@ -269,6 +263,12 @@ class DriftCheckUnavailable(Exception):
         self.status_code = status_code
 
 
+# Their messages say what GitHub answered about a repository, or when the
+# user's GitHub API quota resets, which the user can act on. Any other failure
+# is reported by kind (#2297).
+_SHOWN_GITHUB_ERRORS = (DriftCheckUnavailable, RateLimitExceeded)
+
+
 class DriftStatus(BaseModel):
     workflow_name: str
     # Which repo and branch this result is about. Carried as data because the
@@ -296,19 +296,9 @@ class DriftStatus(BaseModel):
     deleted_in_github: bool = False
 
 class DriftDetectionRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
     repo_names: List[str]
     check_deployment_vars: bool = False
-
-class DriftResolutionRequest(BaseModel):
-    github_user: Optional[str] = None
-    project_name: str
-    workflow_name: str
-    resolution: str  # "use_github" or "use_local"
-    github_content: Optional[str] = None
-    github_sha: Optional[str] = None
-
 
 class WorkflowDriftDetail(BaseModel):
     """Per-(workflow,repo,branch) drift detail."""
@@ -343,15 +333,34 @@ class WorkflowDriftDetail(BaseModel):
     deleted_in_github: bool = False
 
 
+class CodeownersDriftDetail(BaseModel):
+    """The project's CODEOWNERS on one (repo, branch); its WorkflowDriftDetail counterpart."""
+    file_path: str
+    repo: str
+    repo_id: Optional[int] = None
+    branch: str
+    has_drift: bool
+    actionsmanager_sha: Optional[str] = None
+    github_sha: Optional[str] = None
+    last_checked: str
+    message: str
+    check_failed: bool = False
+    deleted_in_github: bool = False
+
+
+class CustomFileDriftDetail(CodeownersDriftDetail):
+    """One of the project's custom files on one (repo, branch), checked as CODEOWNERS is."""
+    custom_file_id: int
+
+
 class AdoptGithubVersionRequest(BaseModel):
     """Body for POST /api/drift/adopt-github-version."""
-    github_user: Optional[str] = None
     project_id: int
     repo_id: Optional[int] = None  # Optional if repo_name is supplied
     repo_name: Optional[str] = None
-    # The branch whose drift the user is resolving. Without it this adopted
-    # content from the repo's default branch, so a project delivering to
-    # release/2.1 could import main's version of the file instead.
+    # The branch whose drift the user is resolving; required (400 without it).
+    # Falling back to the repo's default branch let a project delivering to
+    # release/2.1 import main's version of the file instead.
     branch: Optional[str] = None
     workflow_id: int
     resolution_mode: str  # adopt_project_and_sync | adopt_local_only | create_repo_override
@@ -382,6 +391,10 @@ class ProjectDriftSummary(BaseModel):
     # an empty list here cannot tell "clean" from "some pairs could not be
     # checked", because unchecked_count is only known to a live check.
     drift_status: Optional[str] = None
+    # The project's CODEOWNERS and custom files on each (repo, branch) where
+    # they drifted, counted in drift_count alongside drifted_workflows.
+    drifted_codeowners: List[CodeownersDriftDetail] = Field(default_factory=list)
+    drifted_custom_files: List[CustomFileDriftDetail] = Field(default_factory=list)
 
 
 class WorkflowDriftResponse(BaseModel):
@@ -396,7 +409,6 @@ class WorkflowDriftResponse(BaseModel):
 
 class ResolveWorkflowDriftRequest(BaseModel):
     """Body for POST /api/workflows/{workflow_id}/resolve-drift."""
-    github_user: Optional[str] = None
     repo: str
     branch: str
     resolution: str  # "use_github" or "restore_actionsmanager"
@@ -422,7 +434,6 @@ class BulkResolveDriftRequest(BaseModel):
     resolution/delivery_mode apply uniformly to every item in the batch -
     mixing resolutions per item isn't supported in one request.
     """
-    github_user: Optional[str] = None
     items: List[BulkResolveDriftItem]
     resolution: str  # "use_github" or "restore_actionsmanager"
     delivery_mode: Optional[str] = "pr"  # "pr" or "direct" — only used for restore_actionsmanager
@@ -498,6 +509,7 @@ router = APIRouter()
 # appear in the OpenAPI schema (and so generated clients know about them).
 # Codes raised inside shared helpers count too - the rule tracks the call.
 _ERR_DRIFT_STALE = "The file on GitHub changed since drift was checked"
+_ERR_ADOPT_NEEDS_BRANCH = "branch is required to adopt the GitHub version"
 
 _ERROR_RESPONSES = {
     400: {"description": "Invalid request"},
@@ -530,6 +542,7 @@ PROGRESS_COMMITTING_FILES = "Committing files"
 PROGRESS_OPENING_PR = "Opening PR"
 PR_CREATION_FAILED = "Failed to create PR"
 NO_WORKFLOWS_COMMITTED = "No workflows committed"
+NOTHING_SELECTED_FOR_CAMPAIGN = "No workflows, custom files, or CODEOWNERS were selected"
 
 # Outcome of deleting one file from one branch. "absent" is a success for the
 # caller's intent (the file is not there) but produces no commit, so a caller
@@ -552,6 +565,9 @@ _ERR_VALIDATION_PR_MISSING = "Validation PR not found (may have been deleted)."
 
 # GitHub webhook secret for PR event signature verification
 GITHUB_PR_WEBHOOK_SECRET = os.getenv("GITHUB_PR_WEBHOOK_SECRET", "").strip()
+
+_WORKFLOWS_DIR = ".github/workflows/"
+
 
 # ✅ Helper function to format workflow names
 def format_workflow_name(workflow_name: str, project_code: str, use_prefix: bool = True) -> str:
@@ -669,99 +685,44 @@ def _strip_duplicated_project_prefix(db: Session, project_id: int, name: str) ->
 # ✅ Database dependency
 
 
-def _resolve_github_user(x_github_user: Optional[str], payload_github_user: Optional[str]) -> str:
-    """Return the authenticated GitHub username from the header (preferred) or
-    the legacy body field.  Raises 401 when neither is provided."""
-    user = (x_github_user or "").strip() or (payload_github_user or "").strip()
-    if not user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    return user
+def _caller_can_see_project(db: Session, github_user: str, project: Project) -> bool:
+    """Whether *github_user* may see *project*, decided by its id (see authorization.project_role)."""
+    account = db.query(Account).filter_by(github_user=github_user).first()
+    return project_role(db, account, project) is not None
 
 
-def _find_project_by_name(db: Session, github_user: str, project_name: str):
-    """Look up a project by name, bypassing ownership filter for privileged users.
+# The project a request was made from, as X-Project-Id (#2240). Names are unique
+# per owner only, and the page already holds the id that tells two owners'
+# same-named projects apart. Set per request by main.py.
+_request_project_hint: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "request_project_hint", default=None
+)
 
-    Privileged workspace members (admin) can access any project
-    by name.  To avoid ambiguity when ``project_name`` is not globally
-    unique, the lookup first tries the owner-scoped query (using
-    *github_user*) and only falls back to a global name match when that
-    does not produce a result.
 
-    Members fall through to ProjectMembership-based lookup.
-    Other users fall back to the legacy ownership-based lookup
-    (``Project.user_id == account.user_id``).
+def set_project_hint(header_value: Optional[str]):
+    try:
+        hint = int(header_value) if header_value else None
+    except ValueError:
+        hint = None
+    return _request_project_hint.set(hint if hint and 0 < hint <= _MAX_PROJECT_ID else None)
 
-    Returns the ``Project`` or ``None``.
+
+def reset_project_hint(token) -> None:
+    _request_project_hint.reset(token)
+
+
+def project_hint() -> Optional[int]:
+    return _request_project_hint.get()
+
+
+def _find_project_by_name(db: Session, github_user: str, project_name: str, project_id: Optional[int] = None):
+    """The project *project_name* means for *github_user*, or None (see authorization.find_project_by_name).
+
+    *project_id*, or else the request's X-Project-Id, picks between same-named
+    projects the caller can see (#2240).
     """
     account = db.query(Account).filter_by(github_user=github_user).first()
-    if not account:
-        return None
-
-    # Fast-path: exact ownership match (used by most callers, and keeps
-    # backwards compatibility with older unit tests that mock `.filter_by`).
-    project = db.query(Project).filter_by(
-        user_id=account.user_id,
-        project_name=project_name.strip()
-    ).first()
-    if project:
-        return project
-
-    # Check if caller is a privileged workspace member
-    member = (
-        db.query(WorkspaceMember)
-        .filter(WorkspaceMember.user_id == account.user_id)
-        .first()
-    )
-    if member and is_project_admin(member):
-        # Privileged users — try caller-owned project first for disambiguation,
-        # since project_name is only unique per owner, not globally.
-        project = db.query(Project).filter(
-            Project.user_id == account.user_id,
-            Project.project_name.ilike(project_name.strip()),
-        ).first()
-        if project:
-            return project
-        # Fallback: global name match (single-workspace model)
-        return db.query(Project).filter(
-            Project.project_name.ilike(project_name.strip())
-        ).first()
-
-    # Non-admin members (member, read_only): an explicit grant resolves first,
-    # so a name the caller was granted wins over a same-named project they only
-    # see by virtue of membership.
-    if member and member.workspace_role in ("member", "read_only"):
-        project = db.query(Project).join(
-            ProjectMembership, ProjectMembership.project_id == Project.project_id
-        ).filter(
-            Project.project_name.ilike(project_name.strip()),
-            ProjectMembership.user_id == member.user_id,
-        ).first()
-        if project:
-            return project
-
-    # Non-privileged: ownership-based lookup.
-    owned = db.query(Project).filter(
-        Project.user_id == account.user_id,
-        Project.project_name.ilike(project_name.strip()),
-    ).first()
-    if owned:
-        return owned
-
-    # A full member sees every project in this single-workspace model, so a name
-    # they hold no grant for still resolves. read_only does not.
-    #
-    # Last, deliberately. Project names are unique per owner, not globally, so
-    # resolving workspace-wide ahead of the owner-scoped lookup above would make
-    # a caller's own project unreachable by name and hand them somebody else's
-    # same-named one. The fast path at the top of this function is an exact
-    # match, so a caller asking for their own project in different casing
-    # reaches the owner-scoped query here rather than a stranger's.
-    if member and member.workspace_role == "member":
-        return db.query(Project).filter(
-            Project.project_name.ilike(project_name.strip())
-        ).first()
-
-    return None
+    return find_project_by_name(db, account, project_name, hint=project_id or project_hint())
 
 def count_project_workflows(user: str, project_name: str) -> int:
     """Helper function to count regular workflows for a project"""
@@ -794,54 +755,20 @@ def count_project_workflows(user: str, project_name: str) -> int:
     finally:
         db.close()
 
-def count_project_reusable_workflows(user: str, project_name: str) -> int:
-    """Helper function to count reusable workflows for a project"""
-    db = SessionLocal()
-    try:
-        if user not in user_tokens:
-            return 0
-        
-        project = _find_project_by_name(db, user, project_name)
-        
-        if not project:
-            return 0
-        if not isinstance(getattr(project, "project_id", None), numbers.Integral):
-            return 0
-        
-        # Count reusable workflows for this project
-        workflow_count = db.query(Workflow) \
-            .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id) \
-            .filter(
-                ProjectWorkflow.project_id == project.project_id,
-                Workflow.reusable_workflow == True
-            ).count()
-        
-        return workflow_count
-    except Exception as e:
-        print(f"❌ Error counting reusable workflows: {str(e)}")
-        return 0
-    finally:
-        db.close()
+def get_workflow_from_github(owner, repo, workflow_filename, token, default_branch):
+    """Fetch a specific workflow file from one branch of a GitHub repository.
 
-def get_workflow_from_github(owner, repo, workflow_filename, token, default_branch=None):
-    """Fetch a specific workflow file from GitHub repository.
-
-    ``default_branch``, when supplied, skips the repo-metadata lookup -
-    callers resolving the same repo's default branch for multiple files in
-    one request (e.g. a bulk operation) should resolve it once via
-    ``get_default_branch`` and pass it through here instead of paying for a
-    redundant GET per file.
+    ``default_branch`` is the branch to read (the name predates that) and is
+    required. Falling back to the repo's default branch read a different file
+    than the caller's whenever a project delivers elsewhere (#2300, #2301).
     """
+    if not default_branch:
+        raise ValueError("a branch is required to read a workflow from GitHub")
     headers = {
         "Authorization": f"token {token}",
         "Accept": ACCEPT_HEADER,
         "X-GitHub-Api-Version": X_API_VERSION
     }
-
-    if not default_branch:
-        # Same resolution (and the same failure semantics) as everywhere else,
-        # rather than a second inline copy that quietly settled on "main".
-        default_branch = get_default_branch(owner, repo, headers)
 
     # Try to get the workflow file from default branch
     workflow_path = f".github/workflows/{workflow_filename}"
@@ -858,7 +785,7 @@ def get_workflow_from_github(owner, repo, workflow_filename, token, default_bran
     elif response.status_code == 404:
         return None  # File doesn't exist
     else:
-        raise Exception(f"GitHub API error: {response.status_code}")
+        raise DriftCheckUnavailable(f"GitHub API error: {response.status_code}", status_code=response.status_code)
 
 def fetch_workflow_tree(owner: str, repo: str, branch: str, token: str,
                         etag: Optional[str] = None) -> tuple:
@@ -1014,7 +941,7 @@ def verify_workflow_belongs_to_project(workflow_content, project_code, workflow_
     return True
 
 
-def _validate_user_and_get_project(db: Session, user: str, project_name: str):
+def _validate_user_and_get_project(db: Session, user: str, project_name: str, project_id: Optional[int] = None):
     """
     Validate user authentication and retrieve project information.
     
@@ -1029,7 +956,7 @@ def _validate_user_and_get_project(db: Session, user: str, project_name: str):
     
     token = user_tokens[user]
     
-    project = _find_project_by_name(db, user, project_name)
+    project = _find_project_by_name(db, user, project_name, project_id)
     
     if not project:
         raise HTTPException(status_code=404, detail=PROJECT_ERROR)
@@ -1050,19 +977,30 @@ def _get_project_workflows(db: Session, project):
     deletion ActionsManager itself asked for. Delivery reads these rows from
     ``_build_regular_workflow_results`` instead, which must keep seeing them.
 
+    The split follows where each workflow is delivered, not its reusable label.
+    A reusable workflow a standard project owns goes to that project's own
+    repositories (``_owned_reusable_selected``), so it is checked there with the
+    regular ones; checking it against ``_get_reusable_workflow_repo`` read a
+    repository it was never delivered to (#2085). Only an RWX project's
+    workflows live in the single reusable repository. Linked workflows are not
+    in this set at all: the query goes through ``ProjectWorkflow``.
+
     Returns:
-        tuple: (regular_workflows, reusable_workflows)
+        tuple: (workflows checked in the project's repos, workflows checked in
+        the reusable workflow repo)
     """
     workflows = db.query(Workflow) \
         .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id) \
         .filter(ProjectWorkflow.project_id == project.project_id,
                 Workflow.pending_delete.is_(False)) \
         .all()
-    
-    # Separate regular workflows from reusable workflows
+
+    if project.project_type != "rwx":
+        return workflows, []
+
     regular_workflows = [w for w in workflows if not w.reusable_workflow]
     reusable_workflows = [w for w in workflows if w.reusable_workflow]
-    
+
     return regular_workflows, reusable_workflows
 
 
@@ -1117,72 +1055,6 @@ def _create_drift_status(workflow_name: str, has_drift: bool,
     )
 
 
-def _has_open_pr_for_workflow(db: Session, project_id: int, workflow_name: str, repo_name: str) -> bool:
-    """
-    Check if a workflow has an open PR.
-
-    Cross-project check: For linked reusable workflows, checks PRs in both the
-    standard project and the RWX project so that workflows are locked everywhere
-    when a PR exists.
-
-    Args:
-        db: Database session
-        project_id: Project ID (may be standard or RWX project)
-        workflow_name: Workflow name to check
-        repo_name: Repository name
-
-    Returns:
-        True if the workflow has an open PR, False otherwise
-    """
-    try:
-        # Collect related project IDs via LinkedReusableWorkflow so that
-        # workflows are locked everywhere when a PR exists.
-        project_ids: set[int] = {project_id}
-
-        # Determine if this is a standard or RWX project
-        project = db.query(Project).filter_by(project_id=project_id).first()
-        if project:
-            if project.project_type == "standard":
-                # Standard project: include PRs from linked RWX projects
-                linked_rwx_rows = (
-                    db.query(LinkedReusableWorkflow)
-                    .filter(LinkedReusableWorkflow.standard_project_id == project_id)
-                    .all()
-                )
-                rwx_project_ids = {row.rwx_project_id for row in linked_rwx_rows}
-                project_ids.update(rwx_project_ids)
-            else:
-                # RWX project: include PRs from Standard projects that link to it
-                linked_std_rows = (
-                    db.query(LinkedReusableWorkflow)
-                    .filter(LinkedReusableWorkflow.rwx_project_id == project_id)
-                    .all()
-                )
-                std_project_ids = {row.standard_project_id for row in linked_std_rows}
-                project_ids.update(std_project_ids)
-
-        open_prs = db.query(ProjectPullRequest).filter(
-            ProjectPullRequest.project_id.in_(project_ids),
-            ProjectPullRequest.repo_name == repo_name,
-            ProjectPullRequest.pr_state == "open"
-        ).all()
-
-        # Check if any open PR contains this workflow.
-        # workflow_names is a comma-separated list that may include surrounding
-        # whitespace (it is stored joined by ", "), so strip each entry before
-        # comparing to avoid false negatives.
-        for pr in open_prs:
-            if not pr.workflow_names:
-                continue
-            pr_workflow_names = {name.strip() for name in pr.workflow_names.split(",") if name.strip()}
-            if workflow_name in pr_workflow_names:
-                return True
-        return False
-    except Exception as e:
-        print(f"⚠️ Error checking open PRs for workflow {workflow_name}: {e}")
-        return False
-
-
 def _find_blocking_reusable_workflow_pr(db: Session, workflow: "Workflow", current_project_id: int):
     """Find an open PR campaign owned by a *different* project that is already
     reviewing the given reusable workflow.
@@ -1204,59 +1076,9 @@ def _find_blocking_reusable_workflow_pr(db: Session, workflow: "Workflow", curre
         A ``(ProjectPullRequest, Project)`` tuple describing the blocking PR and
         its owning project, or ``None`` when the workflow is free to review.
     """
-    # All projects related to this workflow: the owning RWX project(s) plus
-    # every standard project that links it.
-    related_project_ids: set[int] = set()
-    owner_rows = (
-        db.query(ProjectWorkflow.project_id)
-        .filter(ProjectWorkflow.workflow_id == workflow.workflow_id)
-        .all()
-    )
-    related_project_ids.update(pid for (pid,) in owner_rows)
-    link_rows = (
-        db.query(LinkedReusableWorkflow.standard_project_id)
-        .filter(LinkedReusableWorkflow.workflow_id == workflow.workflow_id)
-        .all()
-    )
-    related_project_ids.update(pid for (pid,) in link_rows)
-    related_project_ids.discard(current_project_id)
-    if not related_project_ids:
-        return None
-
-    open_prs = (
-        db.query(ProjectPullRequest)
-        .filter(
-            ProjectPullRequest.project_id.in_(related_project_ids),
-            ProjectPullRequest.pr_state == "open",
-        )
-        .all()
-    )
-    # Restrict name matches to PRs against the owning RWX repo(s) to avoid
-    # false positives from same-named regular workflows in caller projects.
-    owner_project_ids = [pid for (pid,) in owner_rows]
-    rwx_repo_names: set[str] = set()
-    if owner_project_ids:
-        rwx_repo_names.update(
-            rname for (rname,) in
-            db.query(Repo.repo_name)
-            .join(ProjectRepo, Repo.repo_id == ProjectRepo.repo_id)
-            .filter(ProjectRepo.project_id.in_(owner_project_ids))
-            .all()
-        )
-    stem = _normalize_reusable_workflow_name(workflow.workflow_name)
-    for pr in open_prs:
-        if not pr.workflow_names:
-            continue
-        if not (pr.repo_name.endswith("/am-reuseable-workflow") or pr.repo_name in rwx_repo_names):
-            continue
-        names = {
-            _normalize_reusable_workflow_name(n)
-            for n in pr.workflow_names.split(",")
-            if n.strip()
-        }
-        if stem in names:
-            owning_project = db.query(Project).filter_by(project_id=pr.project_id).first()
-            return pr, owning_project
+    for pr in deliveries.open_prs_carrying(db, deliveries.WORKFLOW, workflow.workflow_id):
+        if pr.project_id != current_project_id:
+            return pr, db.query(Project).filter_by(project_id=pr.project_id).first()
     return None
 
 
@@ -1276,9 +1098,8 @@ def _reusable_workflow_ids_locked_by_open_campaign(db: Session, workflow_ids) ->
     Callers use this helper to exclude such workflows from any
     ``under_review`` → ``synced_with_github``/``committed_locally`` downgrade.
 
-    PR rows are matched by normalized workflow stem and scoped to the owning
-    RWX repo(s) (or the dedicated ``*/am-reuseable-workflow`` repo) so that
-    same-named regular workflows in caller repos cannot cause false locks.
+    Read from the delivery record, which names the workflow by id, so neither
+    a rename nor a same-named workflow elsewhere can move the lock.
 
     Args:
         db: Database session.
@@ -1288,91 +1109,7 @@ def _reusable_workflow_ids_locked_by_open_campaign(db: Session, workflow_ids) ->
         The set of ``workflow_ids`` that still have an open PR campaign
         somewhere and therefore must remain locked.
     """
-    if not workflow_ids:
-        return set()
-
-    # Canonical stem name for each shared workflow, used to match PR records
-    # whose ``workflow_names`` carry the display-formatted (prefixed/.yml) name.
-    stem_by_id = {
-        wid: _normalize_reusable_workflow_name(name)
-        for wid, name in db.query(Workflow.workflow_id, Workflow.workflow_name)
-        .filter(Workflow.workflow_id.in_(workflow_ids))
-        .all()
-    }
-
-    # Every project related to these workflows: the owning RWX project(s) plus
-    # every standard project that links them.
-    related_project_ids: set[int] = set()
-    related_project_ids.update(
-        pid for (pid,) in db.query(ProjectWorkflow.project_id)
-        .filter(ProjectWorkflow.workflow_id.in_(workflow_ids))
-        .all()
-    )
-    related_project_ids.update(
-        pid for (pid,) in db.query(LinkedReusableWorkflow.standard_project_id)
-        .filter(LinkedReusableWorkflow.workflow_id.in_(workflow_ids))
-        .all()
-    )
-    if not related_project_ids:
-        return set()
-
-    open_prs = (
-        db.query(ProjectPullRequest)
-        .filter(
-            ProjectPullRequest.project_id.in_(related_project_ids),
-            ProjectPullRequest.pr_state == "open",
-        )
-        .all()
-    )
-
-    rwx_repos_by_wid = _rwx_repo_names_by_workflow_id(db, workflow_ids)
-
-    locked: set = set()
-    for pr in open_prs:
-        locked.update(_workflow_ids_locked_by_pr(pr, stem_by_id, rwx_repos_by_wid))
-    return locked
-
-
-def _rwx_repo_names_by_workflow_id(db: Session, workflow_ids) -> dict:
-    """Map each canonical reusable ``workflow_id`` to its owning RWX repo names.
-
-    Used to avoid false-positive locks from same-named regular workflows in
-    caller projects.
-    """
-    rwx_repos_by_wid: dict = {}
-    for wid, rname in (
-        db.query(ProjectWorkflow.workflow_id, Repo.repo_name)
-        .join(ProjectRepo, ProjectRepo.project_id == ProjectWorkflow.project_id)
-        .join(Repo, Repo.repo_id == ProjectRepo.repo_id)
-        .filter(ProjectWorkflow.workflow_id.in_(workflow_ids))
-        .all()
-    ):
-        rwx_repos_by_wid.setdefault(wid, set()).add(rname)
-    return rwx_repos_by_wid
-
-
-def _workflow_ids_locked_by_pr(pr, stem_by_id: dict, rwx_repos_by_wid: dict) -> set:
-    """Return the workflow IDs that ``pr`` keeps locked under_review.
-
-    A reusable workflow is considered locked by ``pr`` when the PR's
-    ``workflow_names`` contains its canonical stem **and** the PR was filed
-    against an owning RWX repo (or the shared ``*/am-reuseable-workflow`` repo).
-    """
-    if not pr.workflow_names:
-        return set()
-    pr_stems = {
-        _normalize_reusable_workflow_name(n)
-        for n in pr.workflow_names.split(",")
-        if n.strip()
-    }
-    is_rwx_pr_repo = pr.repo_name.endswith("/am-reuseable-workflow")
-    locked: set = set()
-    for wid, stem in stem_by_id.items():
-        if not stem or stem not in pr_stems:
-            continue
-        if is_rwx_pr_repo or pr.repo_name in rwx_repos_by_wid.get(wid, set()):
-            locked.add(wid)
-    return locked
+    return deliveries.workflow_ids_with_open_pending(db, workflow_ids)
 
 
 def _reset_drift_lookup_caches(db: Session, project_id: int) -> None:
@@ -1380,323 +1117,144 @@ def _reset_drift_lookup_caches(db: Session, project_id: int) -> None:
 
     Scopes them to one check. The background sweep reuses a single Session for a
     whole batch, which can span minutes of GitHub I/O, so anything cached for the
-    Session's lifetime outlives the check that built it. Staleness here is not
-    neutral: _delivery_confirmed_on_branch reads "repo not in this project" as
-    "no evidence could ever have been recorded", so a set missing a repo attached
-    mid-batch reports that repo as a deletion — the false positive the gate
-    exists to remove (issue #1981).
+    Session's lifetime outlives the check that built it: a repo attached
+    mid-batch would be missing from its repo map and branch list.
     """
-    db.info.pop(f"project_repo_ids:{project_id}", None)
     db.info.pop("repo_id_by_name", None)
+    db.info.pop(f"drift_branches:{project_id}", None)
 
 
-def _project_repo_ids(db: Session, project_id: int) -> set:
-    """Repo ids this project delivers to, cached for the (workflow x repo) loop."""
-    key = f"project_repo_ids:{project_id}"
-    cached = db.info.get(key)
-    if cached is None:
-        cached = {
-            row.repo_id
-            for row in db.query(ProjectRepo.repo_id).filter(
-                ProjectRepo.project_id == project_id
-            ).all()
-        }
-        db.info[key] = cached
-    return cached
+class _Outcome(NamedTuple):
+    """What the drift rule found, worded after the file's name."""
+    has_drift: bool
+    deleted: bool
+    message: str
 
 
-def _delivery_confirmed_on_branch(db: Session, workflow, repo_name: str, branch: str,
-                                  project_id: int) -> bool:
-    """Whether a drift check has ever actually found this file on this (repo, branch).
+_PENDING_MERGE = _Outcome(False, False, "in open PR - pending merge to {repo}")
+_DELETED = _Outcome(True, True, "was deleted from {repo}")
+_NOT_DELIVERED = _Outcome(False, False, "not delivered to {repo} yet")
+_SYNCED = _Outcome(False, False, "synchronized with {repo}")
+_UNDER_REVIEW = _Outcome(False, False, "under review in open PR for {repo}")
+_DIFFERS = _Outcome(True, False, "content differs between local and {repo}")
 
-    "Deleted in GitHub" is a claim about history, and nothing else in the row can
-    make it: ``workflow_git_hash`` is the blob SHA of whatever branch was last
-    written, a PR branch included, and ``github_sha`` is nulled by the very check
-    that reports a deletion. ``confirmed_present_at`` is stamped the first time a
-    check sees the file and never cleared, so it is the one field that answers
-    this (issue #1981).
 
-    Keyed per (workflow, repo, branch): the same workflow can be live on one
-    branch and never delivered to another.
+class _GitHubCopy:
+    """GitHub's copy of a file on one (repo, branch), as a drift check sees it.
 
-    Returns True — do not suppress — wherever the answer is unknowable rather
-    than known-negative. Drift state is only persisted for a project's own repos
-    (``record_drift_transitions`` skips details whose repo_id is None), so for
-    anything else, such as the source repo of a linked reusable workflow, no
-    evidence would ever have been recorded and its absence proves nothing.
-    Suppressing there would downgrade real deletions to "not delivered yet".
+    ``sha`` is its blob, None when the file is missing. The content is read
+    only when the rule needs it, and the read can find the file gone.
     """
-    if db is None or project_id is None:
-        return True
 
+    def __init__(self, sha: Optional[str], read=None, content: Optional[str] = None):
+        self.sha = sha
+        self.content = content
+        self._read = read
+
+    def read(self) -> Optional[str]:
+        if self.content is None and self._read is not None:
+            self.content, self._read = self._read(), None
+            if self.content is None:
+                self.sha = None
+        return self.content
+
+
+def _never() -> bool:
+    return False
+
+
+def _delivered(target, legacy) -> bool:
+    return (target is not None and target.row.delivered_at is not None) or legacy()
+
+
+def _drift_when_missing(target, legacy) -> _Outcome:
+    if target is not None and target.pending:
+        return _PENDING_MERGE
+    return _DELETED if _delivered(target, legacy) else _NOT_DELIVERED
+
+
+def _decide_drift(db: Session, targets: dict, key: tuple, github: _GitHubCopy, expected: str,
+                  legacy=_never, path=None) -> _Outcome:
+    """The drift rule every kind of file is judged by: is GitHub's copy on
+    (repo, branch) what ActionsManager delivered there?
+
+    *key* is ``(kind, file_id, repo_id, branch)`` in *targets*, the project's
+    delivery record (``deliveries.targets_for``). *expected* is ActionsManager's
+    content for that repository now. *legacy* says whether a workflow may have
+    been delivered there before the record existed. *path* is where GitHub's
+    copy was read, recorded with a match.
+
+    =======  ==================================  =============================
+    GitHub   first condition that holds          outcome
+    =======  ==================================  =============================
+    missing  an open PR carries it here          pending merge
+    missing  delivered here                      drift: deleted
+    missing  otherwise                           not delivered yet
+    present  the blob delivered here             synchronized, nothing read
+    present  an open PR carries it here          under review
+    present  its content is *expected*           synchronized, and that blob
+                                                 recorded as delivered
+    present  not delivered here                  not delivered yet
+    present  otherwise                           drift: content differs
+    =======  ==================================  =============================
+
+    A local edit only changes *expected*, which matters only once GitHub's
+    copy is not the delivered one: an edit never hides drift and never makes
+    it. The file's status is what shows the edit.
+    """
+    target = targets.get(key)
+    if github.sha is None:
+        return _drift_when_missing(target, legacy)
+    if target is not None and github.sha == target.row.delivered_sha:
+        return _SYNCED
+    if target is not None and target.pending:
+        return _UNDER_REVIEW
+    content = github.read()
+    if content is None:
+        return _drift_when_missing(target, legacy)
+    if _normalize_yaml_for_comparison(content) == _normalize_yaml_for_comparison(expected):
+        row = deliveries.record_matched(db, *key, github.sha, path)
+        if row is not None:
+            targets.setdefault(key, deliveries.Target(row, False))
+        return _SYNCED
+    return _DIFFERS if _delivered(target, legacy) else _NOT_DELIVERED
+
+
+def _drift_message(name: str, outcome: _Outcome, repo_name: str) -> str:
+    return f"{name} {outcome.message.format(repo=repo_name)}"
+
+
+def _drift_record(db: Session, project_id: Optional[int], targets: Optional[dict]) -> dict:
+    """The delivery record a check reads: *targets* when the caller loaded it, else the project's."""
+    if targets is not None:
+        return targets
+    return deliveries.targets_for(db, project_id) if db is not None and project_id is not None else {}
+
+
+def _repo_ids_by_name(db: Session) -> dict:
+    """Every repository's id by name, read once per check (see _reset_drift_lookup_caches)."""
+    if db is None:
+        return {}
     repo_id_by_name = db.info.get("repo_id_by_name")
     if repo_id_by_name is None:
         repo_id_by_name = {r.repo_name: r.repo_id for r in db.query(Repo).all()}
         db.info["repo_id_by_name"] = repo_id_by_name
-
-    repo_id = repo_id_by_name.get(repo_name)
-    if repo_id is None or repo_id not in _project_repo_ids(db, project_id):
-        return True
-
-    return (
-        db.query(WorkflowDriftState.confirmed_present_at)
-        .filter(
-            WorkflowDriftState.workflow_id == workflow.workflow_id,
-            WorkflowDriftState.repo_id == repo_id,
-            WorkflowDriftState.branch == (branch or ""),
-        )
-        .scalar()
-    ) is not None
+    return repo_id_by_name
 
 
-LOCAL_COMMIT_HASH = "0" * 40  # 40 zeros indicates a local-only commit
+def _drift_key(db: Session, kind: str, file_id, repo_name: str, branch: str) -> tuple:
+    """A file's key in the delivery record on (repo, branch), from any repository's name."""
+    return (kind, file_id, _repo_ids_by_name(db).get(repo_name), branch or "")
 
 
-def _was_ever_delivered(workflow) -> bool:
-    """Whether this workflow carries a real GitHub blob SHA.
-
-    The zeroed sentinel means an ActionsManager edit that has not been pushed,
-    and no hash at all means it has never left the database. Either way nothing
-    was ever written to GitHub under this workflow's name.
-    """
-    return bool(
-        workflow.workflow_git_hash
-        and workflow.workflow_git_hash != LOCAL_COMMIT_HASH
-    )
+def _delivered_sha(targets: dict, key: tuple) -> Optional[str]:
+    target = targets.get(key)
+    return target.row.delivered_sha if target is not None else None
 
 
-def _drift_for_missing_workflow(workflow, repo_name: str, drift_type: str, db: Session, project_id: int,
-                                branch: str = "") -> Optional[DriftStatus]:
-    """Workflow doesn't exist on GitHub. Decide deleted / pending-merge / never-synced.
-
-    Only flag as drift if the workflow has a REAL git hash (was previously synced) —
-    excludes workflows with no hash, or a hash of all zeros (locally committed but
-    never pushed: "0000..."). When a PR is created, workflow_git_hash is set to the
-    PR branch SHA, which won't be present on the target branch until merge — so an
-    open PR means "pending merge", not "deleted".
-    """
-    has_real_hash = _was_ever_delivered(workflow)
-    label = 'Reusable w' if drift_type == 'reusable_workflow' else 'W'
-
-    if has_real_hash:
-        if db and project_id and _has_open_pr_for_workflow(db, project_id, workflow.workflow_name, repo_name):
-            print(f"ℹ️  Workflow '{workflow.workflow_name}' missing from target branch but has open PR — classifying as pending merge (not drifted)")
-            return _create_drift_status(
-                workflow_name=workflow.workflow_name,
-                has_drift=False,
-                github_content=None,
-                local_content=workflow.workflow_yaml,
-                github_sha=None,
-                local_sha=workflow.workflow_git_hash,
-                message=f"{label}orkflow in open PR - pending merge to {repo_name}",
-                drift_type=drift_type,
-                repo=repo_name,
-                branch=branch,
-            )
-
-        if not _delivery_confirmed_on_branch(db, workflow, repo_name, branch, project_id):
-            # Reported as a non-drift status rather than None so the result still
-            # reaches record_drift_transitions and clears any deleted row an
-            # earlier check wrote for this pairing.
-            print(f"\u2139\ufe0f  Workflow '{workflow.workflow_name}' has never been seen on {repo_name}@{branch or 'default'} - pending delivery, not a deletion")
-            return _create_drift_status(
-                workflow_name=workflow.workflow_name,
-                has_drift=False,
-                github_content=None,
-                local_content=workflow.workflow_yaml,
-                github_sha=None,
-                local_sha=workflow.workflow_git_hash,
-                message=f"{label}orkflow not delivered to {repo_name} yet",
-                drift_type=drift_type,
-                repo=repo_name,
-                branch=branch,
-            )
-
-        return _create_drift_status(
-            workflow_name=workflow.workflow_name,
-            has_drift=True,
-            github_content=None,
-            local_content=workflow.workflow_yaml,
-            github_sha=None,
-            local_sha=workflow.workflow_git_hash,
-            message=f"{label}orkflow was deleted from {repo_name}",
-            drift_type=drift_type,
-            deleted_in_github=True,
-            repo=repo_name,
-            branch=branch,
-        )
-
-    # Workflow has never been synced (no real git hash). An open PR means
-    # new_open_pr state (not drift); otherwise it's just never synced yet.
-    if db and project_id and _has_open_pr_for_workflow(db, project_id, workflow.workflow_name, repo_name):
-        print(f"ℹ️  Workflow '{workflow.workflow_name}' has open PR - classifying as new_open_pr (not drifted)")
-        return _create_drift_status(
-            workflow_name=workflow.workflow_name,
-            has_drift=False,
-            github_content=None,
-            local_content=workflow.workflow_yaml,
-            github_sha=None,
-            local_sha=workflow.workflow_git_hash,
-            message=f"{label}orkflow in open PR - pending merge to {repo_name}",
-            drift_type=drift_type,
-            repo=repo_name,
-            branch=branch,
-        )
-
-    return None
-
-
-def _drift_for_content_mismatch(workflow, github_content, github_sha, repo_name: str, drift_type: str,
-                                 db: Session, project_id: int, local_normalized: str, github_normalized: str,
-                                 branch: str = "") -> DriftStatus:
-    """Content differs from target branch. Decide local-edit / under-review / true drift.
-
-    If the workflow was modified locally in ActionsManager (Commit Locally), the hash
-    is reset to all zeros and status is "committed_locally" — that's an intentional
-    local edit pending sync, NOT drift from GitHub. Drift means GitHub changed outside
-    ActionsManager; a local AM edit must never be flagged as drift.
-    """
-    label = 'Reusable w' if drift_type == 'reusable_workflow' else 'W'
-    # Only the zeroed hash proves this was an intentional local edit: every path
-    # that edits a workflow in ActionsManager sets that sentinel. Status alone is
-    # not enough, because closing a fix PR without merging also reverts the
-    # workflow to "committed_locally" while leaving a real GitHub SHA behind.
-    # Treating that as a local edit suppressed genuine drift indefinitely and
-    # emitted drift.resolved while GitHub still differed.
-    is_local_modification = workflow.workflow_git_hash == LOCAL_COMMIT_HASH
-    if is_local_modification:
-        print(f"ℹ️  Workflow '{workflow.workflow_name}' was modified locally (status={workflow.workflow_status}) - classifying as local_modified (not drifted)")
-        return _create_drift_status(
-            workflow_name=workflow.workflow_name,
-            has_drift=False,
-            github_content=github_content,
-            local_content=workflow.workflow_yaml,
-            github_sha=github_sha,
-            local_sha=workflow.workflow_git_hash,
-            message=f"{label}orkflow modified locally - pending sync to {repo_name}",
-            drift_type=drift_type,
-            repo=repo_name,
-            branch=branch,
-        )
-
-    if db and project_id and _has_open_pr_for_workflow(db, project_id, workflow.workflow_name, repo_name):
-        # Workflow has open PR and local differs from target branch — expected for
-        # workflows under review, classify as under_review, not drift.
-        print(f"ℹ️  Workflow '{workflow.workflow_name}' has open PR with changes - classifying as under_review (not drifted)")
-        return _create_drift_status(
-            workflow_name=workflow.workflow_name,
-            has_drift=False,
-            github_content=github_content,
-            local_content=workflow.workflow_yaml,
-            github_sha=github_sha,
-            local_sha=workflow.workflow_git_hash,
-            message=f"{label}orkflow under review in open PR for {repo_name}",
-            drift_type=drift_type,
-            repo=repo_name,
-            branch=branch,
-        )
-
-    print(f"✅ Drift detected for {'reusable ' if drift_type == 'reusable_workflow' else ''}workflow '{workflow.workflow_name}' (content differs)")
-    if local_normalized and github_normalized:
-        print(f"  First 200 chars of local (normalized): {repr(local_normalized[:200])}")
-        print(f"  First 200 chars of GitHub (normalized): {repr(github_normalized[:200])}")
-
-    return _create_drift_status(
-        workflow_name=workflow.workflow_name,
-        has_drift=True,
-        github_content=github_content,
-        local_content=workflow.workflow_yaml,
-        github_sha=github_sha,
-        local_sha=workflow.workflow_git_hash,
-        message=f"{label}orkflow content differs between local and {repo_name}",
-        drift_type=drift_type,
-        repo=repo_name,
-        branch=branch,
-    )
-
-
-def _compare_workflow_content(workflow, github_data, repo_name: str, project_code: str, drift_type: str = "workflow",
-                               db: Session = None, project_id: int = None, branch: str = "") -> DriftStatus:
-    """Compare workflow content between local and GitHub using deterministic drift logic.
-
-    Core drift rule:
-    - If workflow doesn't exist on GitHub → drift (if previously synced)
-    - If content (normalized) matches → no drift, update hash if needed
-    - If content (normalized) differs → drift
-
-    Returns:
-        DriftStatus: The drift status for this workflow
-    """
-    if github_data is None:
-        return _drift_for_missing_workflow(workflow, repo_name, drift_type, db, project_id, branch)
-
-    github_content = github_data["content"]
-    github_sha = github_data["sha"]
-
-    # Verify that the workflow in GitHub actually belongs to this project
-    if not verify_workflow_belongs_to_project(github_content, project_code, workflow.workflow_name):
-        # Skip this workflow as it doesn't belong to the current project
-        print(f"⚠️ Skipping workflow {workflow.workflow_name} in {repo_name} - doesn't belong to project {project_code}")
-        return None
-
-    # Normalize content for comparison
-    local_normalized = _normalize_yaml_for_comparison(workflow.workflow_yaml or "")
-    github_normalized = _normalize_yaml_for_comparison(github_content or "")
-
-    content_matches = local_normalized == github_normalized
-
-    print(f"🔍 Drift check for {'reusable ' if drift_type == 'reusable_workflow' else ''}workflow '{workflow.workflow_name}' in {repo_name}:")
-    print(f"  Local SHA: {workflow.workflow_git_hash}")
-    print(f"  GitHub SHA: {github_sha}")
-    print(f"  Local content length (normalized): {len(local_normalized)}")
-    print(f"  GitHub content length (normalized): {len(github_normalized)}")
-    print(f"  Content matches: {content_matches}")
-
-    if content_matches:
-        # Content matches - no drift, even if SHAs differ
-        print(f"⚪ No drift for {'reusable ' if drift_type == 'reusable_workflow' else ''}workflow '{workflow.workflow_name}' (content matches)")
-
-        return _create_drift_status(
-            workflow_name=workflow.workflow_name,
-            has_drift=False,
-            github_content=github_content,
-            local_content=workflow.workflow_yaml,
-            github_sha=github_sha,
-            local_sha=workflow.workflow_git_hash,
-            message=f"{'Reusable w' if drift_type == 'reusable_workflow' else 'W'}orkflow synchronized with {repo_name}",
-            drift_type=drift_type,
-            repo=repo_name,
-            branch=branch,
-        )
-
-    return _drift_for_content_mismatch(
-        workflow, github_content, github_sha, repo_name, drift_type, db, project_id,
-        local_normalized, github_normalized, branch=branch,
-    )
-
-
-class _WorkflowExpectedView:
-    """Lightweight duck-typed wrapper used by drift comparison to substitute
-    a per-repo override's expected content/hash for the underlying project
-    workflow.  Exposes the same attribute surface as ``models.Workflow`` that
-    ``_compare_workflow_content`` reads from."""
-
-    def __init__(self, workflow, override=None):
-        self.workflow_id = workflow.workflow_id
-        self.workflow_name = workflow.workflow_name
-        self.reusable_workflow = getattr(workflow, "reusable_workflow", False)
-        if override is not None:
-            self.workflow_yaml = override.workflow_yaml
-            self.workflow_git_hash = override.workflow_git_hash
-            self.workflow_status = "synced_with_github"
-            self._is_override = True
-            self._override = override
-        else:
-            self.workflow_yaml = workflow.workflow_yaml
-            self.workflow_git_hash = workflow.workflow_git_hash
-            self.workflow_status = getattr(workflow, "workflow_status", "new")
-            self._is_override = False
-            self._override = None
+def _expected_yaml(workflow, override=None) -> str:
+    """What ActionsManager delivers of *workflow* to a repository: its override there, if one exists."""
+    return (override.workflow_yaml if override is not None else workflow.workflow_yaml) or ""
 
 
 def _get_repo_workflow_override(db: Session, project_id: int, repo_name: str, workflow_id: int):
@@ -1710,12 +1268,7 @@ def _get_repo_workflow_override(db: Session, project_id: int, repo_name: str, wo
     if not db or project_id is None or workflow_id is None or not repo_name:
         return None
 
-    repo_id_by_name = db.info.get("repo_id_by_name")
-    if repo_id_by_name is None:
-        repo_id_by_name = {r.repo_name: r.repo_id for r in db.query(Repo).all()}
-        db.info["repo_id_by_name"] = repo_id_by_name
-
-    repo_id = repo_id_by_name.get(repo_name)
+    repo_id = _repo_ids_by_name(db).get(repo_name)
     if repo_id is None:
         return None
 
@@ -1748,13 +1301,19 @@ def _resolve_drift_branches_for_repo(db: Session, project: "Project", repo_name:
     if project is None or db is None:
         return [get_default_branch(owner, repo, headers, user, db)]
 
-    cfg = resolve_branch_config_for_repo(db, project, repo_name)
-    return _resolve_branches_for_repo(
-        owner, repo,
-        cfg["branch_option"], cfg["branch_regex"], cfg["branch_max_age_days"],
-        headers, user, db,
-        recency_cache_repo=repo_name,
-    )
+    # Kept for the rest of the check (_reset_drift_lookup_caches starts the
+    # next one afresh): its workflows and its CODEOWNERS are checked on the
+    # same branches, and resolving them costs GitHub calls.
+    resolved = db.info.setdefault(f"drift_branches:{project.project_id}", {})
+    if repo_name not in resolved:
+        cfg = resolve_branch_config_for_repo(db, project, repo_name)
+        resolved[repo_name] = _resolve_branches_for_repo(
+            owner, repo,
+            cfg["branch_option"], cfg["branch_regex"], cfg["branch_max_age_days"],
+            headers, user, db,
+            recency_cache_repo=repo_name,
+        )
+    return list(resolved[repo_name])
 
 
 def _get_tree_cache_row(db: Session, repo_name: str, branch: str):
@@ -1857,113 +1416,136 @@ def _prefetch_workflow_shas_per_repo(repo_names: List[str], token: str, db: Sess
     return repo_sha_cache
 
 
-def _update_workflow_hash_after_content_match(db: Session, workflow, override, expected, github_data, repo_name: str) -> None:
-    """Content matched despite the SHA differing — refresh the stored hash (override's if one applies, else the shared workflow's)."""
-    new_github_sha = github_data["sha"]
-    if expected.workflow_git_hash == new_github_sha:
-        return
-    if override is not None:
-        override.workflow_git_hash = new_github_sha
-        db.commit()
-        print(f"✅ Updated git hash for repo override '{workflow.workflow_name}' in {repo_name}: {new_github_sha} (content matched despite SHA difference)")
-    else:
-        workflow.workflow_git_hash = new_github_sha
-        db.commit()
-        print(f"✅ Updated git hash for workflow '{workflow.workflow_name}' in {repo_name}: {new_github_sha} (content matched despite SHA difference)")
+def _workflow_filename_on(db: Session, targets: dict, workflow, repo_name: str, branch: str, filename: str) -> str:
+    """The name *workflow* is read by in (repo, branch)'s listing: the delivered file's, else *filename*.
+
+    The listing holds the names under ``.github/workflows``, so a local rename
+    costs no extra read.
+    """
+    target = targets.get(_drift_key(db, deliveries.WORKFLOW, workflow.workflow_id, repo_name, branch))
+    path = deliveries.path_on(target.row if target is not None else None, _WORKFLOWS_DIR + filename)
+    return path.rsplit("/", 1)[-1]
+
+
+def _delivered_filename(db: Session, workflow, repo_name: str, branch: str, filename: str) -> str:
+    """*workflow*'s file name on (repo, branch): the delivered file's, else *filename*.
+
+    Drift after a local rename is reported where the file was delivered, so
+    adopting GitHub's copy reads it there.
+    """
+    path = deliveries.delivered_path(db, deliveries.WORKFLOW, workflow.workflow_id, repo_name, branch)
+    return (path or _WORKFLOWS_DIR + filename).rsplit("/", 1)[-1]
+
+
+class _WorkflowPlace(NamedTuple):
+    """One workflow file on one (repo, branch) a drift check reads."""
+    repo_name: str
+    owner: str
+    repo: str
+    branch: str
+    filename: str
+    token: str
+
+
+class _ForeignWorkflow(Exception):
+    """The file at a workflow's path belongs to another project (verify_workflow_belongs_to_project)."""
+
+
+def _read_own_workflow(place: _WorkflowPlace, project_code: str, workflow_name: str) -> Optional[str]:
+    """GitHub's content at *place*, or None when the file is gone."""
+    data = get_workflow_from_github(place.owner, place.repo, place.filename, place.token, default_branch=place.branch)
+    if data is None:
+        return None
+    if not verify_workflow_belongs_to_project(data["content"], project_code, workflow_name):
+        raise _ForeignWorkflow()
+    return data["content"]
+
+
+def _workflow_label(drift_type: str) -> str:
+    return "Reusable workflow" if drift_type == "reusable_workflow" else "Workflow"
+
+
+def _workflow_check_failed(workflow, expected: str, place: _WorkflowPlace, drift_type: str,
+                           message: str) -> DriftStatus:
+    """A workflow GitHub could not tell us about on *place*: no opinion about drift."""
+    return _create_drift_status(
+        workflow_name=workflow.workflow_name, has_drift=False, github_content=None, local_content=expected,
+        github_sha=None, local_sha=deliveries.blob_sha(expected), message=message, drift_type=drift_type,
+        check_failed=True, repo=place.repo_name, branch=place.branch,
+    )
+
+
+def _judge_workflow(db: Session, workflow, expected: str, place: _WorkflowPlace, github_sha: Optional[str],
+                    targets: dict, project_code: str, drift_type: str) -> Optional[DriftStatus]:
+    """Drift-check one workflow on *place* by the rule, from the blob SHA the listing gave.
+
+    None when the file there is another project's, which is not this
+    workflow's drift either way.
+    """
+    key = _drift_key(db, deliveries.WORKFLOW, workflow.workflow_id, place.repo_name, place.branch)
+    github = _GitHubCopy(github_sha, functools.partial(_read_own_workflow, place, project_code, workflow.workflow_name))
+    try:
+        outcome = _decide_drift(db, targets, key, github, expected,
+                                legacy=lambda: _may_be_delivered_unrecorded(db, workflow, place.repo_name),
+                                path=_WORKFLOWS_DIR + place.filename)
+    except _ForeignWorkflow:
+        print(f"⚠️ Skipping workflow {workflow.workflow_name} in {place.repo_name} - doesn't belong to project {project_code}")
+        return None
+    if outcome.has_drift:
+        print(f"✅ Drift detected for {_workflow_label(drift_type).lower()} '{workflow.workflow_name}' "
+              f"in {place.repo_name}@{place.branch}: {outcome.message.format(repo=place.repo_name)}")
+    return _create_drift_status(
+        workflow_name=workflow.workflow_name, has_drift=outcome.has_drift,
+        github_content=github.content, local_content=expected,
+        github_sha=github.sha, local_sha=deliveries.blob_sha(expected),
+        message=_drift_message(_workflow_label(drift_type), outcome, place.repo_name),
+        drift_type=drift_type, deleted_in_github=outcome.deleted, repo=place.repo_name, branch=place.branch,
+    )
 
 
 def _check_regular_workflow_in_repo(db: Session, workflow, repo_name: str, owner: str, repo: str,
-                                     formatted_workflow_name: str, workflow_shas: dict, project_code: str,
-                                     token: str, project_id: int, branch: str = "") -> Optional[DriftStatus]:
-    """Drift-check one workflow against one repo, using a prefetched SHA to skip a full content fetch when possible."""
-    # Resolve the expected content for this repo: prefer a repo-specific
-    # override when one exists, otherwise fall back to the shared project
-    # workflow. This is the core of the design-level drift fix: a repo with
-    # an override compares against the override, not the project workflow,
-    # so it doesn't constantly re-report drift.
+                                    formatted_workflow_name: str, workflow_shas: dict, project_code: str,
+                                    token: str, project_id: int, branch: str = "",
+                                    targets: Optional[dict] = None) -> Optional[DriftStatus]:
+    """Drift-check one workflow against one (repo, branch), from the prefetched listing of its workflows.
+
+    The expected content is the repo's override when one exists, otherwise the
+    shared project workflow: a repo with an override is compared against the
+    override, so it does not constantly re-report drift.
+    """
     override = _get_repo_workflow_override(db, project_id, repo_name, workflow.workflow_id)
-    expected = _WorkflowExpectedView(workflow, override)
+    expected = _expected_yaml(workflow, override)
+    targets = targets if targets is not None else {}
+    filename = _workflow_filename_on(db, targets, workflow, repo_name, branch, formatted_workflow_name)
+    place = _WorkflowPlace(repo_name, owner, repo, branch, filename, token)
 
     if workflow_shas is None:
         # We could not list this repo's workflows at all, so we do not know
         # whether the file is missing or we simply couldn't see it.
-        return _create_drift_status(
-            workflow_name=workflow.workflow_name,
-            has_drift=False,
-            github_content=None,
-            local_content=expected.workflow_yaml,
-            github_sha=None,
-            local_sha=expected.workflow_git_hash,
-            message=f"Could not check {repo_name} — GitHub did not return its workflows",
-            drift_type="workflow",
-            check_failed=True,
-            repo=repo_name,
-            branch=branch,
-        )
-
+        return _workflow_check_failed(workflow, expected, place, "workflow",
+                                      f"Could not check {repo_name} — GitHub did not return its workflows")
     try:
-        github_sha = workflow_shas.get(formatted_workflow_name)
-
-        if github_sha is None:
-            # Workflow doesn't exist in GitHub
-            github_data = None
-        elif expected.workflow_git_hash == github_sha:
-            # SHAs match - no drift, skip fetching full content
-            sha_display = github_sha[:7] if github_sha else 'None'
-            print(f"⚪ No drift for workflow '{workflow.workflow_name}' in {repo_name} (SHA match: {sha_display})")
-            return _create_drift_status(
-                workflow_name=workflow.workflow_name,
-                has_drift=False,
-                github_content=expected.workflow_yaml,  # Use local as proxy since they match
-                local_content=expected.workflow_yaml,
-                github_sha=github_sha,
-                local_sha=expected.workflow_git_hash,
-                message=f"Workflow synchronized with {repo_name}",
-                drift_type="workflow",
-                repo=repo_name,
-                branch=branch,
-            )
-        else:
-            # SHA differs or workflow was never synced - fetch full content
-            print(f"🔍 SHA mismatch for workflow '{workflow.workflow_name}' in {repo_name} - fetching full content")
-            print(f"  Local SHA: {expected.workflow_git_hash}")
-            print(f"  GitHub SHA: {github_sha}")
-            github_data = get_workflow_from_github(owner, repo, formatted_workflow_name, token, default_branch=branch)
-
-        # Compare workflow content (against override-aware expected view)
-        drift_status = _compare_workflow_content(expected, github_data, repo_name, project_code, "workflow",
-                                                 db=db, project_id=project_id, branch=branch)
-        if drift_status and not drift_status.has_drift and github_data:
-            _update_workflow_hash_after_content_match(db, workflow, override, expected, github_data, repo_name)
-        return drift_status
+        return _judge_workflow(db, workflow, expected, place, workflow_shas.get(filename),
+                               targets, project_code, "workflow")
     except Exception as e:
         print(f"⚠️ Error checking workflow {workflow.workflow_name} in {repo_name}: {e}")
-        return _create_drift_status(
-            workflow_name=workflow.workflow_name,
-            # Not has_drift=False: a failed check used to be recorded as clean,
-            # which emitted drift.resolved for workflows that were still drifted.
-            has_drift=False,
-            github_content=None,
-            local_content=workflow.workflow_yaml,
-            github_sha=None,
-            local_sha=workflow.workflow_git_hash,
-            message=f"Could not check {repo_name}: {str(e)}",
-            drift_type="workflow",
-            check_failed=True,
-            repo=repo_name,
-            branch=branch,
-        )
+        # A failed check used to be recorded as clean, which emitted
+        # drift.resolved for workflows that were still drifted.
+        return _workflow_check_failed(workflow, expected, place, "workflow",
+                                      f"Could not check {repo_name}: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}")
 
 
 def _process_regular_workflows(db: Session, regular_workflows: List, repo_names: List[str],
-                              project_code: str, token: str, use_prefix: bool = True, project_id: int = None,
-                              project: "Project" = None, user: str = None) -> List[DriftStatus]:
+                               project_code: str, token: str, use_prefix: bool = True, project_id: int = None,
+                               project: "Project" = None, user: str = None,
+                               targets: Optional[dict] = None) -> List[DriftStatus]:
     """
     Process regular workflows for drift detection across multiple repositories.
     Uses Git Trees API for batch SHA comparison to minimize API calls.
 
     Yields one status per (workflow, repo, branch): a project can deliver the
     same workflow to several branches, and each is independently drifted or not.
+    ``targets`` is the project's delivery record, loaded here when not given.
 
     Returns:
         List[DriftStatus]: List of drift statuses for regular workflows
@@ -1973,6 +1555,7 @@ def _process_regular_workflows(db: Session, regular_workflows: List, repo_names:
     if not regular_workflows:
         return drift_results
 
+    targets = _drift_record(db, project_id, targets)
     repo_sha_cache = _prefetch_workflow_shas_per_repo(repo_names, token, db, project, user)
 
     # Now process each workflow
@@ -1993,7 +1576,7 @@ def _process_regular_workflows(db: Session, regular_workflows: List, repo_names:
 
             drift_status = _check_regular_workflow_in_repo(
                 db, workflow, repo_name, owner, repo, formatted_workflow_name,
-                workflow_shas, project_code, token, project_id, branch
+                workflow_shas, project_code, token, project_id, branch, targets,
             )
             if drift_status:
                 drift_results.append(drift_status)
@@ -2001,170 +1584,325 @@ def _process_regular_workflows(db: Session, regular_workflows: List, repo_names:
     return drift_results
 
 
+def _project_codeowners(db: Session, project_id: int) -> Optional[Codeowners]:
+    return db.query(Codeowners).filter(Codeowners.project_id == project_id).first()
+
+
+def _read_file_on_branch(owner: str, repo: str, path: str, branch: str, token: str,
+                         etag: Optional[str] = None) -> tuple:
+    """The file at *path* on *branch*: ({"sha", "content"} or None when absent, etag).
+
+    Conditional on *etag* when given, raising NotModified on GitHub's 304,
+    which costs no rate limit. Raises DriftCheckUnavailable when GitHub cannot
+    say what is there; that is never reported as an absent file.
+    """
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": ACCEPT_HEADER,
+        "X-GitHub-Api-Version": X_API_VERSION,
+    }
+    if etag:
+        headers["If-None-Match"] = etag
+    url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{quote(path, safe='/')}?ref={quote(branch, safe='')}"
+    response = requests.get(url, headers=headers, timeout=GITHUB_TIMEOUT_SECONDS)
+    if response.status_code == 304:
+        raise NotModified(f"{owner}/{repo}@{branch} {path} unchanged")
+    if response.status_code in (404, 409):
+        # As in fetch_workflow_tree: no such file, or an empty repository.
+        return None, None
+    if response.status_code != 200:
+        raise DriftCheckUnavailable(
+            f"GitHub returned {response.status_code} reading {path} in {owner}/{repo}@{branch}",
+            status_code=response.status_code,
+        )
+    data = response.json()
+    content = base64.b64decode(data.get("content") or "").decode("utf-8")
+    return {"sha": data.get("sha"), "content": content}, response.headers.get("ETag")
+
+
+def _fetch_file_on_branch(target, owner: str, repo: str, path: str, branch: str, token: str) -> tuple:
+    """GitHub's copy of a file read on its own on *branch*, conditional on the read *target*'s row last stored.
+
+    Returns (``_GitHubCopy``, ETag to store). A 304 replays the stored SHA and
+    keeps the stored ETag, so an untouched branch costs nothing; the content is
+    then read only if the rule needs it, as workflow drift does after its tree
+    listing. A 304 with no stored SHA refetches rather than reading as an
+    absent file.
+    """
+    row = target.row if target is not None else None
+    try:
+        found, etag = _read_file_on_branch(owner, repo, path, branch, token, row.etag if row else None)
+    except NotModified:
+        if row is not None and row.github_sha:
+            def reread():
+                found, _ = _read_file_on_branch(owner, repo, path, branch, token)
+                return found["content"] if found else None
+            return _GitHubCopy(row.github_sha, reread), deliveries.UNSET
+        found, etag = _read_file_on_branch(owner, repo, path, branch, token)
+    if found is None:
+        return _GitHubCopy(None), etag
+    return _GitHubCopy(found["sha"], content=found["content"]), etag
+
+
+class _File(NamedTuple):
+    """A file a drift check reads on its own on each (repo, branch): the project's CODEOWNERS or a custom file.
+
+    ``detail`` builds its CodeownersDriftDetail or CustomFileDriftDetail.
+    ``from_record`` files are read only where the delivery record has a row
+    for them. Anywhere else they are "not delivered yet" whatever GitHub
+    holds, so reading would only spend rate limit.
+    """
+    kind: str
+    file_id: int
+    name: str
+    path: str
+    content: str
+    detail: Callable
+    from_record: bool = False
+
+
+class _CheckRun(NamedTuple):
+    """What every read of one drift check shares; ``recorded`` is each (kind, file_id, repo_id) on the record."""
+    project: Project
+    user: str
+    token: str
+    now_iso: str
+    targets: dict
+    recorded: frozenset
+
+
+def _codeowners_file(record: Codeowners) -> _File:
+    return _File(deliveries.CODEOWNERS, record.id, CODEOWNERS_NAME, record.file_path, record.content,
+                 CodeownersDriftDetail)
+
+
+def _custom_file(cf: CustomFile) -> _File:
+    return _File(deliveries.CUSTOM_FILE, cf.id, cf.file_path, cf.file_path, cf.file_content or "",
+                 functools.partial(CustomFileDriftDetail, custom_file_id=cf.id), from_record=True)
+
+
+def _single_files(db: Session, project: Project, kind: Optional[str] = None) -> List[_File]:
+    """The project's files read one by one, of *kind* when given; not a custom file on its way out."""
+    files = []
+    record = _project_codeowners(db, project.project_id) if kind in (None, deliveries.CODEOWNERS) else None
+    if record is not None:
+        files.append(_codeowners_file(record))
+    if kind in (None, deliveries.CUSTOM_FILE):
+        files += [_custom_file(cf) for cf in db.query(CustomFile).filter(
+            CustomFile.project_id == project.project_id, CustomFile.pending_delete.is_(False),
+        ).order_by(CustomFile.id)]
+    return files
+
+
+def _reads_in_repo(run: _CheckRun, file: _File, repo_id) -> bool:
+    return not file.from_record or (file.kind, file.file_id, repo_id) in run.recorded
+
+
+def _reads_on_branch(run: _CheckRun, file: _File, repo_id, branch: str) -> bool:
+    return not file.from_record or (file.kind, file.file_id, repo_id, branch) in run.targets
+
+
+def _unchecked_file(run: _CheckRun, file: _File, repo: Repo, branch: str, reason: str) -> DriftObservation:
+    """*file* on (repo, branch) when GitHub could not say what is there: no opinion about drift."""
+    detail = file.detail(file_path=file.path, repo=repo.repo_name, repo_id=repo.repo_id, branch=branch,
+                         last_checked=run.now_iso, has_drift=False, check_failed=True,
+                         message=f"Could not check {repo.repo_name}: {reason}")
+    return DriftObservation(file.kind, file.file_id, file.name, detail)
+
+
+def _check_file_on_branch(db: Session, run: _CheckRun, file: _File, repo: Repo, branch: str) -> DriftObservation:
+    """Drift-check one file on one (repo, branch) by the rule workflows are judged by."""
+    key = (file.kind, file.file_id, repo.repo_id, branch)
+    target = run.targets.get(key)
+    path = deliveries.path_on(target.row if target is not None else None, file.path)
+    owner, name = repo.repo_name.split("/", 1)
+    try:
+        github, etag = _fetch_file_on_branch(target, owner, name, path, branch, run.token)
+        outcome = _decide_drift(db, run.targets, key, github, file.content, path=path)
+    except Exception as e:
+        print(f"⚠️ Error checking {file.name} in {repo.repo_name}@{branch}: {type(e).__name__}")
+        return _unchecked_file(run, file, repo, branch, failure_kind(e, _SHOWN_GITHUB_ERRORS))
+    detail = file.detail(
+        file_path=path, repo=repo.repo_name, repo_id=repo.repo_id, branch=branch, last_checked=run.now_iso,
+        has_drift=outcome.has_drift, deleted_in_github=outcome.deleted, github_sha=github.sha,
+        actionsmanager_sha=_delivered_sha(run.targets, key),
+        message=_drift_message(file.name, outcome, repo.repo_name),
+    )
+    return DriftObservation(file.kind, file.file_id, file.name, detail, etag)
+
+
+def _check_files_in_repo(db: Session, run: _CheckRun, files: List[_File], repo: Repo) -> List[DriftObservation]:
+    """Each file on every branch the project delivers this repo's files to, resolved as workflow drift resolves them."""
+    files = [file for file in files if _reads_in_repo(run, file, repo.repo_id)]
+    if not files or "/" not in (repo.repo_name or ""):
+        return []
+    owner, name = repo.repo_name.split("/", 1)
+    headers = {
+        "Authorization": f"token {run.token}",
+        "Accept": ACCEPT_HEADER,
+        "X-GitHub-Api-Version": X_API_VERSION,
+    }
+    try:
+        branches = _resolve_drift_branches_for_repo(db, run.project, repo.repo_name, owner, name, headers, run.user)
+    except Exception as e:
+        reason = failure_kind(e, _SHOWN_GITHUB_ERRORS)
+        return [_unchecked_file(run, file, repo, "", reason) for file in files]
+    return [
+        _check_file_on_branch(db, run, file, repo, branch)
+        for branch in branches for file in files if _reads_on_branch(run, file, repo.repo_id, branch)
+    ]
+
+
+def _collect_file_observations(db: Session, user: str, project: Project,
+                               targets: Optional[dict] = None) -> List[DriftObservation]:
+    """Check the project's CODEOWNERS and custom files on every (repo, branch) it delivers them to.
+
+    By the rule workflows are judged by (``_decide_drift``), so they can never
+    disagree. One conditional read per (file, repo, branch), so a branch
+    nobody touched costs no rate limit. ``targets`` is the project's delivery
+    record, loaded here when not given.
+    """
+    files = _single_files(db, project)
+    if not files:
+        return []
+    token = user_tokens.get(user)
+    if not token:
+        raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
+    targets = _drift_record(db, project.project_id, targets)
+    run = _CheckRun(project, user, token, datetime.now(timezone.utc).isoformat(), targets,
+                    frozenset(key[:3] for key in targets))
+    repos = db.query(Repo).join(ProjectRepo).filter(ProjectRepo.project_id == project.project_id).all()
+    observations: List[DriftObservation] = []
+    for repo in repos:
+        observations.extend(_check_files_in_repo(db, run, files, repo))
+    return observations
+
+
+def custom_file_on_github(db: Session, cf: CustomFile, repo: Repo, branch: str, token: str) -> tuple:
+    """GitHub's copy of *cf* on (repo, branch), read where its drift check reads it.
+
+    Returns ({"sha", "content"} or None when absent, the path read). One
+    contents call; raises DriftCheckUnavailable when GitHub cannot say.
+    """
+    target = deliveries.targets_for(db, cf.project_id).get((deliveries.CUSTOM_FILE, cf.id, repo.repo_id, branch))
+    path = deliveries.path_on(target.row if target is not None else None, cf.file_path)
+    owner, name = repo.repo_name.split("/", 1)
+    found, _ = _read_file_on_branch(owner, name, path, branch, token)
+    return found, path
+
+
+class _ReusableListing(NamedTuple):
+    """The reusable workflow repository's default branch and its workflow files' blob SHAs.
+
+    ``shas`` is None, never {}, when GitHub could not list it: an empty mapping
+    means "no workflow files", which made a rate limit or a revoked token
+    report every reusable workflow as deleted from GitHub.
+    """
+    branch: str
+    shas: Optional[dict]
+    error: Optional[str] = None
+    repo_missing: bool = False
+
+
+def _list_reusable_repo(owner: str, repo: str, token: str) -> _ReusableListing:
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": ACCEPT_HEADER,
+        "X-GitHub-Api-Version": X_API_VERSION
+    }
+    branch = ""
+    try:
+        branch = get_default_branch(owner, repo, headers)
+        shas = get_all_workflow_shas(owner, repo, branch, token)
+        print(f"🔍 Fetched {len(shas)} reusable workflow file SHAs from {owner}/{repo} using Trees API")
+        return _ReusableListing(branch, shas)
+    except Exception as e:
+        print(f"⚠️ Error fetching workflow SHAs from {owner}/{repo}: {e}")
+        return _ReusableListing(branch, None, failure_kind(e, _SHOWN_GITHUB_ERRORS),
+                                getattr(e, "status_code", None) == 404)
+
+
+def _reusable_repo_unlisted(db: Session, reusable_workflows: List, place: _WorkflowPlace,
+                            listing: _ReusableListing) -> List[DriftStatus]:
+    """check_failed for each reusable workflow, when GitHub could not list the repository."""
+    if listing.repo_missing:
+        # GitHub can see no such repository, so nothing was ever delivered
+        # there under a name we could check. For a workflow never delivered
+        # anywhere that is the whole story, and reporting check_failed
+        # showed the project as "Needs Attention" with "GitHub didn't
+        # respond" for a workflow nothing had delivered.
+        # _get_reusable_workflow_repo falls back to
+        # {user}/am-reuseable-workflow when an RWX project has no repo, and
+        # that repository need not exist.
+        #
+        # A delivered workflow was written to GitHub at some point, and 404
+        # cannot distinguish "the repository was deleted" from "this token
+        # can no longer see a private one" - GitHub answers 404 to both.
+        # Calling that a deletion would drive the Delete Everywhere flow on
+        # a token-scope change, which is the failure #1981 added
+        # check_failed to prevent, so those stay unchecked and visible.
+        reusable_workflows = [w for w in reusable_workflows if _may_be_on_unreachable_repo(db, w)]
+        if not reusable_workflows:
+            print(f"ℹ️  {place.repo_name} does not exist; its reusable "
+                  f"workflows have never been delivered, so there is nothing to check")
+    return [
+        _workflow_check_failed(w, _expected_yaml(w), place, "reusable_workflow",
+                               f"Could not check {place.repo_name}: {listing.error}")
+        for w in reusable_workflows
+        if w.workflow_name and w.workflow_name.strip()
+    ]
+
+
+def _check_reusable_workflow(db: Session, workflow, place: _WorkflowPlace, github_sha: Optional[str],
+                             targets: dict, project_code: str) -> Optional[DriftStatus]:
+    try:
+        return _judge_workflow(db, workflow, _expected_yaml(workflow), place, github_sha, targets,
+                               project_code, "reusable_workflow")
+    except Exception as e:
+        print(f"⚠️ Error checking reusable workflow {workflow.workflow_name} in {place.repo_name}: {e}")
+        # Not a clean result: an unchecked workflow used to be recorded
+        # as resolved, silently clearing genuine drift.
+        return _workflow_check_failed(workflow, _expected_yaml(workflow), place, "reusable_workflow",
+                                      f"Could not check {place.repo_name}: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}")
+
+
 def _process_reusable_workflows(db: Session, reusable_workflows: List, user: str,
-                               project_code: str, token: str, use_prefix: bool = True,
-                               reusable_repo_name: str = None, project_id: int = None) -> List[DriftStatus]:
+                                project_code: str, token: str, use_prefix: bool = True,
+                                reusable_repo_name: str = None, project_id: Optional[int] = None,
+                                targets: Optional[dict] = None) -> List[DriftStatus]:
     """
     Process reusable workflows for drift detection in the dedicated reusable workflow repository.
     Uses Git Trees API for batch SHA comparison to minimize API calls.
-    
+    ``targets`` is the owning project's delivery record, loaded here when not given.
+
     Returns:
         List[DriftStatus]: List of drift statuses for reusable workflows
     """
-    drift_results = []
-    
     if not reusable_workflows:
-        return drift_results
-
+        return []
     if not reusable_repo_name:
         reusable_repo_name = f"{user}/am-reuseable-workflow"
     if "/" not in reusable_repo_name:
-        return drift_results
-        
+        return []
+
     owner, repo = reusable_repo_name.split("/", 1)
+    listing = _list_reusable_repo(owner, repo, token)
+    place = _WorkflowPlace(reusable_repo_name, owner, repo, listing.branch, "", token)
+    if listing.shas is None:
+        return _reusable_repo_unlisted(db, reusable_workflows, place, listing)
 
-    default_branch = ""
-    prefetch_error = None
-    repo_missing = False
-    try:
-        # Get default branch for the reusable workflow repo
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": ACCEPT_HEADER,
-            "X-GitHub-Api-Version": X_API_VERSION
-        }
-        default_branch = get_default_branch(owner, repo, headers)
-
-        # Fetch all workflow SHAs in one API call using Git Trees API
-        all_workflow_shas = get_all_workflow_shas(owner, repo, default_branch, token)
-
-        print(f"🔍 Fetched {len(all_workflow_shas)} reusable workflow file SHAs from {reusable_repo_name} using Trees API")
-
-    except Exception as e:
-        # None, not {} — same distinction _prefetch_workflow_shas_per_repo makes.
-        # An empty mapping means "this repo has no workflow files", which made a
-        # rate limit or revoked token report every reusable workflow as deleted
-        # from GitHub, and that now drives the Delete Everywhere flow.
-        print(f"⚠️ Error fetching workflow SHAs from {reusable_repo_name}: {e}")
-        all_workflow_shas = None
-        prefetch_error = str(e)
-        repo_missing = getattr(e, "status_code", None) == 404
-
-    if all_workflow_shas is None:
-        if repo_missing:
-            # GitHub can see no such repository, so nothing was ever delivered
-            # there under a name we could check. For a workflow that carries no
-            # real blob SHA that is the whole story - it has never left the
-            # database - and reporting check_failed showed the project as
-            # "Needs Attention" with "GitHub didn't respond" for a workflow
-            # nothing had delivered. That is the common case here:
-            # _get_reusable_workflow_repo falls back to
-            # {user}/am-reuseable-workflow when a project has neither an RWX
-            # repo of its own nor a link, and that repository need not exist.
-            #
-            # A workflow that does carry a real SHA was written to GitHub at
-            # some point, and 404 cannot distinguish "the repository was
-            # deleted" from "this token can no longer see a private one" -
-            # GitHub answers 404 to both. Calling that a deletion would drive
-            # the Delete Everywhere flow on a token-scope change, which is the
-            # failure #1981 added check_failed to prevent, so those stay
-            # unchecked and visible.
-            reusable_workflows = [w for w in reusable_workflows if _was_ever_delivered(w)]
-            if not reusable_workflows:
-                print(f"ℹ️  {reusable_repo_name} does not exist; its reusable "
-                      f"workflows have never been delivered, so there is nothing to check")
-        return [
-            _create_drift_status(
-                workflow_name=w.workflow_name,
-                has_drift=False,
-                github_content=None,
-                local_content=w.workflow_yaml,
-                github_sha=None,
-                local_sha=w.workflow_git_hash,
-                message=f"Could not check {reusable_repo_name}: {prefetch_error}",
-                drift_type="reusable_workflow",
-                check_failed=True,
-                repo=reusable_repo_name,
-                branch=default_branch,
-            )
-            for w in reusable_workflows
-            if w.workflow_name and w.workflow_name.strip()
-        ]
-
+    targets = _drift_record(db, project_id, targets)
+    drift_results = []
     for workflow in reusable_workflows:
-        # Skip workflows with empty or null names
         if not workflow.workflow_name or not workflow.workflow_name.strip():
             print(f"⚠️ Skipping reusable workflow with empty name (ID: {workflow.workflow_id})")
             continue
-
-        formatted_workflow_name = format_workflow_name(workflow.workflow_name, project_code, use_prefix)
-
-        try:
-            # Get the SHA for this workflow from the Trees API result
-            github_sha = all_workflow_shas.get(formatted_workflow_name)
-            
-            # Check if we need to fetch full content
-            if github_sha is None:
-                # Workflow doesn't exist in GitHub
-                github_data = None
-            elif workflow.workflow_git_hash == github_sha:
-                # SHAs match - no drift, skip fetching full content
-                sha_display = github_sha[:7] if github_sha else 'None'
-                print(f"⚪ No drift for reusable workflow '{workflow.workflow_name}' in {reusable_repo_name} (SHA match: {sha_display})")
-                
-                # Create a no-drift status without fetching content
-                drift_status = _create_drift_status(
-                    workflow_name=workflow.workflow_name,
-                    has_drift=False,
-                    github_content=workflow.workflow_yaml,  # Use local as proxy since they match
-                    local_content=workflow.workflow_yaml,
-                    github_sha=github_sha,
-                    local_sha=workflow.workflow_git_hash,
-                    message=f"Reusable workflow synchronized with {reusable_repo_name}",
-                    drift_type="reusable_workflow",
-                    repo=reusable_repo_name,
-                    branch=default_branch,
-                )
-                drift_results.append(drift_status)
-                continue
-            else:
-                # SHA differs or workflow was never synced - fetch full content
-                print(f"🔍 SHA mismatch for reusable workflow '{workflow.workflow_name}' in {reusable_repo_name} - fetching full content")
-                print(f"  Local SHA: {workflow.workflow_git_hash}")
-                print(f"  GitHub SHA: {github_sha}")
-                github_data = get_workflow_from_github(owner, repo, formatted_workflow_name, token, default_branch=default_branch)
-
-            drift_status = _compare_workflow_content(workflow, github_data, reusable_repo_name, project_code, "reusable_workflow",
-                                                     db=db, project_id=project_id, branch=default_branch)
-            if drift_status:
-                drift_results.append(drift_status)
-
-                # Update git hash if content matches (no drift) even though SHA differed
-                if not drift_status.has_drift and github_data:
-                    new_github_sha = github_data["sha"]
-                    if workflow.workflow_git_hash != new_github_sha:
-                        workflow.workflow_git_hash = new_github_sha
-                        db.commit()
-                        print(f"✅ Updated git hash for reusable workflow '{workflow.workflow_name}': {new_github_sha} (content matched despite SHA difference)")
-                        
-        except Exception as e:
-            print(f"⚠️ Error checking reusable workflow {workflow.workflow_name} in {reusable_repo_name}: {e}")
-            drift_results.append(_create_drift_status(
-                workflow_name=workflow.workflow_name,
-                # Not a clean result: an unchecked workflow used to be recorded
-                # as resolved, silently clearing genuine drift.
-                has_drift=False,
-                github_content=None,
-                local_content=workflow.workflow_yaml,
-                github_sha=None,
-                local_sha=workflow.workflow_git_hash,
-                message=f"Could not check {reusable_repo_name}: {str(e)}",
-                drift_type="reusable_workflow",
-                check_failed=True,
-                repo=reusable_repo_name,
-                branch=default_branch,
-            ))
-    
+        filename = _workflow_filename_on(db, targets, workflow, place.repo_name, place.branch,
+                                         format_workflow_name(workflow.workflow_name, project_code, use_prefix))
+        drift_status = _check_reusable_workflow(db, workflow, place._replace(filename=filename),
+                                                listing.shas.get(filename), targets, project_code)
+        if drift_status:
+            drift_results.append(drift_status)
     return drift_results
 
 
@@ -2199,17 +1937,27 @@ def _handle_deployment_variables(check_deployment_vars: bool) -> List[DriftStatu
         return []
 
 
-def detect_workflow_drift(db: Session, user: str, project_name: str, repo_names: List[str], check_deployment_vars: bool = False) -> List[DriftStatus]:
+def detect_workflow_drift(
+    db: Session,
+    user: str,
+    project_name: str,
+    repo_names: List[str],
+    check_deployment_vars: bool = False,
+    project_id: Optional[int] = None,
+    targets: Optional[dict] = None,
+) -> List[DriftStatus]:
     """
     Detect drift between workflows stored in database and workflows in GitHub repositories.
     Uses Git SHA comparison for accurate drift detection.
     Only checks workflows that belong to the current project to prevent custom workflows 
     or workflows from other projects from being flagged as drifted.
     
-    Returns a list of drift statuses for each workflow.
+    Returns a list of drift statuses for each workflow. ``targets`` is the
+    project's delivery record, loaded here when the caller has not.
     """
     # Validate user and get project information
-    token, project, project_code = _validate_user_and_get_project(db, user, project_name)
+    token, project, project_code = _validate_user_and_get_project(db, user, project_name, project_id)
+    targets = _drift_record(db, project.project_id, targets)
     
     # Get and separate workflows by type
     regular_workflows, reusable_workflows = _get_project_workflows(db, project)
@@ -2221,12 +1969,11 @@ def detect_workflow_drift(db: Session, user: str, project_name: str, repo_names:
     drift_results = []
     drift_results.extend(_process_regular_workflows(
         db, regular_workflows, repo_names, project_code, token, use_prefix,
-        project_id=project.project_id, project=project, user=user,
+        project_id=project.project_id, project=project, user=user, targets=targets,
     ))
     drift_results.extend(_process_reusable_workflows(
         db, reusable_workflows, user, project_code, token, use_prefix,
-        reusable_repo_name=_get_reusable_workflow_repo(project, user, db),
-        project_id=project.project_id
+        reusable_repo_name=_get_reusable_workflow_repo(project, user, db), targets=targets,
     ))
     drift_results.extend(_handle_deployment_variables(check_deployment_vars))
     
@@ -2276,19 +2023,26 @@ def create_workflow_version(db: Session, workflow_id: int, content: str, metadat
         # This ensures backward compatibility
         return None
 
-def _assert_name_not_held_by_tombstone(db, project_id: int, name: str, is_reusable: bool) -> None:
-    """Refuse a name a pending_delete row still owns.
+def _assert_name_free(db, project_id: int, name: str) -> None:
+    """Refuse a name a pending_delete row of this project still owns.
 
     A tombstone is a workflow queued for removal from GitHub by an open
     campaign. It keeps its name until that campaign merges and
     ``_reap_deleted_workflows`` destroys the row, because the name is what
     ``_commit_workflows_to_branch`` deletes. Letting a live workflow take the
     same name in the same project puts two rows behind one delivered path.
+
+    Either kind counts. A standard project delivers its regular and its own
+    reusable workflows to its own repositories under ``format_workflow_name``
+    (#2084), so two rows of one name are one file (#2309). A live row needs no
+    refusal here: a save finds its workflow by name across both kinds
+    (``_find_live_workflow``), so it only creates a row when no live workflow
+    has the name, and a rename onto a taken name is refused by
+    ``_rename_blocker_name_collision``.
     """
     tombstone = db.query(Workflow).join(ProjectWorkflow).filter(
         ProjectWorkflow.project_id == project_id,
         func.lower(Workflow.workflow_name) == (name or "").lower(),
-        Workflow.reusable_workflow == is_reusable,
         Workflow.pending_delete.is_(True),
     ).first()
     if tombstone:
@@ -2297,6 +2051,105 @@ def _assert_name_not_held_by_tombstone(db, project_id: int, name: str, is_reusab
             detail=(
                 f"'{tombstone.workflow_name}' is queued for removal from GitHub by an open "
                 f"PR campaign. Merge or close that campaign before reusing the name."
+            ),
+        )
+
+
+def _find_live_workflow(db, project_id: int, name: str, listed_reusable: bool):
+    """The project's live workflow of this name, preferring the kind it was listed as.
+
+    One name is one workflow (#2309), so a row of the other kind is the same
+    workflow: its trigger changed, or the client's list predates a change made
+    elsewhere (#2318). Preferring the listed kind still picks the row the
+    client is editing in a same-name pair left from before names were unique
+    across kinds. Case-insensitive equality, not ILIKE: '_' is a LIKE wildcard
+    and workflow names routinely contain it. pending_delete rows are excluded so
+    a save never revives a tombstone and cancels the deletion its campaign is
+    carrying.
+    """
+    rows = db.query(Workflow).join(ProjectWorkflow).filter(
+        ProjectWorkflow.project_id == project_id,
+        func.lower(Workflow.workflow_name) == (name or "").lower(),
+        Workflow.pending_delete.is_(False),
+    ).all()
+    listed = (w for w in rows if bool(w.reusable_workflow) == listed_reusable)
+    return next(listed, rows[0] if rows else None)
+
+
+def _kind_for_save(db, project_id: int, content: str, listed_reusable: bool, workflow=None) -> bool:
+    """The kind a save leaves a workflow with: its trigger decides (#2318).
+
+    ``workflow_call`` in ``on:`` makes a workflow reusable, as on GitHub. YAML
+    that does not parse, or has no ``on:``, says nothing, so the workflow keeps
+    its kind and a new one takes the kind it was listed as. An existing workflow
+    changes kind only when this save edits its YAML: a project save posts every
+    workflow, and one nobody touched keeps its kind even if the two disagree.
+    A Reusable Workflow Project's workflows stay reusable, since linked caller
+    projects call them through ``workflow_call``.
+    """
+    current = listed_reusable if workflow is None else bool(workflow.reusable_workflow)
+    declared = declared_reusable(content)
+    if declared is None or declared == current:
+        return current
+    if workflow is not None and (workflow.workflow_yaml or "") == content:
+        return current
+    project = db.query(Project).filter_by(project_id=project_id).first()
+    if project is None or project.project_type == "rwx":
+        return current
+    if workflow is not None:
+        _assert_kind_change_allowed(db, project, workflow, declared)
+    return declared
+
+
+def _assert_kind_changes_allowed(db, project_id: int, listed: list) -> None:
+    """Run a save's kind-change refusals before any of its workflows is written.
+
+    create_or_update_workflow commits each workflow as it goes, so a refusal
+    raised for the third workflow of a save would leave the first two written
+    while the client is told the save failed. ``listed`` pairs each workflow
+    with the section it came from; only one whose trigger disagrees with that
+    section can change kind, so only those are looked up.
+    """
+    for workflow, listed_reusable in listed:
+        content = (workflow.content or "").strip()
+        if not (workflow.name or "").strip() or declared_reusable(content) in (None, listed_reusable):
+            continue
+        original = getattr(workflow, "original_name", None)
+        name = original if isinstance(original, str) and original.strip() else workflow.name
+        name = _strip_duplicated_project_prefix(db, project_id, _validate_workflow_name(name))
+        existing = _find_live_workflow(db, project_id, name, listed_reusable)
+        if existing is not None:
+            _kind_for_save(db, project_id, content, listed_reusable, existing)
+
+
+def _assert_kind_change_allowed(db, project: "Project", workflow: "Workflow", reusable: bool) -> None:
+    """Refuse a kind change while it would leave state behind (#2318).
+
+    An open campaign's lock and selection are tracked per kind, so a workflow
+    it is delivering keeps its kind until the campaign merges or closes. A
+    same-name pair from before names were unique across kinds would become two
+    rows of one kind, which no lookup can tell apart.
+    """
+    kind = "reusable" if reusable else "regular"
+    if _rename_blocker_open_pr(db, project, workflow):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"'{workflow.workflow_name}' is in an open PR campaign. Merge or close that "
+                f"campaign before making it a {kind} workflow."
+            ),
+        )
+    clash = db.query(Workflow).join(ProjectWorkflow).filter(
+        ProjectWorkflow.project_id == project.project_id,
+        func.lower(Workflow.workflow_name) == workflow.workflow_name.lower(),
+        Workflow.workflow_id != workflow.workflow_id,
+    ).first()
+    if clash:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"'{workflow.workflow_name}' cannot become a {kind} workflow while this project "
+                f"has another workflow of that name. Rename one of them first."
             ),
         )
 
@@ -2330,86 +2183,74 @@ def _assert_not_case_only_rename(original_name: str, new_name: str,
 
 
 def _was_delivered_per_db(db, workflow) -> bool:
-    """Whether the database holds evidence this workflow reached GitHub.
+    """Whether this workflow may be on GitHub, from the database alone.
 
-    Two independent signals, because neither alone is complete:
-    ``workflow_git_hash`` is zeroed by any local edit, so it under-reports a
-    delivered workflow the user has since edited; ``confirmed_present_at``
-    only exists once a drift check has seen the file, so it misses a delivery
-    that predates drift. Either one is positive evidence.
+    Delivered somewhere, or carried by an open PR, per the delivery record; or
+    anything else suggesting it left the database. The record only adds
+    positive evidence: a delivery made before it existed, to a branch no drift
+    check ever saw it on, left no row, and an emptied row from a later campaign
+    that closed says nothing about that one.
 
-    Both signals fail together for a reusable workflow delivered to a repository
-    that is not one of its project's own ``ProjectRepo`` rows: drift details take
-    their repo id from that set, so no ``WorkflowDriftState`` is ever written and
-    no ``confirmed_present_at`` exists, while an ordinary local edit has already
-    zeroed the hash. That combination reported a delivered workflow as new, which
-    released the linked-consumer refusal AND skipped recording the old filename,
-    orphaning it — while the report, which asks GitHub, said "blocked". The
-    status is the third signal: a workflow still in ``new`` has never been
-    through a campaign, and anything past it may have reached GitHub.
+    "May be" is the honest reading, and the asymmetry justifies it: a false
+    "delivered" costs one DELETE that answers 404 and a conservative refusal
+    the user can act on, while a false "never delivered" silently orphans a
+    live file and breaks a caller's ``uses:`` line.
 
-    "May have" is the honest reading, and the asymmetry justifies it: a false
-    positive costs one DELETE that answers 404 (absent, not an error) and a
-    conservative refusal the user can act on, while a false negative silently
-    orphans a live file and breaks a caller's ``uses:`` line.
-
-    Deliberately DB-only. The save path must not grow GitHub round trips, and
-    unlike the read-only report there is no outage to be conservative about
-    here — the answer is deterministic either way.
+    Deliberately DB-only: the save path must not grow GitHub round trips.
     """
-    if _was_ever_delivered(workflow):
-        return True
-    if (workflow.workflow_status or "new") != "new":
-        return True
-    return db.query(WorkflowDriftState).filter(
-        WorkflowDriftState.workflow_id == workflow.workflow_id,
-        WorkflowDriftState.confirmed_present_at.isnot(None),
-    ).first() is not None
+    return (deliveries.delivered_anywhere(db, deliveries.WORKFLOW, workflow.workflow_id)
+            or deliveries.pending_anywhere(db, deliveries.WORKFLOW, workflow.workflow_id)
+            or _may_predate_delivery_record(workflow))
 
 
-def _record_rename_for_delivery(db: Session, workflow, new_name: str) -> None:
-    """Remember the delivered name so the next campaign can carry the rename.
+def _may_predate_delivery_record(file) -> bool:
+    """Whether a workflow, custom file or CODEOWNERS may have reached GitHub before file_deliveries existed:
+    a real blob SHA, or any status past "new"."""
+    if isinstance(file, CustomFile):
+        git_hash, status = file.git_hash, file.file_status
+    elif isinstance(file, Codeowners):
+        git_hash, status = file.git_hash, file.status
+    else:
+        git_hash, status = file.workflow_git_hash, file.workflow_status
+    # A local edit used to write 40 zeros where it now writes NULL; neither is a blob.
+    return bool((git_hash or "").strip("0")) or (status or "new") != "new"
 
-    Git stores no rename: it is a remove plus an add that the diff detects. So
-    delivery needs both halves, and ``workflow_name`` is about to be reassigned
-    — after that the old name is unrecoverable, because nothing else stores a
-    filename (``WorkflowVersion`` keeps content, ``WorkflowDriftState`` keys on
-    ``workflow_id`` and derives the name).
 
-    Only for a workflow that really reached GitHub. Renaming one that never did
-    has no old file to remove, and recording a name that was never delivered
-    would make every campaign try to delete a path that is not there.
+def _record_never_saw(db: Session, kind: str, file_id, file) -> bool:
+    """Whether *file* may be on GitHub although the record has never tracked it anywhere.
 
-    An outstanding rename is never overwritten. Renaming twice before delivering
-    (``ci`` → ``ci2`` → ``ci3``) must still remove ``ci.yml``, which is the only
-    name GitHub has ever seen; ``ci2`` was never delivered and deleting it would
-    be a no-op at best.
-
-    Renaming back to the delivered name cancels it instead. ``ci`` → ``ci2`` →
-    ``ci`` leaves the file GitHub already has as the one being written again, so
-    keeping the record would make the campaign delete the file it had just
-    written and remove the workflow from every repository on merge.
-
-    Compared exactly, not case-insensitively: GitHub's contents API is
-    case-sensitive, so ``ci`` → ``CI`` really is a rename with an old file to
-    remove.
-
-    The name recorded is the row's own, never the caller-supplied
-    ``original_name``: the lookup that found this row matched case-insensitively,
-    so a request naming ``ci`` can match a row stored as ``CI``. Recording the
-    request's spelling would send the removal after a path GitHub does not have,
-    and it would 404 as "already absent" while the real file stayed orphaned.
+    Only a file that may predate the record: one it has a row for, even an
+    emptied one, is one the record has been tracking.
     """
-    if workflow.renamed_from == new_name:
-        print(f"📌 Renamed back to '{new_name}'; the delivered file is the one being written")
-        workflow.renamed_from = None
-        return
-    if workflow.renamed_from:
-        return
-    if not _was_delivered_per_db(db, workflow):
-        return
-    workflow.renamed_from = workflow.workflow_name
-    print(f"📌 Recorded '{workflow.workflow_name}' as the delivered name to remove on the next campaign")
+    return _may_predate_delivery_record(file) and not deliveries.has_any_record(db, kind, file_id)
+
+
+def _may_be_on_unreachable_repo(db: Session, workflow) -> bool:
+    """Whether to keep *workflow* visible as check_failed when its repository 404s.
+
+    The record only adds positive evidence here. A workflow delivered before the
+    record existed and never seen by a drift check has no row, or only a row a
+    closed campaign emptied, even in the project's own repository; dropping it
+    would turn an unreachable repository into nothing to report (#1981).
+    """
+    return (deliveries.delivered_anywhere(db, deliveries.WORKFLOW, workflow.workflow_id)
+            or _may_predate_delivery_record(workflow))
+
+
+def _may_be_delivered_unrecorded(db: Session, workflow, repo_name: str) -> bool:
+    """Whether a workflow the record has never seen may still be on *repo_name*.
+
+    Only for a repository outside the workflow's own project, such as the
+    {user}/am-reuseable-workflow fallback. Drift records nothing there (its
+    details carry no repo id), so a delivery made there before the record
+    existed left nothing to backfill or observe, and the record's silence
+    proves nothing. Reading it as "never delivered" would downgrade a real
+    deletion, or an unreachable repository, to nothing to report (#1981).
+    """
+    if not _record_never_saw(db, deliveries.WORKFLOW, workflow.workflow_id, workflow):
+        return False
+    _, project = _resolve_workflow_owner_project(db, workflow.workflow_id)
+    return project is None or not _project_owns_repo(db, project, repo_name)
 
 
 def _assert_rename_allowed(db, project_id: int, workflow, new_name: str,
@@ -2454,6 +2295,10 @@ def create_or_update_workflow(db, workflow, project_id, is_reusable, last_modifi
     When `workflow.original_name` is provided and differs from `workflow.name`, a true rename
     is performed: the existing record is found by `original_name` and its `workflow_name` is
     updated to the new name instead of creating a duplicate entry.
+
+    `is_reusable` is the kind the caller listed the workflow as. It picks the row
+    of a same-name pair and the kind of a new workflow whose YAML says nothing;
+    otherwise the trigger decides (`_kind_for_save`, #2318). Returns the saved row.
     """
     # Normalize: strip whitespace and convert blank to None
     if last_modified_by:
@@ -2491,18 +2336,7 @@ def create_or_update_workflow(db, workflow, project_id, is_reusable, last_modifi
 
     if is_rename:
         # Look up the workflow by its previous name so we perform a true rename.
-        # Case-insensitive *equality*, not ILIKE: '_' is a single-character
-        # wildcard in SQL LIKE and workflow names routinely contain it, so
-        # renaming "ci_build" could match an unrelated "ciXbuild" and rename
-        # that instead. Same reasoning as the new-name lookup below.
-        # pending_delete rows are excluded so a rename can never resurrect a
-        # workflow that is queued for removal from GitHub.
-        existing_workflow = db.query(Workflow).join(ProjectWorkflow).filter(
-            ProjectWorkflow.project_id == project_id,
-            func.lower(Workflow.workflow_name) == original_name.lower(),
-            Workflow.reusable_workflow == is_reusable,
-            Workflow.pending_delete.is_(False)
-        ).first()
+        existing_workflow = _find_live_workflow(db, project_id, original_name, is_reusable)
 
         if existing_workflow:
             # A rename *takes* the new name, so it needs the same refusal as a
@@ -2510,21 +2344,19 @@ def create_or_update_workflow(db, workflow, project_id, is_reusable, last_modifi
             # `existing_workflow is None` block, which is exactly the branch a
             # rename skips — so renaming onto a tombstone's name produced the
             # duplicate pair the guard exists to prevent.
-            _assert_name_not_held_by_tombstone(db, project_id, new_name, is_reusable)
+            _assert_name_free(db, project_id, new_name)
             # The rest of the refusals the impact report computes. Until this
             # call existed the report could say "blocked" and the save would
             # rename anyway, orphaning the delivered file and breaking every
             # consumer's uses: line with no warning.
             _assert_rename_allowed(db, project_id, existing_workflow, new_name, last_modified_by)
 
-            _record_rename_for_delivery(db, existing_workflow, new_name)
-
             print(f"📌 ✅ Renaming workflow '{original_name}' → '{new_name}' in project {project_id}")
             existing_workflow.workflow_name = new_name
 
             # No duplicate sweep here any more. _assert_rename_allowed above
             # refuses on a strict superset of what the sweep used to match —
-            # same project, same lower(name), same kind, other row — and it
+            # same project, same lower(name), either kind, other row — and it
             # includes tombstones, which the sweep excluded. So the sweep
             # could only ever run against an empty list, including the
             # LinkedReusableWorkflow re-pointing it carried for a case that
@@ -2534,102 +2366,24 @@ def create_or_update_workflow(db, workflow, project_id, is_reusable, last_modifi
 
     if existing_workflow is None:
         # Search for an existing workflow within the current project only.
-        # Case-insensitive *equality*, not ILIKE: workflow names commonly
-        # contain '_', which is a single-character wildcard in SQL LIKE, so
-        # saving "ci_build" could match and overwrite an unrelated "ciXbuild".
-        # Same reasoning as the reusable duplicate sweep in projects.py.
-        # pending_delete rows are excluded so that saving never revives a
-        # tombstone and silently cancels the deletion its campaign is carrying.
-        existing_workflow = db.query(Workflow).join(ProjectWorkflow).filter(
-            ProjectWorkflow.project_id == project_id,
-            func.lower(Workflow.workflow_name) == (new_name or "").lower(),
-            Workflow.reusable_workflow == is_reusable,
-            Workflow.pending_delete.is_(False)
-        ).first()
+        existing_workflow = _find_live_workflow(db, project_id, new_name, is_reusable)
 
         # ...but excluding them must not let a second row take the same name.
         # Both rows format to one GitHub path, and a campaign selecting that name
         # picks up both: _commit_workflows_to_branch would then remove the file
         # and upsert it on the same AM branch, with DB order deciding which wins.
         # Refuse instead, and say what the user has to do about it.
-        _assert_name_not_held_by_tombstone(db, project_id, new_name, is_reusable)
+        _assert_name_free(db, project_id, new_name)
 
     if existing_workflow:
-        print(f"📌 ✅ Updating existing workflow in project: {existing_workflow.workflow_name}")
-        # Whether the YAML actually moved. A project save posts every workflow it
-        # holds, so settings-only saves — adding a repository, renaming the
-        # project — arrive here for workflows nobody edited. projects.py used to
-        # have its own copy of this function that never touched workflow_status;
-        # now that the duplicate is gone and this one runs on that path, an
-        # unchanged re-save flipped every synced workflow to committed_locally
-        # and the badges with it. The hash is gated with it: zeroing the drift
-        # baseline for a workflow whose content did not change would report
-        # drift that does not exist.
-        content_changed = (existing_workflow.workflow_yaml or "") != workflow.content.strip()
-        existing_workflow.workflow_yaml = workflow.content.strip()
-        existing_workflow.reusable_workflow = is_reusable
-        if content_changed:
-            # Zeros mean "modified locally" — the user does not use git here.
-            existing_workflow.workflow_git_hash = "0000000000000000000000000000000000000000"
-
-        # Check if this workflow has any open PRs before downgrading status
-        has_open_pr = False
-        try:
-            if is_reusable:
-                # Reusable workflows are canonical shared assets: any open PR
-                # campaign referencing them — from the owning RWX project or
-                # any linking caller, matched by normalized name and scoped to
-                # the owning repo(s) — keeps them globally locked.
-                has_open_pr = bool(
-                    _reusable_workflow_ids_locked_by_open_campaign(
-                        db, [existing_workflow.workflow_id]
-                    )
-                )
-            else:
-                # Regular workflows: check open PRs against this project's repo.
-                # _has_open_pr_for_workflow handles cross-project PR lookups.
-                project_repos = db.query(Repo.repo_name).join(ProjectRepo).filter(
-                    ProjectRepo.project_id == project_id
-                ).limit(1).all()
-                if project_repos:
-                    repo_name = project_repos[0][0]
-                    has_open_pr = _has_open_pr_for_workflow(db, project_id, existing_workflow.workflow_name, repo_name)
-        except Exception as e:
-            print(f"⚠️ Error checking for open PRs: {e}")
-            import traceback
-            traceback.print_exc()
-
-        # Update status: if there's an open PR, keep under_review; otherwise set to committed_locally
-        if has_open_pr:
-            # Preserve under_review status when PR is open
-            if existing_workflow.workflow_status != "under_review":
-                existing_workflow.workflow_status = "under_review"
-            print("✅ Workflow has open PR - preserving status: under_review")
-        elif content_changed:
-            # No open PR: editing a "synced" or "under_review" workflow brings it back to committed_locally
-            existing_workflow.workflow_status = "committed_locally"
-            print(f"✅ Set git hash to zeros (local modification), workflow status: committed_locally")
-
-        # Audit: record who made this change
-        if last_modified_by:
-            existing_workflow.last_modified_by = last_modified_by
-        db.commit()
-
-        # Create version entry for this update
-        create_workflow_version(
-            db,
-            existing_workflow.workflow_id,
-            workflow.content.strip(),
-            metadata={'action': 'rename' if is_rename else 'update', 'timestamp': datetime.now(timezone.utc).isoformat()}
-        )
+        _apply_workflow_update(db, existing_workflow, workflow.content.strip(), project_id, is_reusable,
+                               last_modified_by, is_rename)
     else:
         print(f"📌 Creating new workflow for project: {new_name}")
         new_workflow = Workflow(
             workflow_name=new_name,
             workflow_yaml=workflow.content.strip(),
-            reusable_workflow=is_reusable,
-            # Set hash to zeros for new workflows (not yet pushed to GitHub)
-            workflow_git_hash="0000000000000000000000000000000000000000",
+            reusable_workflow=_kind_for_save(db, project_id, workflow.content.strip(), is_reusable),
             # New workflows start with "new" status
             workflow_status="new",
             # Audit: record who created this workflow
@@ -2647,7 +2401,7 @@ def create_or_update_workflow(db, workflow, project_id, is_reusable, last_modifi
         ))
         db.commit()
         print(f"✅ Created project association for workflow {existing_workflow.workflow_id}")
-        print(f"✅ Set git hash to zeros (new workflow, not yet pushed), workflow status: new")
+        print("✅ New workflow, not yet pushed, workflow status: new")
         
         # Create initial version entry for this new workflow
         create_workflow_version(
@@ -2656,6 +2410,81 @@ def create_or_update_workflow(db, workflow, project_id, is_reusable, last_modifi
             workflow.content.strip(),
             metadata={'action': 'create', 'timestamp': datetime.now(timezone.utc).isoformat()}
         )
+    return existing_workflow
+
+
+def _apply_workflow_update(db, existing_workflow, content: str, project_id, is_reusable: bool,
+                           last_modified_by, is_rename: bool) -> None:
+    """Save *content* to an existing workflow, for create_or_update_workflow."""
+    print(f"📌 ✅ Updating existing workflow in project: {existing_workflow.workflow_name}")
+    # Whether the YAML actually moved. A project save posts every workflow it
+    # holds, so settings-only saves — adding a repository, renaming the
+    # project — arrive here for workflows nobody edited. projects.py used to
+    # have its own copy of this function that never touched workflow_status;
+    # now that the duplicate is gone and this one runs on that path, an
+    # unchanged re-save flipped every synced workflow to committed_locally
+    # and the badges with it. The hash is gated with it: an unchanged
+    # workflow is still the blob it was committed as.
+    content_changed = (existing_workflow.workflow_yaml or "") != content
+    existing_workflow.reusable_workflow = _kind_for_save(db, project_id, content, is_reusable, existing_workflow)
+    existing_workflow.workflow_yaml = content
+    if content_changed:
+        # No blob SHA for content GitHub has not been given.
+        existing_workflow.workflow_git_hash = None
+
+    # Check if this workflow has any open PRs before downgrading status.
+    # Any project's: a reusable workflow stays locked while any caller or
+    # its owning RWX project has a campaign carrying it.
+    has_open_pr = False
+    try:
+        has_open_pr = deliveries.pending_anywhere(db, deliveries.WORKFLOW, existing_workflow.workflow_id)
+    except Exception as e:
+        print(f"⚠️ Error checking for open PRs: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Update status: if there's an open PR, keep under_review; otherwise set to committed_locally
+    if has_open_pr:
+        # Preserve under_review status when PR is open
+        if existing_workflow.workflow_status != "under_review":
+            existing_workflow.workflow_status = "under_review"
+        print("✅ Workflow has open PR - preserving status: under_review")
+    elif content_changed:
+        # No open PR: editing a "synced" or "under_review" workflow brings it back to committed_locally
+        existing_workflow.workflow_status = "committed_locally"
+        print("✅ Local modification, workflow status: committed_locally")
+
+    # Audit: record who made this change
+    if last_modified_by:
+        existing_workflow.last_modified_by = last_modified_by
+    db.commit()
+    if content_changed:
+        project = db.query(Project).filter_by(project_id=project_id).first()
+        resolve_drift_for_local_edit(db, project, deliveries.WORKFLOW, existing_workflow.workflow_id, content)
+
+    # Create version entry for this update
+    create_workflow_version(
+        db,
+        existing_workflow.workflow_id,
+        content,
+        metadata={'action': 'rename' if is_rename else 'update', 'timestamp': datetime.now(timezone.utc).isoformat()}
+    )
+
+
+def _listed_kind_change(saved, listed_reusable: bool) -> list:
+    """The saved workflow, if its kind is not the one the client listed it as.
+
+    The client groups workflows by kind. When a save changed one's kind (#2318),
+    or found the client's list out of date, the response says so and the UI
+    moves the workflow to the other section without a reload.
+    """
+    if saved is None or bool(saved.reusable_workflow) == listed_reusable:
+        return []
+    return [{
+        "name": saved.workflow_name,
+        "is_reusable": bool(saved.reusable_workflow),
+        "workflow_status": saved.workflow_status,
+    }]
 
 
 def cleanup_orphaned_workflows(db: Session):
@@ -2685,6 +2514,52 @@ def cleanup_orphaned_workflows(db: Session):
         db.rollback()
 
 
+def delete_project_record(db: Session, project: Project) -> None:
+    """Remove *project* from ActionsManager, and the workflows no other project holds. Commits.
+
+    Its rows go with it: foreign keys are enforced on SQLite too (issue
+    #1811). The saved display positions are removed explicitly anyway, so the
+    cleanup does not depend on engine configuration.
+    """
+    db.query(ProjectDisplayOrder).filter(
+        ProjectDisplayOrder.project_id == project.project_id
+    ).delete(synchronize_session=False)
+    db.delete(project)
+    db.commit()
+    cleanup_orphaned_workflows(db)
+
+
+def _joined_names(carried: Optional[str], added: str) -> str:
+    names = _split_workflow_names(carried)
+    names += [name for name in _split_workflow_names(added) if name not in names]
+    return ", ".join(names)
+
+
+def _refresh_pr_row(row: ProjectPullRequest, pr_number: int, pr_url: str,
+                    campaign_id: Optional[int], is_new_pr: bool, fields: dict) -> None:
+    """Point an existing PR row at this run's pull request.
+
+    Commits added to a PR that is still open leave what it already carried
+    there, so its names are joined by this run's rather than replaced: a push
+    of one workflow onto a campaign's PR made its card, and a rollback's
+    "keep", forget the rest. A fresh PR on a reused row carries only its own.
+    """
+    carries_on = not is_new_pr and row.pr_state == "open" and row.pr_number == pr_number
+    row.pr_number = pr_number
+    row.pr_url = pr_url
+    row.pr_state = "open"
+    # A fresh GitHub PR (or a legacy row without a campaign) joins the
+    # new campaign; updates to an existing open PR stay in their campaign.
+    if campaign_id is not None and (is_new_pr or row.campaign_id is None):
+        row.campaign_id = campaign_id
+    for column, value in fields.items():
+        if value is None:
+            continue
+        if carries_on and column in ("workflow_names", "file_names"):
+            value = _joined_names(getattr(row, column), value)
+        setattr(row, column, value)
+
+
 def _save_pr_to_database(db: Session, project_id: int, repo_name: str,
                         pr_number: int, pr_url: str, branch_name: str,
                         target_branch: str, title: Optional[str] = None,
@@ -2692,7 +2567,7 @@ def _save_pr_to_database(db: Session, project_id: int, repo_name: str,
                         workflow_names: Optional[str] = None,
                         file_names: Optional[str] = None,
                         campaign_id: Optional[int] = None,
-                        is_new_pr: bool = True) -> bool:
+                        is_new_pr: bool = True) -> ProjectPullRequest:
     """
     Save or update PR information in the database.
 
@@ -2714,7 +2589,7 @@ def _save_pr_to_database(db: Session, project_id: int, repo_name: str,
             keeps its current campaign instead of moving to the new one.
 
     Returns:
-        True if the PR row was attached to ``campaign_id``, False otherwise.
+        The saved ``ProjectPullRequest`` row.
 
     Raises:
         Exception: re-raises any database error after rolling back, so callers
@@ -2728,29 +2603,11 @@ def _save_pr_to_database(db: Session, project_id: int, repo_name: str,
             branch_name=branch_name,
             target_branch=target_branch
         ).first()
+        fields = {"title": title, "author": author, "body": body,
+                  "workflow_names": workflow_names, "file_names": file_names}
 
-        attached_to_campaign = False
         if existing_pr:
-            # Update existing PR entry
-            existing_pr.pr_number = pr_number
-            existing_pr.pr_url = pr_url
-            existing_pr.pr_state = "open"
-            # A fresh GitHub PR (or a legacy row without a campaign) joins the
-            # new campaign; updates to an existing open PR stay in their campaign.
-            if campaign_id is not None and (is_new_pr or existing_pr.campaign_id is None):
-                existing_pr.campaign_id = campaign_id
-                attached_to_campaign = True
-            # Overwrite extended fields when provided
-            if title is not None:
-                existing_pr.title = title
-            if author is not None:
-                existing_pr.author = author
-            if body is not None:
-                existing_pr.body = body
-            if workflow_names is not None:
-                existing_pr.workflow_names = workflow_names
-            if file_names is not None:
-                existing_pr.file_names = file_names
+            _refresh_pr_row(existing_pr, pr_number, pr_url, campaign_id, is_new_pr, fields)
             print(f"✅ Updated PR entry in database: PR #{pr_number} for {repo_name}")
         else:
             # Create new PR entry
@@ -2763,18 +2620,14 @@ def _save_pr_to_database(db: Session, project_id: int, repo_name: str,
                 pr_state="open",
                 branch_name=branch_name,
                 target_branch=target_branch,
-                title=title,
-                author=author,
-                body=body,
-                workflow_names=workflow_names,
-                file_names=file_names,
+                **fields,
             )
             db.add(new_pr)
-            attached_to_campaign = campaign_id is not None
+            existing_pr = new_pr
             print(f"✅ Saved new PR entry to database: PR #{pr_number} for {repo_name}")
 
         db.commit()
-        return attached_to_campaign
+        return existing_pr
 
     except Exception as e:
         # Failing to record a PR (e.g. the database schema is missing the
@@ -2859,24 +2712,6 @@ def _reap_deleted_workflows(db: Session, project_id: int, workflows: list,
     return [w for w in workflows if not w.pending_delete], [w.workflow_id for w in removed]
 
 
-def _clear_completed_renames(workflows: list, new_status: str) -> None:
-    """Forget the pre-rename name once the campaign carrying it has merged.
-
-    Only on merge. ``_cancel_pending_deletes`` clears its flag when a campaign
-    is *closed*, because a closed campaign means the deletion never happened —
-    here the opposite holds. Closing a campaign leaves the old file on GitHub
-    under its old name, so the rename is still outstanding and the next campaign
-    has to carry it. Clearing on close would strand that file permanently, with
-    nothing left that knows its name.
-    """
-    if new_status != "synced_with_github":
-        return
-    for workflow in workflows:
-        if workflow.renamed_from:
-            print(f"✅ Rename of '{workflow.renamed_from}' → '{workflow.workflow_name}' is merged")
-            workflow.renamed_from = None
-
-
 def _cancel_pending_deletes(workflows: list, new_status: str) -> None:
     """Unmark workflows whose removal campaign was closed without merging.
 
@@ -2956,7 +2791,6 @@ def _update_project_workflows_status(db: Session, project_id: int, new_status: s
                 )
         workflows, removed_ids = _reap_deleted_workflows(db, project_id, workflows, new_status)
         _cancel_pending_deletes(workflows, new_status)
-        _clear_completed_renames(workflows, new_status)
         for workflow in workflows:
             workflow.workflow_status = new_status
         db.commit()
@@ -3016,7 +2850,7 @@ def _update_project_custom_files_status(
 def _update_project_codeowners_status(
     db: Session, project_id: int, new_status: str, only_if_status: Optional[str] = None
 ) -> None:
-    """Update status for all Codeowners records in a project."""
+    """Update the status of the project's CODEOWNERS file."""
     try:
         query = db.query(Codeowners).filter(Codeowners.project_id == project_id)
         if only_if_status:
@@ -3031,93 +2865,23 @@ def _update_project_codeowners_status(
         db.rollback()
 
 
-def _sync_linked_reusable_workflows_after_merge(db: Session, standard_project_id: int) -> None:
-    """Reconcile linked reusable workflows after all PRs for a caller project are merged.
-
-    When a caller (standard) project merges its last open PR, linked reusable
-    workflows that are still marked 'under_review' need to transition to
-    'synced_with_github'.  Their owning RWX project's pr_state should also
-    transition to 'synced' when no un-synced workflows remain.
-    """
-    try:
-        linked_wf_ids = _get_linked_workflow_ids_for_project(
-            db, standard_project_id, only_if_status="under_review"
-        )
-        if not linked_wf_ids:
-            return
-
-        # Global lock: workflows still referenced by an open PR campaign in
-        # any other project (a sibling caller or the owning RWX project) must
-        # stay under_review until that campaign is merged or closed.
-        locked_ids = _reusable_workflow_ids_locked_by_open_campaign(db, linked_wf_ids)
-        if locked_ids:
-            print(
-                f"🔒 Kept {len(locked_ids)} linked reusable workflow(s) under_review "
-                f"(open PR campaign in another project)"
-            )
-            linked_wf_ids = [wid for wid in linked_wf_ids if wid not in locked_ids]
-        if not linked_wf_ids:
-            return
-
-        # Transition the linked workflows to synced_with_github
-        # renamed_from goes with the status. This bulk update is the only path
-        # that syncs a reusable workflow delivered through a caller project, and
-        # _clear_completed_renames never sees those rows — so the record of the
-        # pre-rename name survived the merge that completed it. The next rename
-        # then kept the stale name (the recorder never overwrites one), the
-        # campaign after that deleted a file that was already gone, and the name
-        # in between became a permanent orphan.
-        db.query(Workflow).filter(
-            Workflow.workflow_id.in_(linked_wf_ids)
-        ).update({"workflow_status": "synced_with_github", "renamed_from": None},
-                 synchronize_session=False)
-        db.commit()
-        print(f"✅ Synced {len(linked_wf_ids)} linked reusable workflow(s) → synced_with_github")
-
-        # Determine which RWX projects own these workflows and update their pr_state
-        rwx_project_ids = (
-            db.query(LinkedReusableWorkflow.rwx_project_id)
-            .filter(LinkedReusableWorkflow.workflow_id.in_(linked_wf_ids))
-            .distinct()
-            .all()
-        )
-        for (rwx_pid,) in rwx_project_ids:
-            # Only transition to "synced" if the RWX project has no remaining
-            # under_review workflows (from any caller project or its own PRs).
-            remaining = (
-                db.query(Workflow)
-                .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
-                .filter(
-                    ProjectWorkflow.project_id == rwx_pid,
-                    Workflow.workflow_status == "under_review",
-                )
-                .count()
-            )
-            if remaining == 0:
-                _update_project_pr_state(db, rwx_pid, "synced")
-    except Exception as e:
-        print(f"❌ Error syncing linked reusable workflows after merge: {str(e)}")
-        db.rollback()
-
-
 @router.post("/api/save-workflows", responses=_responses(400, 401, 404, 409, 500))
 def save_workflows(
     payload: SaveProjectWorkflowsRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     try:
-        github_user = _resolve_github_user(x_github_user, payload.github_user)
+        github_user = account.github_user
         project = _find_project_by_name(db, github_user, payload.project_name)
 
         if not project:
             raise HTTPException(status_code=404, detail=PROJECT_ERROR)
 
         # _find_project_by_name admits any ProjectMembership, project_viewer
-        # included. Without this a viewer could save — and a save can set
-        # renamed_from, which arms a DELETE of the old file in every target
-        # repository on the next campaign. The read-only preview was already
+        # included. Without this a viewer could save — and a save can rename a
+        # delivered workflow, which arms a DELETE of the delivered file in every
+        # target repository on the next campaign. The read-only preview was already
         # gated at project_editor, so the write that performs the rename was the
         # looser of the two.
         #
@@ -3128,17 +2892,22 @@ def save_workflows(
         # raised inside the loop would leave the workflows ahead of it written.
         _require_project_editor(db, github_user, project)
 
-        # ✅ Save regular workflows
+        # Each list is the kind the client shows the workflow as; the trigger
+        # decides what it is saved as (#2318).
+        _assert_kind_changes_allowed(
+            db, project.project_id,
+            [(w, False) for w in payload.workflows] + [(w, True) for w in payload.rxworkflows],
+        )
+        kind_changes = []
         for workflow in payload.workflows:
-            is_reusable = is_reusable_workflow_yaml(workflow.content)
             print(f"✅ ✅ REG: {workflow}")
-            create_or_update_workflow(db, workflow, project.project_id, is_reusable=is_reusable, last_modified_by=github_user)
+            saved = create_or_update_workflow(db, workflow, project.project_id, is_reusable=False, last_modified_by=github_user)
+            kind_changes += _listed_kind_change(saved, False)
 
-        # ✅ Save reusable workflows
         for workflow in payload.rxworkflows:
-            is_reusable = is_reusable_workflow_yaml(workflow.content)
             print(f"✅ ❌ ❌ ❌ RW: {workflow}")
-            create_or_update_workflow(db, workflow, project.project_id, is_reusable=is_reusable, last_modified_by=github_user)
+            saved = create_or_update_workflow(db, workflow, project.project_id, is_reusable=True, last_modified_by=github_user)
+            kind_changes += _listed_kind_change(saved, True)
 
         # Update project audit trail and state
         project.last_modified_by = github_user or None
@@ -3152,7 +2921,8 @@ def save_workflows(
         return {
             "message": "Workflows saved successfully",
             "pr_state": project.pr_state,
-            "state_changed": old_state != project.pr_state
+            "state_changed": old_state != project.pr_state,
+            "kind_changes": kind_changes,
         }
     except HTTPException:
         # Re-raise HTTP exceptions as-is
@@ -3162,18 +2932,17 @@ def save_workflows(
         import traceback
         traceback.print_exc()
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error saving workflows: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error saving workflows")
 
-@router.post("/api/detect-drift", responses=_responses(401, 404, 500))
+@router.post("/api/detect-drift", responses=_responses(401, 404, 409, 500))
 def detect_drift(
     payload: DriftDetectionRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """Detect drift between local workflows and GitHub workflows."""
     try:
-        github_user = _resolve_github_user(x_github_user, payload.github_user)
+        github_user = account.github_user
         drift_statuses = detect_workflow_drift(
             db,
             github_user,
@@ -3190,79 +2959,8 @@ def detect_drift(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/api/resolve-drift", responses=_responses(400, 401, 404, 500))
-def resolve_drift(
-    payload: DriftResolutionRequest,
-    db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-):
-    """Resolve workflow drift by updating either the database or GitHub."""
-    try:
-        github_user = _resolve_github_user(x_github_user, payload.github_user)
-        if github_user not in user_tokens:
-            raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
-        
-        # Get project and workflow
-        project = _find_project_by_name(db, github_user, payload.project_name)
-        
-        if not project:
-            raise HTTPException(status_code=404, detail=PROJECT_ERROR)
-
-        # Resolving the project was the whole access check here. Drift
-        # resolution writes: "use_github" stores caller-supplied content into
-        # workflow_yaml, and the other modes commit to the repositories.
-        _require_project_editor(db, github_user, project)
-
-        workflow = (
-            db.query(Workflow)
-            .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
-            .filter(
-                Workflow.workflow_name == payload.workflow_name,
-                ProjectWorkflow.project_id == project.project_id,
-            )
-            .first()
-        )
-        if not workflow:
-            raise HTTPException(status_code=404, detail=_ERR_WORKFLOW_NOT_FOUND)
-        
-        if payload.resolution == "use_github":
-            # Update the database with GitHub content
-            if not payload.github_content:
-                raise HTTPException(status_code=400, detail="GitHub content required for this resolution")
-            
-            workflow.workflow_yaml = payload.github_content.strip()
-            
-            # Store the GitHub SHA if provided
-            if payload.github_sha:
-                workflow.workflow_git_hash = payload.github_sha
-                print(f"✅ Updated git hash for workflow '{payload.workflow_name}': {payload.github_sha}")
-            
-            db.commit()
-            
-            return {
-                "message": f"✅ Workflow '{payload.workflow_name}' updated in database with GitHub version",
-                "action": "database_updated"
-            }
-            
-        elif payload.resolution == "use_local":
-            # The local version is already correct, user should push to GitHub
-            # This is handled by the existing update-workflow endpoint
-            return {
-                "message": f"✅ Local version of '{payload.workflow_name}' is correct. Use 'Update GitHub' to sync to repositories.",
-                "action": "use_update_github"
-            }
-            
-        else:
-            raise HTTPException(status_code=400, detail="Invalid resolution. Use 'use_github' or 'use_local'")
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+        print(f"❌ Error detecting drift: {e}")
+        raise HTTPException(status_code=500, detail="Error detecting drift")
 
 # -----------------------------------------------------------------------------
 # Drift detection v2 — issue-spec endpoints
@@ -3295,7 +2993,6 @@ def _drift_status_to_detail(
         has_drift=drift_status.has_drift,
         actionsmanager_yaml=drift_status.local_content,
         github_yaml=drift_status.github_content,
-        actionsmanager_sha=drift_status.local_sha,
         github_sha=drift_status.github_sha,
         last_checked=now_iso,
         message=drift_status.message,
@@ -3400,12 +3097,15 @@ def _collect_project_drift_details(
     user: str,
     project: Project,
     only_workflow_id: Optional[int] = None,
+    targets: Optional[dict] = None,
 ) -> List[WorkflowDriftDetail]:
     """Run drift detection for a project and return spec-shaped details.
 
     When ``only_workflow_id`` is provided, the returned list is filtered to
-    that single workflow (still per repo/branch).
+    that single workflow (still per repo/branch). ``targets`` is the
+    project's delivery record, loaded here when not given.
     """
+    targets = _drift_record(db, project.project_id, targets)
     repo_names = [
         r.repo_name for r in
         db.query(Repo).join(ProjectRepo).filter(
@@ -3421,7 +3121,8 @@ def _collect_project_drift_details(
         candidate_repo_names.append(reusable_repo)
 
     statuses = detect_workflow_drift(
-        db, user, project.project_name, repo_names, check_deployment_vars=False
+        db, user, project.project_name, repo_names, check_deployment_vars=False,
+        project_id=project.project_id, targets=targets,
     )
 
     # Index workflows by name for quick lookup of workflow_id and yaml content
@@ -3458,9 +3159,15 @@ def _collect_project_drift_details(
             now_iso
         )
         if detail:
+            detail.actionsmanager_sha = _delivered_sha(targets, _drift_key(
+                db, deliveries.WORKFLOW, detail.workflow_id, detail.repo, detail.branch))
             details.append(detail)
 
     return details
+
+
+def _workflow_observations(details: List[WorkflowDriftDetail]) -> List[DriftObservation]:
+    return [DriftObservation(deliveries.WORKFLOW, d.workflow_id, d.workflow_name, d) for d in details]
 
 
 NOT_AUTHORIZED_PROJECT_DETAIL = "Not authorized for this project"
@@ -3469,40 +3176,19 @@ _ERR_INSUFFICIENT_PROJECT_ROLE = "Insufficient project permissions. Required: pr
 _ERR_REPO_NOT_IN_PROJECT = "Repository is not part of this project"
 
 
-def _require_project_editor(db: Session, github_user: str, project: Project) -> None:
+def _require_project_editor(db: Session, github_user: str, project: Project, *, settling: bool = False) -> None:
     """Require at least project_editor before writing to the project's repositories.
 
-    Drift resolution writes to GitHub — "Restore Directly" force-pushes over the
-    default branch — and so does deleting a workflow, so read-only access must
-    not be enough for either. The endpoints previously only proved the caller
-    could *see* the project, because _find_project_by_name never reads
-    ProjectMembership.project_role.
-
-    Project owners and admin workspace members always pass; everyone else needs
-    an explicit project_editor membership.
+    Drift resolution and workflow deletion write to GitHub, so seeing the
+    project is not enough. The role comes from authorization.project_role,
+    *settling* included: merging or closing a pull request still works while
+    the project is being deleted.
     """
     account = db.query(Account).filter_by(github_user=github_user).first()
-    if not account:
+    role = project_role(db, account, project, settling=settling)
+    if role is None:
         raise HTTPException(status_code=403, detail=NOT_AUTHORIZED_PROJECT_DETAIL)
-
-    # Owning the project is full rights, and owners need no membership row.
-    if project.user_id == account.user_id:
-        return
-
-    member = (
-        db.query(WorkspaceMember)
-        .filter(WorkspaceMember.user_id == account.user_id)
-        .first()
-    )
-    if member and is_project_admin(member):
-        return
-    if not member:
-        raise HTTPException(status_code=403, detail=NOT_AUTHORIZED_PROJECT_DETAIL)
-
-    effective_role = check_project_access(db, member, project.project_id)
-    if effective_role is None:
-        raise HTTPException(status_code=403, detail=NOT_AUTHORIZED_PROJECT_DETAIL)
-    if effective_role not in ("project_editor", "project_admin"):
+    if PROJECT_ROLE_LEVEL[role] < PROJECT_ROLE_LEVEL["project_editor"]:
         raise HTTPException(status_code=403, detail=_ERR_INSUFFICIENT_PROJECT_ROLE)
 
 
@@ -3680,24 +3366,17 @@ def _resolve_workflow_owner_project(db: Session, workflow_id: int):
 
 
 def _stored_project_drift_details(db: Session, project: Project) -> List[WorkflowDriftDetail]:
-    """Rebuild the drifted-workflow list from persisted state, calling nothing.
+    """Rebuild the drifted-workflow list from the delivery record, calling nothing.
 
-    Everything here is either stored on the drift-state row or already local:
-    the managed YAML and its hash come from the project's own workflow (or its
-    per-repo override), and the rest is what the last check recorded.
+    Everything here is either stored on the record's row or already local:
+    the managed YAML comes from the project's own workflow (or its per-repo
+    override), and the rest is what was delivered and what the last check saw.
 
     ``github_yaml`` is deliberately left unset. A diff is only meaningful
     against GitHub's *current* content, so the UI fetches it when the user
     opens one rather than replaying a snapshot that may already be stale.
     """
-    states = (
-        db.query(WorkflowDriftState)
-        .filter(
-            WorkflowDriftState.project_id == project.project_id,
-            WorkflowDriftState.has_drift.is_(True),
-        )
-        .all()
-    )
+    states = deliveries.drifted_rows(db, project.project_id, deliveries.WORKFLOW)
     if not states:
         return []
 
@@ -3720,7 +3399,6 @@ def _stored_project_drift_details(db: Session, project: Project) -> List[Workflo
             continue
 
         override = overrides_by_key.get((state.workflow_id, state.repo_id))
-        expected = _WorkflowExpectedView(workflow, override)
         filename = format_workflow_name(workflow.workflow_name, project.project_code or "", project.use_prefix)
         affected = _affected_repos_for(
             workflow.workflow_id, repo_name, project_repo_names, repo_id_by_name, overrides_by_key
@@ -3733,15 +3411,12 @@ def _stored_project_drift_details(db: Session, project: Project) -> List[Workflo
             repo=repo_name,
             branch=state.branch or "",
             has_drift=True,
-            actionsmanager_yaml=expected.workflow_yaml,
+            actionsmanager_yaml=_expected_yaml(workflow, override),
             github_yaml=None,          # fetched on demand — see docstring
-            actionsmanager_sha=expected.workflow_git_hash,
+            actionsmanager_sha=state.delivered_sha,
             github_sha=state.github_sha,
             last_checked=_utc_iso(state.last_checked_at) or "",
-            message=(
-                f"Workflow was deleted from {repo_name}" if state.deleted_in_github
-                else f"Workflow content differs between local and {repo_name}"
-            ),
+            message=_drift_message("Workflow", _DELETED if state.deleted_in_github else _DIFFERS, repo_name),
             project_id=project.project_id,
             repo_id=state.repo_id,
             is_shared_workflow=len(project_repo_names) > 1,
@@ -3755,16 +3430,50 @@ def _stored_project_drift_details(db: Session, project: Project) -> List[Workflo
     return details
 
 
+def _stored_file_drift_details(db: Session, project: Project, kind: str) -> list:
+    """The stored drift list's CODEOWNERS or custom-file rows, calling nothing (see _stored_project_drift_details)."""
+    details = []
+    for file in _single_files(db, project, kind):
+        rows = deliveries.drifted_rows(db, project.project_id, kind, file.file_id)
+        repo_names = dict(db.query(Repo.repo_id, Repo.repo_name).filter(Repo.repo_id.in_({row.repo_id for row in rows})))
+        details += [
+            file.detail(
+                file_path=deliveries.path_on(row, file.path),
+                repo=repo_names[row.repo_id],
+                repo_id=row.repo_id,
+                branch=row.branch or "",
+                has_drift=True,
+                actionsmanager_sha=row.delivered_sha,
+                github_sha=row.github_sha,
+                last_checked=_utc_iso(row.last_checked_at) or "",
+                message=_drift_message(file.name, _DELETED if row.deleted_in_github else _DIFFERS,
+                                       repo_names[row.repo_id]),
+                deleted_in_github=bool(row.deleted_in_github),
+            )
+            for row in rows
+        ]
+    return details
+
+
+def _drifted_of_kind(observations: List[DriftObservation], kind: str) -> list:
+    return [o.detail for o in observations if o.kind == kind and o.detail.has_drift and not o.detail.check_failed]
+
+
 def run_project_drift_check(db: Session, user: str, project: Project):
-    """Check one project for drift, persist the result, return (drifted, unchecked).
+    """Check one project for drift, persist the result, return
+    (drifted, unchecked, drifted_codeowners, drifted_custom_files).
 
     The single place a live drift check happens. Both "Check now" and the
     background sweep call this, so an automatic check can never diverge from
-    the one a user asks for.
+    the one a user asks for. ``unchecked`` holds workflow, CODEOWNERS and
+    custom-file details alike.
     """
     _reset_drift_lookup_caches(db, project.project_id)
     try:
-        details = _collect_project_drift_details(db, user, project)
+        # One read of the record for the whole check, for every kind of file.
+        targets = deliveries.targets_for(db, project.project_id)
+        details = _collect_project_drift_details(db, user, project, targets=targets)
+        observed_files = _collect_file_observations(db, user, project, targets)
     except HTTPException:
         _record_drift_check_failure(db, project, "Drift detection request failed")
         raise
@@ -3772,21 +3481,25 @@ def run_project_drift_check(db: Session, user: str, project: Project):
         _record_drift_check_failure(db, project, str(e))
         raise
 
+    files = [observation.detail for observation in observed_files]
     drifted = [d for d in details if d.has_drift and not d.check_failed]
-    unchecked = [d for d in details if d.check_failed]
+    drifted_codeowners = _drifted_of_kind(observed_files, deliveries.CODEOWNERS)
+    drifted_custom_files = _drifted_of_kind(observed_files, deliveries.CUSTOM_FILE)
+    drifted_files = drifted_codeowners + drifted_custom_files
+    unchecked = [d for d in details + files if d.check_failed]
     try:
         _cache_project_drift_summary(
             db,
             project,
-            _determine_drift_summary_status(drifted, unchecked),
-            len(drifted),
-            f"{len(unchecked)} workflow/repo pair(s) could not be checked" if unchecked else None,
+            _determine_drift_summary_status(drifted + drifted_files, unchecked),
+            len(drifted) + len(drifted_files),
+            f"{len(unchecked)} file/repo pair(s) could not be checked" if unchecked else None,
         )
-        record_drift_transitions(db, project, details)
+        record_drift_transitions(db, project, _workflow_observations(details) + observed_files)
     except Exception:
         db.rollback()
 
-    return drifted, unchecked
+    return drifted, unchecked, drifted_codeowners, drifted_custom_files
 
 
 @router.get(
@@ -3796,14 +3509,14 @@ def run_project_drift_check(db: Session, user: str, project: Project):
         401: {"description": NOT_AUTHENTICATED_DETAIL},
         403: {"description": NOT_AUTHORIZED_PROJECT_DETAIL},
         404: {"description": "Project not found"},
+        409: {"description": "More than one project has this name"},
         500: {"description": "Unexpected error while computing drift"},
     },
 )
 def get_project_drift(
     project_id: int,
-    github_user: str,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
     refresh: bool = False,
 ):
     """Project-level drift summary — all drifted workflows/repos/branches.
@@ -3816,7 +3529,7 @@ def get_project_drift(
     time of this request — otherwise "clean" would look freshly verified when
     nothing had been checked in days.
     """
-    auth_module.assert_session_owns_user(github_user, request, db)
+    github_user = account.github_user
     if github_user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
@@ -3824,19 +3537,22 @@ def get_project_drift(
     if not project:
         raise HTTPException(status_code=404, detail=PROJECT_ERROR)
 
-    # Authorization: ensure caller has access to this project via the standard
-    # _find_project_by_name() resolution (handles owner / membership / admin).
-    accessible = _find_project_by_name(db, github_user, project.project_name)
-    if not accessible or accessible.project_id != project_id:
+    # Authorization: the caller must be able to see this project (owner,
+    # membership or admin), decided by its id rather than its name.
+    if not _caller_can_see_project(db, github_user, project):
         raise HTTPException(status_code=403, detail=NOT_AUTHORIZED_PROJECT_DETAIL)
 
     if not refresh:
         drifted = _stored_project_drift_details(db, project)
+        drifted_codeowners = _stored_file_drift_details(db, project, deliveries.CODEOWNERS)
+        drifted_custom_files = _stored_file_drift_details(db, project, deliveries.CUSTOM_FILE)
         return ProjectDriftSummary(
             project_id=project.project_id,
             project_name=project.project_name,
-            drift_count=len(drifted),
+            drift_count=len(drifted) + len(drifted_codeowners) + len(drifted_custom_files),
             drifted_workflows=drifted,
+            drifted_codeowners=drifted_codeowners,
+            drifted_custom_files=drifted_custom_files,
             # None when no check has ever run — the UI must say "not checked
             # yet" rather than implying a clean result.
             last_checked=_utc_iso(project.last_drift_check_at),
@@ -3846,17 +3562,21 @@ def get_project_drift(
         )
 
     try:
-        drifted, unchecked = run_project_drift_check(db, github_user, project)
+        drifted, unchecked, drifted_codeowners, drifted_custom_files = run_project_drift_check(
+            db, github_user, project)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Drift detection failed: {e}")
+        print(f"❌ Drift detection failed: {e}")
+        raise HTTPException(status_code=500, detail="Drift detection failed")
 
     return ProjectDriftSummary(
         project_id=project.project_id,
         project_name=project.project_name,
-        drift_count=len(drifted),
+        drift_count=len(drifted) + len(drifted_codeowners) + len(drifted_custom_files),
         drifted_workflows=drifted,
+        drifted_codeowners=drifted_codeowners,
+        drifted_custom_files=drifted_custom_files,
         last_checked=datetime.now(timezone.utc).isoformat(),
         unchecked_count=len(unchecked),
         # What the check just saved, so the row and the Projects list agree.
@@ -3864,15 +3584,14 @@ def get_project_drift(
     )
 
 
-@router.get("/api/workflows/{workflow_id}/drift", response_model=WorkflowDriftResponse, responses=_responses(401, 403, 404, 500))
+@router.get("/api/workflows/{workflow_id}/drift", response_model=WorkflowDriftResponse, responses=_responses(401, 403, 404, 409, 500))
 def get_workflow_drift(
     workflow_id: int,
-    github_user: str,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     """Per-workflow drift detail — includes both YAML versions and SHAs per repo/branch."""
-    auth_module.assert_session_owns_user(github_user, request, db)
+    github_user = account.github_user
     if github_user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
@@ -3882,8 +3601,7 @@ def get_workflow_drift(
     if not project:
         raise HTTPException(status_code=404, detail="Workflow is not associated with a project")
 
-    accessible = _find_project_by_name(db, github_user, project.project_name)
-    if not accessible or accessible.project_id != project.project_id:
+    if not _caller_can_see_project(db, github_user, project):
         raise HTTPException(status_code=403, detail="Not authorized for this workflow")
 
     try:
@@ -3891,7 +3609,8 @@ def get_workflow_drift(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Drift detection failed: {e}")
+        print(f"❌ Drift detection failed: {e}")
+        raise HTTPException(status_code=500, detail="Drift detection failed")
 
     return WorkflowDriftResponse(
         workflow_id=wf.workflow_id,
@@ -3926,7 +3645,7 @@ def _direct_push_workflow_to_branch(
     Returns a dict with keys: ``status_code`` (int) and, on success, ``sha`` (str).
     """
     encoded_content = base64.b64encode(content_str.encode()).decode()
-    file_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+    file_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{path}?ref={quote(branch, safe='')}"
     sha, unchanged = _check_existing_workflow_content(file_url, encoded_content, headers, user, db)
 
     if expected_sha and sha and sha != expected_sha:
@@ -3974,7 +3693,8 @@ def _apply_use_github_resolution(
     repo: str,
     formatted_name: str,
     token: str,
-    default_branch: Optional[str] = None,
+    *,
+    branch: str,
     expected_sha: Optional[str] = None,
 ) -> dict:
     """Overwrite ``wf``'s local YAML with the current GitHub version for one repo/branch.
@@ -3985,9 +3705,9 @@ def _apply_use_github_resolution(
     once per item, since a live GitHub diff check per item would be far more
     expensive than the fetch this helper already does.
 
-    ``default_branch``, when supplied, is forwarded to
-    ``get_workflow_from_github`` to skip its repo-metadata lookup - pass it
-    when resolving several items in the same repo in one request.
+    ``branch`` is required and never empty: drift is per branch, and
+    ``get_workflow_from_github`` reads the repo's default branch when given
+    none, which imports a different file than the one the user was shown (#2300).
 
     ``expected_sha`` is the blob SHA the user's decision was based on. Adopting
     GitHub's version discards the managed YAML, so if GitHub moved on since the
@@ -3997,13 +3717,16 @@ def _apply_use_github_resolution(
     Returns {"success": bool, "github_sha": str|None, "error": str|None,
     "conflict": bool}.
     """
+    if not branch:
+        raise ValueError(_ERR_ADOPT_NEEDS_BRANCH)
     owner, repo_short = repo.split("/", 1)
-    github_data = get_workflow_from_github(owner, repo_short, formatted_name, token, default_branch=default_branch)
+    filename = _delivered_filename(db, wf, repo, branch, formatted_name)
+    github_data = get_workflow_from_github(owner, repo_short, filename, token, default_branch=branch)
     if not github_data:
         return {
             "success": False,
             "github_sha": None,
-            "error": f"Workflow '{formatted_name}' not found in {repo}",
+            "error": f"Workflow '{filename}' not found in {repo}@{branch}",
         }
 
     github_content = (github_data.get("content") or "").strip()
@@ -4015,15 +3738,15 @@ def _apply_use_github_resolution(
             "conflict": True,
             "github_sha": github_sha,
             "error": (
-                f"{formatted_name} in {repo} changed since drift was checked. "
+                f"{filename} in {repo}@{branch} changed since drift was checked. "
                 "Re-run the drift check and review the current difference before resolving."
             ),
         }
 
-    wf.workflow_yaml = github_content
-    wf.workflow_git_hash = github_sha
-    wf.last_modified_by = github_user
-    wf.workflow_status = "synced_with_github"
+    _update_project_workflow(db, wf, github_content, github_sha, github_user, renamed=filename != formatted_name)
+    # ActionsManager's copy is now what GitHub holds on this branch.
+    deliveries.record_delivered(db, deliveries.WORKFLOW, wf.workflow_id, repo, branch,
+                                _WORKFLOWS_DIR + filename, github_sha)
     db.commit()
 
     return {"success": True, "github_sha": github_sha, "error": None}
@@ -4038,7 +3761,7 @@ def _resolve_use_github_drift(db: Session, github_user: str, wf, project, payloa
 
     resolution = _apply_use_github_resolution(
         db, github_user, wf, payload.repo, formatted_name, token,
-        expected_sha=payload.expected_github_sha,
+        branch=branch, expected_sha=payload.expected_github_sha,
     )
     if not resolution["success"]:
         if resolution.get("conflict"):
@@ -4063,7 +3786,7 @@ def _resolve_use_github_drift(db: Session, github_user: str, wf, project, payloa
         # caches claiming drift that was just resolved. record_drift_transitions
         # only touches the rows it is given, and only_workflow_id scopes those
         # to this workflow.
-        record_drift_transitions(db, project, drift_details)
+        record_drift_transitions(db, project, _workflow_observations(drift_details))
         recompute_project_drift_summary(db, project)
 
         # Find the specific drift detail for this repo/branch
@@ -4126,7 +3849,7 @@ def _resolve_use_github_drift(db: Session, github_user: str, wf, project, payloa
         print(f"  ⚠️ Error re-checking drift: {drift_check_error}")
         # Database was updated, so return success but note drift check failed
         return {
-            "message": f"Workflow '{wf.workflow_name}' updated from GitHub version (drift check failed: {str(drift_check_error)})",
+            "message": f"Workflow '{wf.workflow_name}' updated from GitHub version (drift check failed: {failure_kind(drift_check_error, _SHOWN_GITHUB_ERRORS)})",
             "action": "use_github",
             "workflow_id": wf.workflow_id,
             "repo": payload.repo,
@@ -4135,6 +3858,22 @@ def _resolve_use_github_drift(db: Session, github_user: str, wf, project, payloa
             "stored_hash": wf.workflow_git_hash,
             "github_hash": github_sha,
         }
+
+
+def _campaign_selection(workflows) -> dict:
+    """The campaign selection that delivers ``workflows`` — a restore or a removal.
+
+    ``selected_workflows`` only ever selects regular rows, so a reusable one
+    named there matched nothing and the campaign opened no pull request. A
+    standard project's own reusable workflows live in its repos (#2085), so
+    restoring or removing one has to select it the way a campaign does.
+    """
+    regular = [w.workflow_name for w in workflows if not w.reusable_workflow]
+    reusable = [w.workflow_name for w in workflows if w.reusable_workflow]
+    return {
+        "selected_workflows": regular or None,
+        "selected_reusable_workflows": reusable or None,
+    }
 
 
 def _resolve_restore_actionsmanager_drift(db: Session, github_user: str, wf, project,
@@ -4162,15 +3901,22 @@ def _resolve_restore_actionsmanager_drift(db: Session, github_user: str, wf, pro
                 wf.last_modified_by = github_user
                 wf.workflow_status = "synced_with_github"
                 project.pr_state = "synced"
+                removal_error = _remove_superseded_on_target(
+                    db, deliveries.WORKFLOW, wf.workflow_id, payload.repo, branch, path,
+                    project.project_code, github_user, headers,
+                )
+                deliveries.record_delivered(db, deliveries.WORKFLOW, wf.workflow_id, payload.repo, branch,
+                                            path, result.get("sha"))
                 db.commit()
                 # GitHub now matches the managed version, so any persisted drift
                 # for this workflow/repo is stale.
-                clear_workflow_drift(db, project, wf.workflow_id, payload.repo, branch)
+                clear_drift(db, project, deliveries.WORKFLOW, wf.workflow_id, payload.repo, branch)
 
                 print(f"  ✅ Direct push successful, new SHA: {result.get('sha')}")
 
                 return {
-                    "message": f"Workflow '{wf.workflow_name}' restored to {payload.repo}@{branch} (direct commit)",
+                    "message": (f"Workflow '{wf.workflow_name}' restored to {payload.repo}@{branch} (direct commit)"
+                                + _superseded_copy_note(removal_error)),
                     "action": "restore_actionsmanager",
                     "delivery_mode": "direct",
                     "workflow_id": wf.workflow_id,
@@ -4200,10 +3946,10 @@ def _resolve_restore_actionsmanager_drift(db: Session, github_user: str, wf, pro
             # db passed explicitly. async_mode defaults False, so the
             # BackgroundTasks instance is never used.
             pr_payload = CreatePullRequestsRequest(
-                github_user=github_user,
                 project_name=project.project_name,
+                project_id=project.project_id,
                 selected_repos=[payload.repo],
-                selected_workflows=[wf.workflow_name],
+                **_campaign_selection([wf]),
             )
             pr_result = create_pull_requests(
                 pr_payload, BackgroundTasks(), db, github_user=github_user
@@ -4239,7 +3985,7 @@ def _resolve_restore_actionsmanager_drift(db: Session, github_user: str, wf, pro
         )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to restore workflow via {delivery_mode}: {e}",
+            detail=f"Failed to restore workflow via {delivery_mode}",
         )
 
 
@@ -4259,8 +4005,7 @@ def resolve_workflow_drift(
     workflow_id: int,
     payload: ResolveWorkflowDriftRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """Resolve drift for a single workflow on a specific repo/branch.
 
@@ -4268,7 +4013,7 @@ def resolve_workflow_drift(
       * ``use_github``               – overwrite local YAML with GitHub YAML and refresh hash.
       * ``restore_actionsmanager``   – push local YAML back to GitHub via PR or direct commit.
     """
-    github_user = _resolve_github_user(x_github_user, payload.github_user)
+    github_user = account.github_user
     if github_user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
@@ -4278,8 +4023,7 @@ def resolve_workflow_drift(
     if not project:
         raise HTTPException(status_code=404, detail="Workflow is not associated with a project")
 
-    accessible = _find_project_by_name(db, github_user, project.project_name)
-    if not accessible or accessible.project_id != project.project_id:
+    if not _caller_can_see_project(db, github_user, project):
         raise HTTPException(status_code=403, detail="Not authorized for this workflow")
 
     # Resolving drift writes to GitHub, so seeing the project is not enough.
@@ -4342,35 +4086,26 @@ def _validate_bulk_resolve_items(db: Session, project_id: int, items) -> list:
 def _bulk_resolve_use_github(
     db: Session, github_user: str, project: Project, resolved_items: list, token: str
 ) -> List[BulkResolveDriftItemResult]:
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": ACCEPT_HEADER,
-        "X-GitHub-Api-Version": X_API_VERSION,
-    }
-    # Cache each repo's default branch across items so N drifted workflows in
-    # the same repo cost one repo-metadata lookup, not N. Only consulted for
-    # items that somehow arrive without a branch — normally the item names the
-    # branch the user was looking at, and adopting from any other branch would
-    # import a different file than the one they were shown.
-    default_branch_cache: dict = {}
     results: List[BulkResolveDriftItemResult] = []
     for item, wf in resolved_items:
         formatted_name = format_workflow_name(wf.workflow_name, project.project_code or "", project.use_prefix)
+        # The item names the branch the user was looking at. Reading the repo
+        # default instead would import a different file than the one they were
+        # shown, so an item without one fails, as the single route's 400 does.
+        branch = (item.branch or "").strip()
+        if not branch:
+            results.append(BulkResolveDriftItemResult(
+                workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
+                success=False, message=_ERR_ADOPT_NEEDS_BRANCH,
+            ))
+            continue
         try:
-            source_branch = item.branch
-            if not source_branch:
-                if item.repo not in default_branch_cache:
-                    owner, repo_short = item.repo.split("/", 1)
-                    default_branch_cache[item.repo] = get_default_branch(owner, repo_short, headers, github_user, db)
-                source_branch = default_branch_cache[item.repo]
-
             outcome = _apply_use_github_resolution(
                 db, github_user, wf, item.repo, formatted_name, token,
-                default_branch=source_branch,
-                expected_sha=item.expected_github_sha,
+                branch=branch, expected_sha=item.expected_github_sha,
             )
             if outcome["success"]:
-                clear_workflow_drift(db, project, wf.workflow_id, item.repo, source_branch)
+                clear_drift(db, project, deliveries.WORKFLOW, wf.workflow_id, item.repo, branch)
             results.append(BulkResolveDriftItemResult(
                 workflow_id=item.workflow_id,
                 repo=item.repo,
@@ -4382,13 +4117,14 @@ def _bulk_resolve_use_github(
             db.rollback()
             results.append(BulkResolveDriftItemResult(
                 workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
-                success=False, message=f"Failed to adopt GitHub version: {e}",
+                success=False, message=f"Failed to adopt GitHub version: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}",
             ))
     return results
 
 
 def _bulk_resolve_restore_direct_push_result(
-    item, wf, push_result: dict, project: Project, github_user: str, db: Session, branch: str,
+    item, wf, push_result: dict, project: Project, github_user: str, db: Session, branch: str, path: str,
+    headers: dict,
 ) -> BulkResolveDriftItemResult:
     status_code = push_result.get("status_code")
     if status_code in (200, 201):
@@ -4396,12 +4132,19 @@ def _bulk_resolve_restore_direct_push_result(
             wf.workflow_git_hash = push_result["sha"]
         wf.last_modified_by = github_user
         wf.workflow_status = "synced_with_github"
+        removal_error = _remove_superseded_on_target(
+            db, deliveries.WORKFLOW, wf.workflow_id, item.repo, branch, path,
+            project.project_code, github_user, headers,
+        )
+        deliveries.record_delivered(db, deliveries.WORKFLOW, wf.workflow_id, item.repo, branch,
+                                    path, push_result.get("sha"))
         db.commit()
-        clear_workflow_drift(db, project, wf.workflow_id, item.repo, branch)
+        clear_drift(db, project, deliveries.WORKFLOW, wf.workflow_id, item.repo, branch)
         return BulkResolveDriftItemResult(
             workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
             success=True,
-            message=f"Workflow '{wf.workflow_name}' restored to {item.repo}@{branch} (direct commit)",
+            message=(f"Workflow '{wf.workflow_name}' restored to {item.repo}@{branch} (direct commit)"
+                     + _superseded_copy_note(removal_error)),
         )
     if status_code == 409:
         # Stale item: reported on its own row so the rest of the batch
@@ -4440,12 +4183,13 @@ def _bulk_resolve_restore_direct_item(
             commit_msg, headers, github_user, db,
             expected_sha=item.expected_github_sha,
         )
-        return _bulk_resolve_restore_direct_push_result(item, wf, push_result, project, github_user, db, branch)
+        return _bulk_resolve_restore_direct_push_result(item, wf, push_result, project, github_user, db, branch, path,
+                                                        headers)
     except Exception as e:  # noqa: BLE001 - convert unexpected errors to a per-item failure
         db.rollback()
         return BulkResolveDriftItemResult(
             workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
-            success=False, message=f"Failed to restore workflow directly: {e}",
+            success=False, message=f"Failed to restore workflow directly: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}",
         )
 
 
@@ -4490,13 +4234,12 @@ def _bulk_resolve_pr_group(
     db: Session, github_user: str, project: Project, repo: str, group: list,
 ) -> List[BulkResolveDriftItemResult]:
     """Create one PR covering every workflow in ``group`` (all share ``repo``)."""
-    workflow_names = [wf.workflow_name for _item, wf in group]
     try:
         pr_payload = CreatePullRequestsRequest(
-            github_user=github_user,
             project_name=project.project_name,
+            project_id=project.project_id,
             selected_repos=[repo],
-            selected_workflows=workflow_names,
+            **_campaign_selection([wf for _item, wf in group]),
         )
         pr_result = create_pull_requests(
             pr_payload, BackgroundTasks(), db, github_user=github_user
@@ -4523,7 +4266,7 @@ def _bulk_resolve_pr_group(
         return [
             BulkResolveDriftItemResult(
                 workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
-                success=False, message=f"Failed to create PR: {e}",
+                success=False, message=f"Failed to create PR: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}",
             )
             for item, wf in group
         ]
@@ -4567,8 +4310,7 @@ def bulk_resolve_project_drift(
     project_id: int,
     payload: BulkResolveDriftRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """Resolve drift for multiple workflows in one request.
 
@@ -4577,7 +4319,7 @@ def bulk_resolve_project_drift(
     existing per-repo loop-and-collect-results pattern already used by
     ``_handle_sync_direct_push``.
     """
-    github_user = _resolve_github_user(x_github_user, payload.github_user)
+    github_user = account.github_user
     if github_user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
@@ -4593,8 +4335,7 @@ def bulk_resolve_project_drift(
     if not project:
         raise HTTPException(status_code=404, detail=PROJECT_ERROR)
 
-    accessible = _find_project_by_name(db, github_user, project.project_name)
-    if not accessible or accessible.project_id != project_id:
+    if not _caller_can_see_project(db, github_user, project):
         raise HTTPException(status_code=403, detail=NOT_AUTHORIZED_PROJECT_DETAIL)
 
     # Bulk resolve writes to GitHub for every item, so require editor rights.
@@ -4654,13 +4395,15 @@ def _validate_adopt_github_request(
             status_code=400,
             detail=f"resolution_mode must be one of: {sorted(_VALID_RESOLUTION_MODES)}",
         )
+    if not (payload.branch or "").strip():
+        raise HTTPException(status_code=400, detail=_ERR_ADOPT_NEEDS_BRANCH)
+    payload.branch = payload.branch.strip()
 
     project = db.query(Project).filter_by(project_id=payload.project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail=PROJECT_ERROR)
 
-    accessible = _find_project_by_name(db, github_user, project.project_name)
-    if not accessible or accessible.project_id != project.project_id:
+    if not _caller_can_see_project(db, github_user, project):
         raise HTTPException(status_code=403, detail=NOT_AUTHORIZED_PROJECT_DETAIL)
 
     # Adopting can push to every project repo, so require editor rights.
@@ -4725,7 +4468,7 @@ def _fetch_github_content_and_affected_repos(
     owner: str,
     repo: str,
     token: str,
-    branch: Optional[str] = None,
+    branch: str,
 ) -> tuple:
     """Fetch GitHub workflow content and identify affected repos.
 
@@ -4740,10 +4483,9 @@ def _fetch_github_content_and_affected_repos(
     """
     github_data = get_workflow_from_github(owner, repo, formatted_name, token, default_branch=branch)
     if not github_data:
-        where = f"{source_repo.repo_name}@{branch}" if branch else source_repo.repo_name
         raise HTTPException(
             status_code=404,
-            detail=f"Workflow '{formatted_name}' not found in {where}",
+            detail=f"Workflow '{formatted_name}' not found in {source_repo.repo_name}@{branch}",
         )
     github_content = (github_data.get("content") or "").strip()
     github_sha = github_data.get("sha")
@@ -4844,12 +4586,17 @@ def _update_project_workflow(
     github_content: str,
     github_sha: str,
     github_user: str,
+    renamed: bool = False,
 ) -> None:
-    """Update the project workflow content from GitHub version."""
+    """Update the project workflow content from GitHub version.
+
+    *renamed*: GitHub holds it under the name it was delivered by, not its
+    current one, so the rename still waits for a campaign to deliver it.
+    """
     workflow.workflow_yaml = github_content
     workflow.workflow_git_hash = github_sha
     workflow.last_modified_by = github_user
-    workflow.workflow_status = "synced_with_github"
+    workflow.workflow_status = "committed_locally" if renamed else "synced_with_github"
     db.commit()
     db.refresh(workflow)
 
@@ -4900,6 +4647,61 @@ def _get_target_repos_for_sync(
     return list(affected_repos)
 
 
+def _direct_sync_to_branch(
+    db: Session,
+    project: Project,
+    workflow: Workflow,
+    repo_name: str,
+    branch: str,
+    path: str,
+    content: str,
+    commit_msg: str,
+    headers: dict,
+    github_user: str,
+) -> dict:
+    """Push one (repo, branch) for adopt_project_and_sync and report how it went.
+
+    A failure here is this target's result, not the request's: earlier targets
+    are already written, so the caller has to be able to say which (#2302).
+    """
+    owner, repo = repo_name.split("/", 1)
+    try:
+        result = _direct_push_workflow_to_branch(
+            owner, repo, branch, path, content, commit_msg, headers, github_user, db,
+        )
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Direct sync to {repo_name}@{branch} failed: {e}")
+        return {"repo": repo_name, "branch": branch, "status": "failed", "github_sha": None,
+                "error": failure_kind(e, _SHOWN_GITHUB_ERRORS)}
+
+    ok = result.get("status_code") in (200, 201)
+    error = result.get("error")
+    if ok:
+        try:
+            # The removal's failure is this synced target's error: the old copy is still there.
+            error = _remove_superseded_on_target(db, deliveries.WORKFLOW, workflow.workflow_id, repo_name, branch,
+                                                 path, project.project_code, github_user, headers)
+            deliveries.record_delivered(db, deliveries.WORKFLOW, workflow.workflow_id, repo_name, branch,
+                                        path, result.get("sha"))
+            clear_drift(db, project, deliveries.WORKFLOW, workflow.workflow_id, repo_name, branch)
+        except Exception as e:
+            # The push landed, so this target is synced; the next drift check
+            # corrects the stale row.
+            db.rollback()
+            print(f"⚠️ Synced {repo_name}@{branch} but could not record it or clear its drift: {e}")
+    return {"repo": repo_name, "branch": branch, "status": "synced" if ok else "failed",
+            "github_sha": result.get("sha"), "error": error}
+
+
+def _failed_sync_targets(entries: list) -> str:
+    """Which targets failed and why, for the message the UI shows (#2302)."""
+    return "; ".join(
+        f"{e['repo']}@{e['branch']}: {e['error']}" if e["branch"] else f"{e['repo']}: {e['error']}"
+        for e in entries if e["status"] != "synced"
+    )
+
+
 def _handle_sync_direct_push(
     db: Session,
     project: Project,
@@ -4931,36 +4733,28 @@ def _handle_sync_direct_push(
 
     for r in target_repos:
         t_owner, t_repo = r.repo_name.split("/", 1)
-        try:
-            t_branch = get_default_branch(t_owner, t_repo, headers, github_user, db)
-        except Exception as e:
-            # Report the failure for this repo instead of pushing to "main" —
-            # if we could not read the repo's metadata we do not know that
-            # "main" even exists, let alone that it is the right target.
+        # The branches a PR Campaign would deliver to, not the repo's GitHub
+        # default: a project delivering to release/* never targets main (#2301).
+        branches, branch_error = _resolve_effective_target_branches(
+            r.repo_name, t_owner, t_repo, project, db,
+            project.branch_option or "default", project.branch_regex or "",
+            project.branch_max_age_days or 30, headers, github_user,
+        )
+        if branch_error:
             all_ok = False
             sync_results["repos"].append({
-                "repo": r.repo_name,
-                "success": False,
-                "error": f"Could not resolve target branch: {e}",
+                "repo": r.repo_name, "branch": None, "status": "failed", "github_sha": None,
+                "error": branch_error["error"],
             })
             continue
 
-        result = _direct_push_workflow_to_branch(
-            t_owner, t_repo, t_branch, path, github_content,
-            commit_msg, headers, github_user, db,
-        )
-        ok = result.get("status_code") in (200, 201)
-        sync_results["repos"].append({
-            "repo": r.repo_name,
-            "branch": t_branch,
-            "status": "synced" if ok else "failed",
-            "github_sha": result.get("sha"),
-            "error": None if ok else result.get("error"),
-        })
-        if ok:
-            clear_workflow_drift(db, project, workflow.workflow_id, r.repo_name, t_branch)
-        else:
-            all_ok = False
+        for t_branch in branches:
+            entry = _direct_sync_to_branch(
+                db, project, workflow, r.repo_name, t_branch, path, github_content,
+                commit_msg, headers, github_user,
+            )
+            sync_results["repos"].append(entry)
+            all_ok = all_ok and entry["status"] == "synced"
 
     project.pr_state = "synced" if all_ok else "draft"
     db.commit()
@@ -4972,7 +4766,7 @@ def _handle_sync_direct_push(
             f"directly pushed to {len(target_repos)} repo(s)."
             if all_ok else
             f"Project workflow adopted from {source_repo.repo_name}, but "
-            f"some repos failed to sync. See sync_results."
+            f"some targets failed to sync: {_failed_sync_targets(sync_results['repos'])}"
         ),
         "resolution_mode": ADOPT_PROJECT_AND_SYNC,
         "updated_project_workflow": True,
@@ -4997,8 +4791,8 @@ def _handle_sync_pr_mode(
         dict: API response for the PR-based sync
     """
     pr_payload = CreatePullRequestsRequest(
-        github_user=github_user,
         project_name=project.project_name,
+        project_id=project.project_id,
         selected_repos=[r.repo_name for r in target_repos],
         selected_workflows=[workflow.workflow_name],
     )
@@ -5089,7 +4883,7 @@ def _handle_adopt_project_and_sync(
 @router.post(
     "/api/drift/adopt-github-version",
     responses={
-        400: {"description": "Invalid resolution_mode, delivery_mode, or repo format"},
+        400: {"description": "Invalid resolution_mode, delivery_mode or repo format, or no branch"},
         401: {"description": NOT_AUTHENTICATED_DETAIL},
         403: {"description": NOT_AUTHORIZED_PROJECT_DETAIL},
         404: {"description": "Project or workflow not found"},
@@ -5100,8 +4894,7 @@ def _handle_adopt_project_and_sync(
 def adopt_github_version(
     payload: AdoptGithubVersionRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """Scope-aware drift resolution flow.
 
@@ -5117,7 +4910,7 @@ def adopt_github_version(
         repo can intentionally diverge from the shared project workflow without
         re-triggering drift on every detection cycle.
     """
-    github_user = _resolve_github_user(x_github_user, payload.github_user)
+    github_user = account.github_user
 
     # Validate request and get entities
     project, workflow, source_repo, token, formatted_name, owner, repo = (
@@ -5125,8 +4918,9 @@ def adopt_github_version(
     )
 
     # Fetch GitHub content and identify affected repos
+    read_name = _delivered_filename(db, workflow, source_repo.repo_name, payload.branch, formatted_name)
     github_content, github_sha, affected_repos = _fetch_github_content_and_affected_repos(
-        db, project, workflow, source_repo, formatted_name, owner, repo, token, payload.branch,
+        db, project, workflow, source_repo, read_name, owner, repo, token, payload.branch,
     )
 
     # Handle CREATE_REPO_OVERRIDE mode
@@ -5137,11 +4931,14 @@ def adopt_github_version(
         )
 
     # Update project workflow for ADOPT_LOCAL_ONLY and ADOPT_PROJECT_AND_SYNC
-    _update_project_workflow(db, workflow, github_content, github_sha, github_user)
+    _update_project_workflow(db, workflow, github_content, github_sha, github_user,
+                             renamed=read_name != formatted_name)
+    deliveries.record_delivered(db, deliveries.WORKFLOW, workflow.workflow_id, source_repo.repo_name,
+                                payload.branch, _WORKFLOWS_DIR + read_name, github_sha)
     # The managed version now matches GitHub in the source repo, so its
     # persisted drift is resolved. Other repos are left alone — they may
     # legitimately still drift against the newly adopted content.
-    clear_workflow_drift(db, project, workflow.workflow_id, source_repo.repo_name, payload.branch)
+    clear_drift(db, project, deliveries.WORKFLOW, workflow.workflow_id, source_repo.repo_name, payload.branch)
 
     # Handle ADOPT_LOCAL_ONLY mode
     if payload.resolution_mode == ADOPT_LOCAL_ONLY:
@@ -5157,16 +4954,15 @@ def adopt_github_version(
 def _get_project_and_token(payload: "CreatePullRequestsRequest", db: Session, github_user: str = None):
     """Validate authentication and return (token, project).
 
-    ``github_user`` overrides ``payload.github_user`` when provided so that
-    callers can pass the header-derived identity instead of trusting the body.
+    ``github_user`` is the authenticated caller (#2241); payloads carry no caller name.
     """
-    user = github_user or payload.github_user or ""
+    user = github_user or ""
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
     if user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
     token = user_tokens[user]
-    project = _find_project_by_name(db, user, payload.project_name)
+    project = _find_project_by_name(db, user, payload.project_name, getattr(payload, "project_id", None))
     if not project:
         raise HTTPException(status_code=404, detail=PROJECT_ERROR)
     return token, project
@@ -5358,48 +5154,18 @@ def _build_custom_files_for_delivery(project: Project, payload: "CreatePullReque
     ]
 
 
-def _build_codeowners_for_delivery(project: Project, payload: "CreatePullRequestsRequest", repo_names: List[str], db: Session) -> dict:
-    """Return CODEOWNERS content keyed by repo_name, for repos both selected for
-    CODEOWNERS deployment and already in scope for this campaign (``repo_names``).
+def _build_codeowners_for_delivery(project: Project, payload: "CreatePullRequestsRequest", db: Session) -> Optional[dict]:
+    """The project's CODEOWNERS file for this PR Campaign, or None to leave it out.
 
-    Repos selected for CODEOWNERS but not in ``repo_names`` (e.g. deselected from
-    Caller Repositories) are left for the standalone ``/codeowners/deploy``
-    endpoint, which opens its own dedicated branch/PR for them.
+    Whatever its status when included, so a campaign can also put it back where
+    it drifted, or deliver it to a repository added since.
     """
-    if not payload.selected_codeowners_repos:
-        return {}
-    target_repos = set(payload.selected_codeowners_repos) & set(repo_names)
-    if not target_repos:
-        return {}
-    rows = db.query(Codeowners, Repo).join(Repo, Codeowners.repo_id == Repo.repo_id).filter(
-        Codeowners.project_id == project.project_id,
-        Repo.repo_name.in_(target_repos),
-    ).all()
-    return {
-        repo.repo_name: {
-            "file_path": co.file_path or ".github/CODEOWNERS",
-            "content": co.content,
-            "repo_id": repo.repo_id,
-            "project_id": project.project_id,
-        }
-        for co, repo in rows
-        if co.content
-    }
-
-
-def _mark_codeowners_committed(db: Session, project_id: int, repo_id: int, new_sha: str) -> None:
-    """Mark a repo's CODEOWNERS record as under_review after committing to an AM branch."""
-    try:
-        record = db.query(Codeowners).filter(
-            Codeowners.project_id == project_id, Codeowners.repo_id == repo_id
-        ).first()
-        if record:
-            record.git_hash = new_sha
-            record.status = "under_review"
-            db.commit()
-    except Exception as e:
-        print(f"❌ Error updating codeowners record after commit: {str(e)}")
-        db.rollback()
+    if not payload.include_codeowners:
+        return None
+    record = _project_codeowners(db, project.project_id)
+    if record is None or not record.content:
+        return None
+    return {"id": record.id, "file_path": record.file_path or ".github/CODEOWNERS", "content": record.content}
 
 
 def _owned_reusable_selected(project: Project, payload, db: Session) -> list:
@@ -5413,20 +5179,41 @@ def _owned_reusable_selected(project: Project, payload, db: Session) -> list:
 
     RWX projects are left alone: their own repo is already what
     _get_reusable_workflow_repo resolves to, and their prefix handling differs.
+
+    Matched by the stored name, which is what every caller sends for a workflow
+    the project owns. Normalising here also matched a linked workflow's display
+    name, so selecting a linked ``AM_RWW1_deploy.yml`` dragged in an owned
+    ``deploy`` (#2309).
     """
-    if project.project_type == "rwx" or payload.selected_reusable_workflows is None:
+    if payload.selected_reusable_workflows is None:
         return []
-    owned = db.query(Workflow).join(ProjectWorkflow).filter(
+    selected = _lowered_names(payload.selected_reusable_workflows)
+    return [
+        w for w in _owned_reusable_rows(project, db)
+        if not _delivers_to_reusable_repo(project, w) and (w.workflow_name or "").lower() in selected
+    ]
+
+
+def _delivers_to_reusable_repo(project: Project, workflow) -> bool:
+    """Whether a campaign delivers *workflow*, one *project* owns, to the reusable-workflow repository.
+
+    Only a Reusable Workflow Project's reusable workflows, which go to its
+    repository's default branch (_reusable_delivery_target). Everything else a
+    project owns, a caller project's own reusable workflows included (#2084),
+    goes to the branches it delivers its own repositories.
+    """
+    return project.project_type == "rwx" and bool(workflow.reusable_workflow)
+
+
+def _lowered_names(names) -> set:
+    return {(n or "").strip().lower() for n in names or [] if n}
+
+
+def _owned_reusable_rows(project: Project, db: Session) -> list:
+    return db.query(Workflow).join(ProjectWorkflow).filter(
         ProjectWorkflow.project_id == project.project_id,
         Workflow.reusable_workflow == True
     ).all()
-    selected_norm = {
-        _normalize_reusable_workflow_name(n) for n in payload.selected_reusable_workflows
-    }
-    return [
-        w for w in owned
-        if _normalize_reusable_workflow_name(w.workflow_name) in selected_norm
-    ]
 
 
 def _includes_regular_workflows(payload, project: Optional[Project] = None,
@@ -5468,7 +5255,7 @@ def _campaign_meta(payload, project: Project, db: Session,
     }
 
 
-def _build_regular_workflow_results(project: Project, payload: "CreatePullRequestsRequest", repo_names: List[str], headers: dict, db: Session, github_user: str = None, progress_callback=None, custom_files: Optional[List[dict]] = None, codeowners_files: Optional[dict] = None):
+def _build_regular_workflow_results(project: Project, payload: "CreatePullRequestsRequest", repo_names: List[str], headers: dict, db: Session, github_user: str = None, progress_callback=None, custom_files: Optional[List[dict]] = None, codeowners: Optional[dict] = None):
     """Process regular (non-reusable) workflows and return (results, selected_names).
 
     Regular workflows are included when the caller explicitly listed
@@ -5501,21 +5288,17 @@ def _build_regular_workflow_results(project: Project, payload: "CreatePullReques
 
     if delivered:
         workflow_dicts = [
-            {"name": w.workflow_name, "content": w.workflow_yaml,
+            {"id": w.workflow_id, "name": w.workflow_name, "content": w.workflow_yaml,
              "pending_delete": bool(w.pending_delete),
-             # The name the file still carries on GitHub. Delivered as the
-             # remove half of the rename, in the same campaign as the add, so
-             # the pull request shows a rename rather than an unrelated new
-             # file plus an orphan.
-             "renamed_from": w.renamed_from}
+             "is_reusable": bool(w.reusable_workflow)}
             for w in delivered if w.workflow_name and w.workflow_yaml
         ]
         selected_names = [w.workflow_name for w in delivered if w.workflow_name]
 
-    if not workflow_dicts and not custom_files and not codeowners_files:
+    if not workflow_dicts and not custom_files and not codeowners:
         return {}, []
 
-    user = github_user or (payload.github_user or "")
+    user = github_user or ""
     results = _process_regular_workflows_update(
         repo_names=repo_names,
         workflows=workflow_dicts,
@@ -5528,7 +5311,7 @@ def _build_regular_workflow_results(project: Project, payload: "CreatePullReques
         user=user,
         use_prefix=project.use_prefix,
         project=project,
-        codeowners_files=codeowners_files,
+        codeowners=codeowners,
         progress_callback=progress_callback,
         campaign_meta=_campaign_meta(payload, project, db, selected_names),
         custom_files=custom_files,
@@ -5609,12 +5392,8 @@ def _build_reusable_workflow_results(project: Project, payload: "CreatePullReque
     # rest of its files by _build_regular_workflow_results. Sending them here
     # too would open a second pull request against the reusable-workflow repo
     # for a file that is not in it.
-    owned = []
-    if project.project_type == "rwx":
-        owned = db.query(Workflow).join(ProjectWorkflow).filter(
-            ProjectWorkflow.project_id == project.project_id,
-            Workflow.reusable_workflow == True
-        ).all()
+    own_rows = _owned_reusable_rows(project, db)
+    owned = [w for w in own_rows if _delivers_to_reusable_repo(project, w)]
     # Workflows linked from RWX projects (standard projects)
     linked_rows = db.query(Workflow, LinkedReusableWorkflow, Project).join(
         LinkedReusableWorkflow, LinkedReusableWorkflow.workflow_id == Workflow.workflow_id
@@ -5628,9 +5407,13 @@ def _build_reusable_workflow_results(project: Project, payload: "CreatePullReque
     linked_only = [w for w in linked_rx if w.workflow_id not in seen_ids]
     all_reusable = list(owned) + linked_only
     # Normalise both sides so display names (with prefix + .yml extension) match
-    # the canonical raw stem stored in ``Workflow.workflow_name``.
+    # the canonical raw stem stored in ``Workflow.workflow_name``. A name one of
+    # this project's own reusable workflows answers to selects that workflow,
+    # not a linked one that normalises the same (#2309).
+    own_names = _lowered_names(w.workflow_name for w in own_rows if not _delivers_to_reusable_repo(project, w))
     selected_norm = {
         _normalize_reusable_workflow_name(n) for n in payload.selected_reusable_workflows
+        if (n or "").strip().lower() not in own_names
     }
     reusable_workflows = [
         w for w in all_reusable
@@ -5648,12 +5431,11 @@ def _build_reusable_workflow_results(project: Project, payload: "CreatePullReque
     if not reusable_workflows:
         return {}, []
     rxworkflow_dicts = [
-        {"name": w.workflow_name, "content": w.workflow_yaml,
-         "renamed_from": w.renamed_from}
+        {"id": w.workflow_id, "name": w.workflow_name, "content": w.workflow_yaml}
         for w in reusable_workflows if w.workflow_name and w.workflow_yaml
     ]
     selected_names = [w.workflow_name for w in reusable_workflows if w.workflow_name]
-    user = github_user or (payload.github_user or "")
+    user = github_user or ""
 
     # For linked reusable workflows in a standard (caller) project, prefix
     # behaviour must come from the owning RWX project, not the caller project.
@@ -5690,21 +5472,11 @@ def _parse_repo_branch(repo_branch: str):
     return repo_branch, "main"
 
 
-def _codeowners_merged_repos(results: dict) -> List[str]:
-    """Repo names whose CODEOWNERS content was committed onto an existing
-    workflow/custom-file PR branch in this run — the caller should skip
-    deploying a standalone CODEOWNERS PR for these."""
-    return [
-        _parse_repo_branch(repo_branch)[0]
-        for repo_branch, result in results.items()
-        if isinstance(result, dict)
-        and result.get("status") in ("pr_created", "pr_updated")
-        and result.get("codeowners_committed")
-    ]
-
-
 def _persist_single_pr(result: dict, repo_branch: str, project: Project, campaign, db: Session):
-    """Save a single PR record to the database. Returns (attached, repo_name)."""
+    """Save a single PR record, and what it carries, to the database.
+
+    Returns whether the row is attached to *campaign*.
+    """
     repo_name, target_branch = _parse_repo_branch(repo_branch)
     am_branch = result.get("branch_name") or (
         f"actions-manager/{project.project_code.lower()}"
@@ -5718,8 +5490,9 @@ def _persist_single_pr(result: dict, repo_branch: str, project: Project, campaig
         per_pr_files.append(codeowners_path)
     file_names_str = ", ".join(per_pr_files) if per_pr_files else None
     is_new_pr = result.get("status") == "pr_created"
+    campaign_id = getattr(campaign, "campaign_id", None)
     try:
-        attached = _save_pr_to_database(
+        pr_row = _save_pr_to_database(
             db=db,
             project_id=project.project_id,
             repo_name=repo_name,
@@ -5732,19 +5505,26 @@ def _persist_single_pr(result: dict, repo_branch: str, project: Project, campaig
             body=result.get("pr_body"),
             workflow_names=workflow_names_str,
             file_names=file_names_str,
-            campaign_id=campaign.campaign_id if campaign else None,
+            campaign_id=campaign_id,
             is_new_pr=is_new_pr,
         )
+        deliveries.record_pending(db, pr_row, result.get("deliveries"))
+        db.commit()
     except Exception as exc:
+        db.rollback()
+        print(f"❌ Could not record PR #{result.get('pr_number')} for {repo_name}: {exc}")
         raise HTTPException(
             status_code=500,
             detail=(
                 f"Pull request #{result.get('pr_number')} for {repo_name} was created on GitHub "
-                f"but could not be recorded in the ActionsManager database: {exc}. "
+                "but could not be recorded in the ActionsManager database. "
                 "The database schema may be out of date — restart the container or run "
                 "'python run_migrations.py' from the backend directory, then refresh PR status."
             ),
         ) from exc
+    # The campaign was created by this run, so a row carries its id only if it
+    # was attached to it.
+    attached = campaign_id is not None and pr_row.campaign_id == campaign_id
     if is_new_pr and not attached:
         raise HTTPException(
             status_code=500,
@@ -5757,10 +5537,27 @@ def _persist_single_pr(result: dict, repo_branch: str, project: Project, campaig
     return attached
 
 
-def _update_linked_workflow_statuses(db: Session, project_id: int, all_selected: List[str]):
-    """Mark linked reusable workflows as under_review after PR creation."""
-    _update_project_workflows_status(db, project_id, "under_review", workflow_names=all_selected)
-    linked_wf_ids = _get_linked_workflow_ids_for_project(db, project_id, workflow_names=all_selected)
+def _update_linked_workflow_statuses(db: Session, project: Project, project_names: List[str],
+                                    reusable_names: List[str]):
+    """Mark the workflows a campaign delivers under_review after PR creation.
+
+    A standard project's own workflows, its reusable ones included (#2084),
+    arrive in ``project_names``, so ``reusable_names`` are only the ones it
+    links. Matching one combined list against both kinds also marked a
+    same-named owned or linked workflow the campaign did not deliver, and an
+    RWX workflow under_review is locked for every project linking it (#2309).
+    An RWX project owns everything it delivers.
+    """
+    owned, linked = (
+        (project_names + reusable_names, []) if project.project_type == "rwx"
+        else (project_names, reusable_names)
+    )
+    if owned:
+        _update_project_workflows_status(db, project.project_id, "under_review", workflow_names=owned)
+    linked_wf_ids = (
+        _get_linked_workflow_ids_for_project(db, project.project_id, workflow_names=linked)
+        if linked else []
+    )
     if linked_wf_ids:
         db.query(Workflow).filter(
             Workflow.workflow_id.in_(linked_wf_ids)
@@ -5849,12 +5646,16 @@ def _build_campaign_snapshot(db: Session, project: Project, repo_names: Optional
     }
 
 
-def _save_prs_and_update_status(results: dict, project: Project, selected_workflow_names: List[str], selected_reusable_workflow_names: List[str], db: Session, github_user: Optional[str] = None, custom_file_ids: Optional[List[int]] = None, repo_names: Optional[List[str]] = None, campaign_name: Optional[str] = None, campaign_description: Optional[str] = None):
+def _save_prs_and_update_status(results: dict, project: Project, selected_workflow_names: List[str], selected_reusable_workflow_names: List[str], db: Session, github_user: Optional[str] = None, custom_file_ids: Optional[List[int]] = None, repo_names: Optional[List[str]] = None, campaign_name: Optional[str] = None, campaign_description: Optional[str] = None, project_state: str = "open"):
     """Persist PR records to the database and update project/workflow statuses.
 
     Every run that produces PR records creates a NEW unique campaign record so
     newly-created PRs are never appended to a previous campaign. PR rows whose
     existing open PR merely received new commits stay in their original campaign.
+    The project's pr_state becomes *project_state* once any PR is recorded.
+    A deletion's (PROJECT_DELETING) files are not put under review: the
+    project's state says what is happening, and a deletion called off leaves
+    each file synced where its removal did not merge (_reopen_removed_files).
 
     Returns (pr_count, campaign_id) — campaign_id is None when no campaign was created.
     """
@@ -5902,21 +5703,48 @@ def _save_prs_and_update_status(results: dict, project: Project, selected_workfl
         except Exception as exc:
             print(f"⚠️ Error recording campaign.opened notification: {exc}")
             db.rollback()
-    _update_project_pr_state(db, project.project_id, "open")
+    _update_project_pr_state(db, project.project_id, project_state)
     if all_selected:
-        _update_linked_workflow_statuses(db, project.project_id, all_selected)
-    if custom_file_ids:
-        try:
-            db.query(CustomFile).filter(
-                CustomFile.id.in_(custom_file_ids),
-                CustomFile.file_status != "synced_with_github",
-            ).update({"file_status": "under_review"}, synchronize_session=False)
-            db.commit()
-            print(f"✅ Set {len(custom_file_ids)} custom file(s) to under_review")
-        except Exception as e:
-            print(f"❌ Error setting custom files to under_review: {str(e)}")
-            db.rollback()
+        _update_linked_workflow_statuses(
+            db, project, selected_workflow_names, selected_reusable_workflow_names
+        )
+    _lock_custom_files_for_review(db, custom_file_ids)
+    if project_state != PROJECT_DELETING:
+        _lock_codeowners_for_review(db, project.project_id, actionable_results)
     return pr_count, campaign_id
+
+
+def _lock_custom_files_for_review(db: Session, custom_file_ids: Optional[List[int]]) -> None:
+    if not custom_file_ids:
+        return
+    try:
+        db.query(CustomFile).filter(
+            CustomFile.id.in_(custom_file_ids),
+            CustomFile.file_status != "synced_with_github",
+        ).update({"file_status": "under_review"}, synchronize_session=False)
+        db.commit()
+        print(f"✅ Set {len(custom_file_ids)} custom file(s) to under_review")
+    except Exception as e:
+        print(f"❌ Error setting custom files to under_review: {str(e)}")
+        db.rollback()
+
+
+def _lock_codeowners_for_review(db: Session, project_id: int, actionable_results: dict) -> None:
+    """Mark the project's CODEOWNERS under review once a PR carries it, as custom files are.
+
+    Not a copy saved again since it was committed: its hash, cleared by the
+    save, marks a change no PR carries yet, so it stays a local change to deliver.
+    """
+    if not any(result.get("codeowners_committed") for result in actionable_results.values()):
+        return
+    try:
+        record = _project_codeowners(db, project_id)
+        if record is not None and record.git_hash == deliveries.blob_sha(record.content):
+            record.status = "under_review"
+            db.commit()
+    except Exception as e:
+        print(f"❌ Error setting CODEOWNERS to under_review: {str(e)}")
+        db.rollback()
 
 
 pr_campaign_tasks = {}
@@ -5941,20 +5769,19 @@ def _run_create_pull_requests_async(task_id: str, payload: CreatePullRequestsReq
                 "Authorization": f"token {token}"
             }
             custom_files_for_delivery = _build_custom_files_for_delivery(project, payload, db)
-            codeowners_for_delivery = _build_codeowners_for_delivery(project, payload, repo_names, db)
+            codeowners_for_delivery = _build_codeowners_for_delivery(project, payload, db)
             regular_results, selected_workflow_names = _build_regular_workflow_results(
                 project, payload, repo_names, headers, db, github_user=github_user,
                 progress_callback=progress_callback, custom_files=custom_files_for_delivery,
-                codeowners_files=codeowners_for_delivery,
+                codeowners=codeowners_for_delivery,
             )
             reusable_results, selected_reusable_workflow_names = _build_reusable_workflow_results(
                 project, payload, headers, db, github_user=github_user, progress_callback=progress_callback
             )
             results = {**regular_results, **reusable_results}
-            has_codeowners = bool(payload.selected_codeowners_repos)
-            if not results and not has_codeowners:
+            if not results:
                 pr_campaign_tasks[task_id]["status"] = "error"
-                pr_campaign_tasks[task_id]["error"] = "No workflows, custom files, or CODEOWNERS repos were selected"
+                pr_campaign_tasks[task_id]["error"] = NOTHING_SELECTED_FOR_CAMPAIGN
                 return
 
             custom_file_ids = [cf["id"] for cf in custom_files_for_delivery]
@@ -5965,45 +5792,28 @@ def _run_create_pull_requests_async(task_id: str, payload: CreatePullRequestsReq
                 campaign_name=payload.campaign_name, campaign_description=payload.campaign_description,
             )
 
-            if has_codeowners and campaign_id is None:
-                # CODEOWNERS-only (or all workflow PRs were no-ops): create a campaign
-                # so CODEOWNERS PRs have somewhere to attach.
-                campaign = ProjectPRCampaign(
-                    project_id=project.project_id, created_by=github_user,
-                    campaign_name=payload.campaign_name,
-                    campaign_description=payload.campaign_description,
-                    **_build_campaign_snapshot(
-                        db, project, repo_names, results,
-                        selected_workflow_names + selected_reusable_workflow_names,
-                    ),
-                )
-                db.add(campaign)
-                db.commit()
-                db.refresh(campaign)
-                campaign_id = campaign.campaign_id
-                _update_project_pr_state(db, project.project_id, "open")
-
             pr_campaign_tasks[task_id]["status"] = "completed"
             pr_campaign_tasks[task_id]["results"] = results
             pr_campaign_tasks[task_id]["prs_created"] = pr_count
             pr_campaign_tasks[task_id]["campaign_id"] = campaign_id
-            pr_campaign_tasks[task_id]["codeowners_merged_repos"] = _codeowners_merged_repos(results)
+    except HTTPException as e:
+        # Written for the user, as the synchronous path returns it.
+        pr_campaign_tasks[task_id]["status"] = "error"
+        pr_campaign_tasks[task_id]["error"] = str(e.detail)
     except Exception as e:
         print(f"❌ Error in async PR creation: {str(e)}")
         import traceback
         traceback.print_exc()
         pr_campaign_tasks[task_id]["status"] = "error"
-        pr_campaign_tasks[task_id]["error"] = str(e)
+        pr_campaign_tasks[task_id]["error"] = "Error creating pull requests"
 
 
 @router.post("/api/create-pull-requests", responses=_responses(400, 401, 403, 404, 409, 500))
-def create_pull_requests(
+def create_pull_requests_route(
     payload: CreatePullRequestsRequest,
     background_tasks: BackgroundTasks,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-    github_user: Optional[str] = None,
+    account: auth_module.CurrentAccount,
 ):
     """
     Create pull requests for workflows in specified repositories.
@@ -6011,10 +5821,22 @@ def create_pull_requests(
     Supports both regular workflows (per-repo PRs) and reusable workflows
     (PR against the dedicated am-reuseable-workflow repository).
     """
-    # Allow internal callers to pass github_user directly; otherwise resolve from header/body
-    if github_user is None:
-        github_user = _resolve_github_user(x_github_user, payload.github_user)
+    return create_pull_requests(payload, background_tasks, db, github_user=account.github_user)
 
+
+def create_pull_requests(
+    payload: CreatePullRequestsRequest,
+    background_tasks: BackgroundTasks,
+    db: Session,
+    *,
+    github_user: str,
+):
+    """Open a PR campaign as *github_user*, who the caller has already authenticated.
+
+    The route passes the session's caller (#2241); internal callers (custom files,
+    workflow import, drift restore) pass the user they act for. It used to read
+    a ``github_user`` query parameter for them, which any HTTP client could set.
+    """
     token, project = _get_project_and_token(payload, db, github_user=github_user)
     # A campaign commits workflow files and opens pull requests across every
     # repository in the project, so proving the caller can *see* it is not
@@ -6044,18 +5866,17 @@ def create_pull_requests(
             "Authorization": f"token {token}"
         }
         custom_files_for_delivery = _build_custom_files_for_delivery(project, payload, db)
-        codeowners_for_delivery = _build_codeowners_for_delivery(project, payload, repo_names, db)
+        codeowners_for_delivery = _build_codeowners_for_delivery(project, payload, db)
         regular_results, selected_workflow_names = _build_regular_workflow_results(
             project, payload, repo_names, headers, db, github_user=github_user,
-            custom_files=custom_files_for_delivery, codeowners_files=codeowners_for_delivery,
+            custom_files=custom_files_for_delivery, codeowners=codeowners_for_delivery,
         )
         reusable_results, selected_reusable_workflow_names = _build_reusable_workflow_results(
             project, payload, headers, db, github_user=github_user
         )
         results = {**regular_results, **reusable_results}
-        has_codeowners = bool(payload.selected_codeowners_repos)
-        if not results and not has_codeowners:
-            raise HTTPException(status_code=400, detail="No workflows, custom files, or CODEOWNERS repos were selected")
+        if not results:
+            raise HTTPException(status_code=400, detail=NOTHING_SELECTED_FOR_CAMPAIGN)
         custom_file_ids = [cf["id"] for cf in custom_files_for_delivery]
         pr_count, campaign_id = _save_prs_and_update_status(
             results, project, selected_workflow_names, selected_reusable_workflow_names, db,
@@ -6063,27 +5884,11 @@ def create_pull_requests(
             repo_names=repo_names if _includes_regular_workflows(payload, project, db) else [],
             campaign_name=payload.campaign_name, campaign_description=payload.campaign_description,
         )
-        if has_codeowners and campaign_id is None:
-            campaign = ProjectPRCampaign(
-                project_id=project.project_id, created_by=github_user,
-                campaign_name=payload.campaign_name,
-                campaign_description=payload.campaign_description,
-                **_build_campaign_snapshot(
-                    db, project, repo_names, results,
-                    selected_workflow_names + selected_reusable_workflow_names,
-                ),
-            )
-            db.add(campaign)
-            db.commit()
-            db.refresh(campaign)
-            campaign_id = campaign.campaign_id
-            _update_project_pr_state(db, project.project_id, "open")
         return {
             "message": "Pull requests created successfully",
             "results": results,
             "prs_created": pr_count,
             "campaign_id": campaign_id,
-            "codeowners_merged_repos": _codeowners_merged_repos(results),
         }
     except HTTPException:
         raise
@@ -6091,7 +5896,7 @@ def create_pull_requests(
         print(f"❌ Error creating pull requests: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error creating pull requests")
 
 
 @router.get("/api/create-pull-requests/{task_id}", responses=_responses(404))
@@ -6100,15 +5905,14 @@ def get_create_pull_requests_status(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
     return pr_campaign_tasks[task_id]
 
-@router.post("/api/run-preflight-validation", responses=_responses(400, 401, 403, 404, 500))
+@router.post("/api/run-preflight-validation", responses=_responses(400, 401, 403, 404, 409, 500))
 def run_preflight_validation(
     payload: RunPreflightRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """Run project preflight in the configured validation repository."""
-    github_user = _resolve_github_user(x_github_user, payload.github_user)
+    github_user = account.github_user
     try:
         token, project = _get_project_and_token(payload, db, github_user=github_user)
         # Preflight opens a pull request in the validation repository, so it is a
@@ -6173,7 +5977,8 @@ def run_preflight_validation(
         try:
             project = _find_project_by_name(db, github_user, payload.project_name)
             if project:
-                _set_preflight_result(project, "failed", db, str(e))
+                kind = failure_kind(e, _SHOWN_GITHUB_ERRORS)
+                _set_preflight_result(project, "failed", db, f"Preflight validation failed: {kind}")
         except Exception:
             db.rollback()
         print(f"❌ Error running preflight validation: {str(e)}")
@@ -6441,16 +6246,15 @@ def _refresh_preflight_status_from_github(
     return project.last_preflight_status or derived_status, project.last_preflight_error, pr_state
 
 
-@router.get("/api/preflight-validation-status", responses=_responses(401, 404, 500))
+@router.get("/api/preflight-validation-status", responses=_responses(401, 404, 409, 500))
 def get_preflight_validation_status(
-    github_user: str,
     project_name: str,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
     refresh_from_github: bool = True,
 ):
     """Return (and optionally refresh) the project's preflight validation status."""
-    auth_module.assert_session_owns_user(github_user, request, db)
+    github_user = account.github_user
     try:
         if github_user not in user_tokens:
             raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
@@ -6738,15 +6542,14 @@ def _execute_validation_pr_merge_and_respond(
     }
 
 
-@router.patch("/api/close-preflight-validation-pr", responses=_responses(400, 401, 403, 404, 500))
+@router.patch("/api/close-preflight-validation-pr", responses=_responses(400, 401, 403, 404, 409, 500))
 def close_preflight_validation_pr(
     payload: ClosePreflightValidationRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """Close the project's validation PR and optionally delete the source branch."""
-    github_user = _resolve_github_user(x_github_user, payload.github_user)
+    github_user = account.github_user
     try:
         if github_user not in user_tokens:
             raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
@@ -6810,15 +6613,14 @@ def close_preflight_validation_pr(
         raise HTTPException(status_code=500, detail="Failed to close validation PR.")
 
 
-@router.put("/api/merge-preflight-validation-pr", responses=_responses(400, 401, 403, 404, 500))
+@router.put("/api/merge-preflight-validation-pr", responses=_responses(400, 401, 403, 404, 409, 500))
 def merge_preflight_validation_pr(
     payload: MergePreflightValidationRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """Merge the project's validation PR to approve preflight."""
-    github_user = _resolve_github_user(x_github_user, payload.github_user)
+    github_user = account.github_user
     try:
         project = _find_project_by_name(db, github_user, payload.project_name)
         if not project:
@@ -6893,60 +6695,40 @@ def _fetch_pr_state_from_github(pr, github_user: str, token: str, db: Session) -
         pr._github_action_capabilities = _derive_pr_action_capabilities(pr_data)
         pr_state = "merged" if _is_pull_request_merged(pr_data) else pr_data.get("state", "open")
 
-        if pr.pr_state != pr_state:
-            original_state = pr.pr_state
-            pr.pr_state = pr_state
-            # Backfill timestamp fields when transitioning from GitHub data
-            if pr_state == "merged" and pr.merged_at is None:
-                raw_merged_at = pr_data.get("merged_at")
-                if raw_merged_at:
-                    try:
-                        pr.merged_at = datetime.fromisoformat(raw_merged_at.replace("Z", "+00:00"))
-                    except Exception:
-                        print(f"⚠️ Could not parse merged_at for PR #{pr.pr_number}: {raw_merged_at!r}")
-                        # Leave merged_at as None rather than writing a misleading current timestamp
-                else:
-                    # GitHub did not return a merged_at value; leave the field unset
-                    pass
-            elif pr_state == "closed" and pr.closed_at is None:
-                raw_closed_at = pr_data.get("closed_at")
-                if raw_closed_at:
-                    try:
-                        pr.closed_at = datetime.fromisoformat(raw_closed_at.replace("Z", "+00:00"))
-                    except Exception:
-                        print(f"⚠️ Could not parse closed_at for PR #{pr.pr_number}: {raw_closed_at!r}")
-                        # Leave closed_at as None rather than writing a misleading current timestamp
-                else:
-                    # GitHub did not return a closed_at value; leave the field unset
-                    pass
-            # Backfill title/author if not yet stored
-            if not pr.title and pr_data.get("title"):
-                pr.title = pr_data["title"]
-            if not pr.author and pr_data.get("user", {}).get("login"):
-                pr.author = pr_data["user"]["login"]
-            try:
-                db.commit()
-                print(f"✅ Updated PR #{pr.pr_number} state to: {pr_state}")
-            except Exception as commit_err:
-                print(f"⚠️ Error persisting PR #{pr.pr_number} state: {commit_err}")
-                db.rollback()
-                pr.pr_state = original_state
-                return original_state
+        if pr.pr_state == pr_state:
+            return pr_state
+        return _apply_refreshed_outcome(db, pr, pr_state, pr_data, github_user)
 
-            # Separate try/except from the commit above: the PR-state write is
-            # already durable at this point, so a notification failure here must
-            # never be mistaken for (or trigger a rollback of) that commit.
-            try:
-                record_campaign_pr_transition(db, pr, original_state, pr_state)
-            except Exception as notify_err:
-                print(f"⚠️ Error recording campaign PR transition notification: {notify_err}")
-                db.rollback()
-
-        return pr_state
-
+    except ProjectDeleted:
+        raise
     except Exception as e:
         print(f"⚠️ Error fetching PR #{pr.pr_number} state: {e}")
         return pr.pr_state
+
+
+def _apply_refreshed_outcome(db: Session, pr, pr_state: str, pr_data: dict, github_user: str) -> str:
+    """Record the outcome a refresh found for *pr*; returns its state now.
+
+    Raises ProjectDeleted when the outcome finished the project's deletion,
+    which took *pr* and the request's other rows with it.
+    """
+    if not pr.title and pr_data.get("title"):
+        pr.title = pr_data["title"]
+    if not pr.author and pr_data.get("user", {}).get("login"):
+        pr.author = pr_data["user"]["login"]
+    # GitHub's own timestamp: a refresh can find a PR merged days ago.
+    at = _github_time(pr_data.get("merged_at" if pr_state == "merged" else "closed_at"))
+    original_state, project_id = pr.pr_state, pr.project_id
+    try:
+        deleted = apply_pr_outcome(db, pr, pr_state, at=at, github_user=github_user)
+    except Exception as commit_err:
+        print(f"⚠️ Error persisting PR #{pr.pr_number} state: {commit_err}")
+        db.rollback()
+        pr.pr_state = original_state
+        return original_state
+    if deleted:
+        raise ProjectDeleted(project_id)
+    return pr_state
 
 
 def _resolve_pr_state(pr, refresh_from_github: bool, github_user: str, token: str, db: Session) -> str:
@@ -6961,21 +6743,68 @@ def _pr_action_fields(pr) -> dict:
     return getattr(pr, "_github_action_capabilities", {}) or {}
 
 
-def _apply_all_prs_resolved_transitions(
-    db: Session, project, total_count: int, merged_count: int
-) -> None:
+def _count_workflows_under_review(db: Session, project_id: int) -> int:
+    return (
+        db.query(Workflow)
+        .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
+        .filter(
+            ProjectWorkflow.project_id == project_id,
+            Workflow.workflow_status == "under_review",
+        )
+        .count()
+    )
+
+
+def _mark_owning_rwx_projects_synced(db: Session, linked_wf_ids: list) -> None:
+    """Set pr_state synced on each owning RWX project with nothing left under review."""
+    rwx_pids = (
+        db.query(LinkedReusableWorkflow.rwx_project_id)
+        .filter(LinkedReusableWorkflow.workflow_id.in_(linked_wf_ids))
+        .distinct()
+        .all()
+    )
+    for (rwx_pid,) in rwx_pids:
+        if _count_workflows_under_review(db, rwx_pid) == 0:
+            _update_project_pr_state(db, rwx_pid, "synced")
+
+
+def _settle_linked_workflows(db: Session, project_id: int, new_wf_status: str, all_merged: bool) -> None:
+    """Move a caller project's linked reusable workflows out of review with it."""
+    linked_wf_ids = _get_linked_workflow_ids_for_project(db, project_id, only_if_status="under_review")
+    # Global lock: linked reusable workflows still referenced by an open
+    # PR campaign in another project must stay under_review.
+    locked_ids = _reusable_workflow_ids_locked_by_open_campaign(db, linked_wf_ids)
+    if locked_ids:
+        print(
+            f"🔒 Page-load sync: kept {len(locked_ids)} linked workflow(s) "
+            f"under_review (open PR campaign in another project)"
+        )
+        linked_wf_ids = [wid for wid in linked_wf_ids if wid not in locked_ids]
+    if not linked_wf_ids:
+        return
+    try:
+        db.query(Workflow).filter(
+            Workflow.workflow_id.in_(linked_wf_ids)
+        ).update({"workflow_status": new_wf_status}, synchronize_session=False)
+        db.commit()
+        print(f"✅ Page-load sync: {len(linked_wf_ids)} linked workflow(s) → {new_wf_status}")
+        if all_merged:
+            _mark_owning_rwx_projects_synced(db, linked_wf_ids)
+    except Exception as e:
+        print(f"❌ Error updating linked workflow statuses: {str(e)}")
+        db.rollback()
+
+
+def _apply_all_prs_resolved_transitions(db: Session, project, all_merged: bool) -> None:
     """Apply workflow/project state transitions after all PRs have been resolved.
 
     When every PR was merged the workflows move to *synced_with_github*; when at
     least one PR was closed without a merge they revert to *committed_locally*.
 
     This function also handles the matching updates for any linked reusable
-    workflows so the caller does not need to repeat that pattern.
+    workflows so the caller does not need to repeat that pattern. Call it
+    through settle_project_prs, which decides ``all_merged``.
     """
-    if total_count == 0:
-        return
-    all_merged = merged_count == total_count
-
     new_wf_status = "synced_with_github" if all_merged else "committed_locally"
     new_pr_state = "synced" if all_merged else "draft"
 
@@ -6984,65 +6813,12 @@ def _apply_all_prs_resolved_transitions(
     )
     _update_project_custom_files_status(db, project.project_id, new_wf_status, only_if_status="under_review")
     _update_project_codeowners_status(db, project.project_id, new_wf_status, only_if_status="under_review")
+    _settle_linked_workflows(db, project.project_id, new_wf_status, all_merged)
 
-    linked_wf_ids = _get_linked_workflow_ids_for_project(
-        db, project.project_id, only_if_status="under_review"
-    )
-    if linked_wf_ids:
-        # Global lock: linked reusable workflows still referenced by an open
-        # PR campaign in another project must stay under_review.
-        locked_ids = _reusable_workflow_ids_locked_by_open_campaign(db, linked_wf_ids)
-        if locked_ids:
-            print(
-                f"🔒 Page-load sync: kept {len(locked_ids)} linked workflow(s) "
-                f"under_review (open PR campaign in another project)"
-            )
-            linked_wf_ids = [wid for wid in linked_wf_ids if wid not in locked_ids]
-    if linked_wf_ids:
-        try:
-            db.query(Workflow).filter(
-                Workflow.workflow_id.in_(linked_wf_ids)
-            ).update({"workflow_status": new_wf_status}, synchronize_session=False)
-            db.commit()
-            print(f"✅ Page-load sync: {len(linked_wf_ids)} linked workflow(s) → {new_wf_status}")
-            if all_merged:
-                # Update pr_state for owning RWX projects whose remaining
-                # under_review workflow count drops to zero.
-                rwx_pids = (
-                    db.query(LinkedReusableWorkflow.rwx_project_id)
-                    .filter(LinkedReusableWorkflow.workflow_id.in_(linked_wf_ids))
-                    .distinct()
-                    .all()
-                )
-                for (rwx_pid,) in rwx_pids:
-                    remaining = (
-                        db.query(Workflow)
-                        .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
-                        .filter(
-                            ProjectWorkflow.project_id == rwx_pid,
-                            Workflow.workflow_status == "under_review",
-                        )
-                        .count()
-                    )
-                    if remaining == 0:
-                        _update_project_pr_state(db, rwx_pid, "synced")
-        except Exception as e:
-            print(f"❌ Error updating linked workflow statuses: {str(e)}")
-            db.rollback()
-
-    # Mirror _sync_linked_reusable_workflows_after_merge: a project is only
-    # marked resolved (synced/draft) when none of its own workflows remain
-    # under_review — e.g. an RWX project whose workflow is still locked by a
-    # caller's open PR campaign keeps its current pr_state.
-    remaining_under_review = (
-        db.query(Workflow)
-        .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
-        .filter(
-            ProjectWorkflow.project_id == project.project_id,
-            Workflow.workflow_status == "under_review",
-        )
-        .count()
-    )
+    # A project is only marked resolved (synced/draft) when none of its own
+    # workflows remain under_review — e.g. an RWX project whose workflow is
+    # still locked by a caller's open PR campaign keeps its current pr_state.
+    remaining_under_review = _count_workflows_under_review(db, project.project_id)
     if remaining_under_review:
         print(
             f"🔒 Page-load sync: kept pr_state for project {project.project_id} — "
@@ -7056,6 +6832,251 @@ def _apply_all_prs_resolved_transitions(
         print("✅ Page-load sync: all PRs merged, workflows set to synced_with_github")
     else:
         print("✅ Page-load sync: at least one PR closed without merge, workflows reverted to committed_locally")
+
+
+def _latest_campaign_prs(db: Session, project_id: int) -> list:
+    """The PR rows of the project's most recent campaign.
+
+    Closed PR rows are never removed, so judging "all merged" over the project's
+    whole history meant one campaign closed months ago kept every later merge
+    from syncing. Only projects whose PRs all predate campaigns fall back to
+    every row.
+    """
+    latest = (
+        db.query(func.max(ProjectPullRequest.campaign_id))
+        .filter(ProjectPullRequest.project_id == project_id)
+        .scalar()
+    )
+    query = db.query(ProjectPullRequest).filter(ProjectPullRequest.project_id == project_id)
+    if latest is not None:
+        query = query.filter(ProjectPullRequest.campaign_id == latest)
+    return query.all()
+
+
+def _has_files_under_review(db: Session, project) -> bool:
+    """Whether anything in the project is waiting on a PR, so settling has work to do.
+
+    Without this a page load with no open PR would stamp pr_state from the last
+    campaign's outcome, overwriting the draft state of edits made since.
+    """
+    if project.pr_state in ("open", PROJECT_DELETING):
+        return True
+    pid = project.project_id
+    if db.query(Workflow.workflow_id).join(ProjectWorkflow).filter(
+        ProjectWorkflow.project_id == pid, Workflow.workflow_status == "under_review"
+    ).first():
+        return True
+    if db.query(CustomFile.id).filter(
+        CustomFile.project_id == pid, CustomFile.file_status == "under_review"
+    ).first():
+        return True
+    if db.query(Codeowners.id).filter(
+        Codeowners.project_id == pid, Codeowners.status == "under_review"
+    ).first():
+        return True
+    return bool(_get_linked_workflow_ids_for_project(db, pid, only_if_status="under_review"))
+
+
+# What settle_project_prs returns when the PRs it settled finished the project's
+# deletion, and get_project_pr_status's project_state once the project is gone.
+PROJECT_DELETED = "deleted"
+PROJECT_DELETED_DETAIL = "Project was deleted: its removal pull requests merged"
+
+
+class ProjectDeleted(HTTPException):
+    """A PR outcome finished the deletion of project *project_id* while a request was reading its rows.
+
+    They went with it, so the request cannot carry on with them; this is its 404.
+    """
+
+    def __init__(self, project_id: int):
+        super().__init__(status_code=404, detail=PROJECT_DELETED_DETAIL)
+        self.project_id = project_id
+
+
+def _call_off_deletion(db: Session, project, prs_still_open: bool) -> Optional[bool]:
+    """The project stays and its files stay in GitHub, but where a merged removal took one off.
+
+    Removal PRs still open become ordinary open PRs. What the merged ones
+    removed they recorded when they merged (apply_pr_outcome).
+    """
+    if prs_still_open:
+        _update_project_pr_state(db, project.project_id, "open")
+        return None
+    _apply_all_prs_resolved_transitions(db, project, False)
+    # Whatever the transitions kept, the project must not stay read-only.
+    _update_project_pr_state(db, project.project_id, "draft")
+    return False
+
+
+def _settle_deletion(db: Session, project, latest: list):
+    """Finish or call off the deletion of *project*, whose open PRs are its removal PRs (*latest*).
+
+    Any of them closed unmerged calls it off at once, even with others still
+    open. Once all have merged the project goes, unless the record still holds
+    one of its files delivered somewhere a removal did not reach.
+    """
+    states = {pr.pr_state for pr in latest}
+    if not latest or "closed" in states:
+        return _call_off_deletion(db, project, "open" in states)
+    if "open" in states:
+        return None
+    if deliveries.project_delivered_anywhere(db, project.project_id):
+        return _call_off_deletion(db, project, False)
+    delete_project_record(db, project)
+    return PROJECT_DELETED
+
+
+def settle_project_prs(db: Session, project):
+    """Move the project's files out of review once none of its PRs is open.
+
+    The one place this is decided: every path that learns a PR outcome, the PR
+    refreshes and the project page load all call it. Returns True when the files
+    went to synced, False when they went back to committed_locally, None
+    when a PR is still open or nothing was waiting, and PROJECT_DELETED when
+    the project's removal PRs have all merged and the project is gone.
+    """
+    if project is None or not _has_files_under_review(db, project):
+        return None
+    if project.pr_state == PROJECT_DELETING:
+        return _settle_deletion(db, project, _latest_campaign_prs(db, project.project_id))
+    if db.query(ProjectPullRequest.pr_id).filter(
+        ProjectPullRequest.project_id == project.project_id,
+        ProjectPullRequest.pr_state == "open",
+    ).first():
+        return None
+    latest = _latest_campaign_prs(db, project.project_id)
+    if not latest:
+        return None
+    all_merged = all(pr.pr_state == "merged" for pr in latest)
+    _apply_all_prs_resolved_transitions(db, project, all_merged)
+    return all_merged
+
+
+def settle_project_and_linked(db: Session, project):
+    """Settle *project* and the Standard ↔ RWX projects linked to it; returns what settling *project* did.
+
+    An RWX project's reusable workflow goes under review through a caller's
+    campaign, so the PRs it waits on belong to the caller. Settling only the
+    project being viewed would leave it under review until the caller's own page
+    is opened.
+    """
+    related_ids = [pid for pid in _get_pr_visibility_project_map(db, project) if pid != project.project_id]
+    for related in db.query(Project).filter(Project.project_id.in_(related_ids)).all():
+        settle_project_prs(db, related)
+    return settle_project_prs(db, project)
+
+
+# Each kind's model, id column and status attribute, for _reopen_removed_files.
+_FILE_STATUS = {
+    deliveries.WORKFLOW: (Workflow, Workflow.workflow_id, "workflow_status"),
+    deliveries.CUSTOM_FILE: (CustomFile, CustomFile.id, "file_status"),
+    deliveries.CODEOWNERS: (Codeowners, Codeowners.id, "status"),
+}
+
+
+def _reopen_removed_files(db: Session, removed: list) -> None:
+    """Mark each file a merge removed from GitHub, but the project keeps, as a local change.
+
+    *removed* is what deliveries.record_pr_outcome settled. A file queued for
+    removal (pending_delete) is going anyway. Any other one was taken off by a
+    project deletion, and if that deletion is called off the file is no
+    longer synced where its removal merged: it is there to deliver again.
+    """
+    ids_by_kind: dict = {}
+    for kind, file_id in removed:
+        ids_by_kind.setdefault(kind, []).append(file_id)
+    for kind, file_ids in ids_by_kind.items():
+        model, id_column, status = _FILE_STATUS[kind]
+        for record in db.query(model).filter(id_column.in_(file_ids)):
+            if not getattr(record, "pending_delete", False):
+                setattr(record, status, "committed_locally")
+
+
+def _github_time(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        print(f"⚠️ Could not parse GitHub timestamp {value!r}")
+        return None
+
+
+def apply_pr_outcome(db: Session, pr, state: str, *, at: Optional[datetime] = None,
+                     github_user: Optional[str] = None) -> bool:
+    """Record that *pr* merged or closed, and everything that follows from it (_apply_pr_outcome).
+
+    The merge button and GitHub's webhook for that merge can both settle the
+    last removal PR at once. Whichever loses finds the project's rows gone:
+    the deletion it was finishing is finished, so it says so instead of failing.
+    """
+    project_id = pr.project_id
+    try:
+        return _apply_pr_outcome(db, pr, state, at=at, github_user=github_user)
+    except (StaleDataError, ObjectDeletedError):
+        db.rollback()
+        if db.query(Project.project_id).filter(Project.project_id == project_id).first() is None:
+            return True
+        raise
+
+
+def _apply_pr_outcome(db: Session, pr, state: str, *, at: Optional[datetime] = None,
+                      github_user: Optional[str] = None) -> bool:
+    """Record that *pr* merged or closed, and everything that follows from it.
+
+    The merge and close buttons, the webhook and a refresh from GitHub all call
+    this, so a merge has the same effects however it is discovered. Each used to
+    carry its own copy, and they disagreed: a merge found by refresh cleared no
+    drift and ran no rollback action, the webhook never recorded merged_at, and
+    only the refresh sent a notification.
+
+    *at* is GitHub's merged_at/closed_at when the caller has it. Without a user
+    token (the webhook) a rollback "revert" degrades to "keep", and drift reports
+    the divergence instead.
+
+    Returns True when this merge finished the project's deletion. *pr* and the
+    project's other rows are gone then, so a caller wanting anything of *pr*
+    reads it first.
+    """
+    if state not in ("merged", "closed") or pr.pr_state == state:
+        return False
+    previous = pr.pr_state
+    pr.pr_state = state
+    when = at or datetime.now(timezone.utc)
+    if state == "merged" and pr.merged_at is None:
+        pr.merged_at = when
+    elif state == "closed" and pr.closed_at is None:
+        pr.closed_at = when
+    # In the same commit as the state: once it is recorded the early return
+    # above means this never runs again, so a settlement committed separately
+    # could be lost for good. Before the drift clears below, which act on what
+    # this PR delivered.
+    _reopen_removed_files(db, deliveries.record_pr_outcome(db, pr, state))
+    db.commit()
+    print(f"✅ Updated PR #{pr.pr_number} in {pr.repo_name} to {state}")
+
+    # Separate from the commit above: a notification failure must never undo
+    # the recorded outcome.
+    try:
+        record_campaign_pr_transition(db, pr, previous, state)
+    except Exception as notify_err:
+        print(f"⚠️ Error recording campaign PR transition notification: {notify_err}")
+        db.rollback()
+
+    project = db.query(Project).filter(Project.project_id == pr.project_id).first()
+    if project is None:
+        return False
+    if state == "merged":
+        _clear_drift_for_merged_pr(db, project, pr)
+        _create_pr_merged_version_entries(db, project, pr.pr_number, pr.repo_name)
+    if settle_project_prs(db, project) == PROJECT_DELETED:
+        return True
+    if state == "merged":
+        # Last, so a rollback's choice about ActionsManager's own copy wins over
+        # the synced_with_github stamping above.
+        _apply_rollback_campaign_action(db, pr, github_user)
+    return False
 
 
 def _get_pr_visibility_project_map(db: Session, project: Project) -> dict[int, str]:
@@ -7198,12 +7219,11 @@ def _campaign_pr_response(
     )
 
 
-@router.get("/api/project-pr-status", responses=_responses(401, 404, 500))
+@router.get("/api/project-pr-status", responses=_responses(401, 404, 409, 500))
 def get_project_pr_status(
-    github_user: str,
     project_name: str,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
     refresh_from_github: bool = False
 ):
     """
@@ -7234,8 +7254,11 @@ def get_project_pr_status(
 
     Returns cached database state by default for fast loading. Only fetches from GitHub
     when explicitly requested via refresh_from_github=true.
+
+    A refresh that finds the project's last removal PR merged finishes its
+    deletion; the answer is then project_state "deleted" and nothing else.
     """
-    auth_module.assert_session_owns_user(github_user, request, db)
+    github_user = account.github_user
     try:
         if github_user not in user_tokens:
             raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
@@ -7245,153 +7268,132 @@ def get_project_pr_status(
         project = _find_project_by_name(db, github_user, project_name)
         if not project:
             raise HTTPException(status_code=404, detail=PROJECT_ERROR)
+        return _project_pr_status_after_deletions(db, project, refresh_from_github, github_user, token)
 
-        # ------------------------------------------------------------------
-        # Collect related project IDs via LinkedReusableWorkflow so that PR
-        # status is shared across linked Standard ↔ RWX project pairs.
-        # ------------------------------------------------------------------
-        # project_id_map: {project_id -> project_name} for every project whose
-        # PRs should appear in this view (current + linked projects).
-        project_id_map: dict[int, str] = {project.project_id: project.project_name}
-
-        if project.project_type == "standard":
-            # Standard project: include PRs from each linked RWX project.
-            linked_rwx_rows = (
-                db.query(LinkedReusableWorkflow)
-                .filter(LinkedReusableWorkflow.standard_project_id == project.project_id)
-                .all()
-            )
-            rwx_project_ids = {row.rwx_project_id for row in linked_rwx_rows}
-            if rwx_project_ids:
-                rwx_projects = db.query(Project).filter(
-                    Project.project_id.in_(rwx_project_ids)
-                ).all()
-                for rwx_proj in rwx_projects:
-                    project_id_map[rwx_proj.project_id] = rwx_proj.project_name
-        else:
-            # RWX project: include PRs from each Standard project that links to it.
-            linked_std_rows = (
-                db.query(LinkedReusableWorkflow)
-                .filter(LinkedReusableWorkflow.rwx_project_id == project.project_id)
-                .all()
-            )
-            std_project_ids = {row.standard_project_id for row in linked_std_rows}
-            if std_project_ids:
-                std_projects = db.query(Project).filter(
-                    Project.project_id.in_(std_project_ids)
-                ).all()
-                for std_proj in std_projects:
-                    project_id_map[std_proj.project_id] = std_proj.project_name
-
-        prs = db.query(ProjectPullRequest).filter(
-            ProjectPullRequest.project_id.in_(project_id_map.keys())
-        ).all()
-
-        pr_responses = []
-        open_count = 0
-        merged_count = 0
-        closed_count = 0
-
-        for pr in prs:
-            pr_state = _resolve_pr_state(pr, refresh_from_github, github_user, token, db)
-
-            if pr_state == "open":
-                open_count += 1
-            elif pr_state == "merged":
-                merged_count += 1
-            elif pr_state == "closed":
-                closed_count += 1
-
-            # This server-side filter applies only to the returned
-            # `pull_requests` list so resolved PRs do not appear in the
-            # open PR drawer or expose open-PR actions. Summary counts are
-            # still accumulated across all PR states above, and the
-            # "Pull Requests Open" banner visibility is determined
-            # separately by `project.pr_state`, not by this filter.
-            # Merged and closed PRs remain available via the
-            # /api/project-pr-history endpoint backing the PR History view.
-            if pr_state != "open":
-                continue
-
-            # Determine if this PR belongs to the queried project or a linked project
-            source_project_name = None
-            if pr.project_id != project.project_id:
-                # PR belongs to a linked project — label it with the source project name
-                source_project_name = project_id_map.get(pr.project_id)
-
-            pr_responses.append(PRStatusResponse(
-                repo_name=pr.repo_name,
-                pr_number=pr.pr_number,
-                pr_url=pr.pr_url,
-                pr_state=pr_state,
-                branch_name=pr.branch_name,
-                target_branch=pr.target_branch,
-                created_at=pr.created_at.isoformat() if pr.created_at else "",
-                updated_at=pr.updated_at.isoformat() if pr.updated_at else "",
-                source_project_name=source_project_name,
-                **_pr_action_fields(pr),
-            ))
-
-        # After refreshing from GitHub, apply workflow/project state transitions
-        # whenever all PRs are now resolved (no remaining open ones).
-        # We intentionally do NOT gate on initial_project_pr_state == "open" here.
-        # The frontend already controls when refresh_from_github=true is sent (only
-        # when pr_state=="open" OR workflows are stuck at "under_review"), so by the
-        # time we reach this code the project genuinely has PRs whose resolved state
-        # needs to be reflected. Using an overly narrow had_open_state guard caused
-        # silent skips when project.pr_state held an unexpected value (e.g. due to
-        # a previous partial transition), leaving the UI permanently stuck.
-        # Use the in-memory counts from the loop above (already accurate from the
-        # GitHub API responses) rather than re-querying the DB, which can return
-        # stale results due to SQLAlchemy session caching between per-PR commits.
-        if refresh_from_github and len(prs) > 0 and open_count == 0:
-            _apply_all_prs_resolved_transitions(db, project, len(prs), merged_count)
-            db.refresh(project)
-
-        # Compute the cross-project lock set so the frontend can avoid flipping
-        # linked reusable workflow badges that are still held under_review by an
-        # open PR campaign in *another* project (a sibling caller or the owning
-        # RWX project) — that campaign is not necessarily visible in this
-        # project's ``open_prs`` count and would otherwise look "resolved".
-        candidate_wf_ids: set[int] = set()
-        # Linked reusable workflows for a standard project.
-        candidate_wf_ids.update(
-            wid for (wid,) in
-            db.query(Workflow.workflow_id)
-            .join(LinkedReusableWorkflow, LinkedReusableWorkflow.workflow_id == Workflow.workflow_id)
-            .filter(LinkedReusableWorkflow.standard_project_id == project.project_id)
-            .all()
-        )
-        # Reusable workflows owned by the project (the RWX-project view).
-        candidate_wf_ids.update(
-            wid for (wid,) in
-            db.query(Workflow.workflow_id)
-            .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
-            .filter(
-                ProjectWorkflow.project_id == project.project_id,
-                Workflow.reusable_workflow.is_(True),
-            )
-            .all()
-        )
-        locked_workflow_ids = sorted(
-            _reusable_workflow_ids_locked_by_open_campaign(db, list(candidate_wf_ids))
-        ) if candidate_wf_ids else []
-
-        return ProjectPRStatusResponse(
-            project_state=project.pr_state or "new",
-            pull_requests=pr_responses,
-            total_prs=len(prs),
-            open_prs=open_count,
-            merged_prs=merged_count,
-            closed_prs=closed_count,
-            locked_workflow_ids=locked_workflow_ids,
-        )
-
+    except ProjectDeleted:
+        return ProjectPRStatusResponse(project_state=PROJECT_DELETED, pull_requests=[], total_prs=0,
+                                       open_prs=0, merged_prs=0, closed_prs=0, locked_workflow_ids=[])
+    except HTTPException:
+        # Not a server error: the project lookup raises 409 for an ambiguous
+        # name (#2240), and the catch-all below would report it as a 500.
+        raise
     except Exception as e:
         print(f"❌ Error getting project PR status: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error getting project PR status")
+
+
+def _project_pr_status_after_deletions(db: Session, project: Project, refresh_from_github: bool,
+                                      github_user: str, token: str) -> ProjectPRStatusResponse:
+    """_project_pr_status, read again when a refresh finished a linked project's deletion.
+
+    The PRs of linked projects are listed too, and that project's went with it.
+    Raises ProjectDeleted when the deletion was *project*'s own.
+    """
+    project_id = project.project_id
+    while True:
+        try:
+            return _project_pr_status(db, project, refresh_from_github, github_user, token)
+        except ProjectDeleted as gone:
+            if gone.project_id == project_id:
+                raise
+
+
+def _project_pr_status(db: Session, project: Project, refresh_from_github: bool,
+                       github_user: str, token: str) -> ProjectPRStatusResponse:
+    # PR status is shared across linked Standard ↔ RWX project pairs.
+    project_id_map = _get_pr_visibility_project_map(db, project)
+
+    prs = db.query(ProjectPullRequest).filter(
+        ProjectPullRequest.project_id.in_(project_id_map.keys())
+    ).all()
+
+    pr_responses = []
+    counts = {"open": 0, "merged": 0, "closed": 0}
+
+    for pr in prs:
+        pr_state = _resolve_pr_state(pr, refresh_from_github, github_user, token, db)
+        if pr_state in counts:
+            counts[pr_state] += 1
+
+        # This server-side filter applies only to the returned
+        # `pull_requests` list so resolved PRs do not appear in the
+        # open PR drawer or expose open-PR actions. Summary counts are
+        # still accumulated across all PR states above, and the
+        # "Pull Requests Open" banner visibility is determined
+        # separately by `project.pr_state`, not by this filter.
+        # Merged and closed PRs remain available via the
+        # /api/project-pr-campaigns endpoint backing the PR History view.
+        if pr_state == "open":
+            pr_responses.append(_open_pr_status(pr, project, project_id_map))
+
+    # Each PR the refresh found resolved has already been applied. Settling
+    # again covers a project left under_review by PRs that resolved earlier
+    # (the frontend sends refresh_from_github for exactly that case).
+    if refresh_from_github:
+        if settle_project_and_linked(db, project) == PROJECT_DELETED:
+            raise ProjectDeleted(project.project_id)
+        db.refresh(project)
+
+    return ProjectPRStatusResponse(
+        project_state=project.pr_state or "new",
+        pull_requests=pr_responses,
+        total_prs=len(prs),
+        open_prs=counts["open"],
+        merged_prs=counts["merged"],
+        closed_prs=counts["closed"],
+        locked_workflow_ids=_pr_status_locked_workflow_ids(db, project),
+    )
+
+
+def _open_pr_status(pr, project: Project, project_id_map: dict) -> PRStatusResponse:
+    # A PR of a linked project is labelled with the project it came from.
+    source_project_name = project_id_map.get(pr.project_id) if pr.project_id != project.project_id else None
+    return PRStatusResponse(
+        repo_name=pr.repo_name,
+        pr_number=pr.pr_number,
+        pr_url=pr.pr_url,
+        pr_state="open",
+        branch_name=pr.branch_name,
+        target_branch=pr.target_branch,
+        created_at=pr.created_at.isoformat() if pr.created_at else "",
+        updated_at=pr.updated_at.isoformat() if pr.updated_at else "",
+        source_project_name=source_project_name,
+        **_pr_action_fields(pr),
+    )
+
+
+def _pr_status_locked_workflow_ids(db: Session, project: Project) -> list:
+    """The cross-project lock set, so the frontend can avoid flipping linked
+    reusable workflow badges that are still held under_review by an open PR
+    campaign in *another* project (a sibling caller or the owning RWX project).
+    That campaign is not necessarily visible in this project's ``open_prs``
+    count and would otherwise look "resolved".
+    """
+    candidate_wf_ids: set[int] = set()
+    # Linked reusable workflows for a standard project.
+    candidate_wf_ids.update(
+        wid for (wid,) in
+        db.query(Workflow.workflow_id)
+        .join(LinkedReusableWorkflow, LinkedReusableWorkflow.workflow_id == Workflow.workflow_id)
+        .filter(LinkedReusableWorkflow.standard_project_id == project.project_id)
+        .all()
+    )
+    # Reusable workflows owned by the project (the RWX-project view).
+    candidate_wf_ids.update(
+        wid for (wid,) in
+        db.query(Workflow.workflow_id)
+        .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
+        .filter(
+            ProjectWorkflow.project_id == project.project_id,
+            Workflow.reusable_workflow.is_(True),
+        )
+        .all()
+    )
+    if not candidate_wf_ids:
+        return []
+    return sorted(_reusable_workflow_ids_locked_by_open_campaign(db, list(candidate_wf_ids)))
 
 
 # Protected branch names that must never be deleted by ActionsManager.
@@ -7567,23 +7569,23 @@ def _create_pr_merged_version_entries(db, project, pr_number, repo_name):
 
 
 def _clear_drift_for_merged_pr(db, project, pr_record) -> None:
-    """Clear persisted drift for the workflows a merged PR restored.
+    """Clear stored drift for the files a merged PR delivered, of every kind that drifts.
 
-    Scoped to the PR's own workflows and repo: a merge only proves those files
-    now match GitHub, so clearing project-wide would hide real drift elsewhere.
+    Scoped to what the PR delivered, on its own repo and branch: a merge only
+    proves those files now match GitHub, so clearing project-wide would hide
+    real drift elsewhere. A rollback is no exception: its merge delivered the
+    blob it carried (deliveries.record_pr_outcome), which GitHub now holds.
     """
-    if not pr_record or not pr_record.workflow_names:
+    if not pr_record:
         return
-    names = [n.strip() for n in pr_record.workflow_names.split(",") if n.strip()]
-    if not names:
-        return
-    workflows = db.query(Workflow).join(ProjectWorkflow).filter(
-        ProjectWorkflow.project_id == project.project_id,
-        Workflow.workflow_name.in_(names),
-    ).all()
-    for wf in workflows:
-        clear_workflow_drift(db, project, wf.workflow_id, pr_record.repo_name,
-                             pr_record.target_branch)
+    try:
+        for kind in (deliveries.WORKFLOW, deliveries.CODEOWNERS, deliveries.CUSTOM_FILE):
+            for file_id in deliveries.delivered_by_pr(db, kind, pr_record):
+                clear_drift(db, project, kind, file_id, pr_record.repo_name, pr_record.target_branch)
+    except Exception as e:
+        # The outcome is already committed; a later check corrects the stale rows.
+        print(f"❌ Error clearing drift after a merge: {str(e)}")
+        db.rollback()
 
 
 def _apply_rollback_campaign_action(db: Session, pr_record, github_user: Optional[str] = None) -> None:
@@ -7602,55 +7604,24 @@ def _handle_merged_pull_request(*, response, project, repo_name, pr_number, owne
     merge_data = response.json()
     print(f"✅ Successfully merged PR #{pr_number} in {repo_name}")
 
-    # Update PR state in database
     pr_record = db.query(ProjectPullRequest).filter_by(
         project_id=project.project_id,
         repo_name=repo_name,
         pr_number=pr_number
     ).first()
-
-    if pr_record:
-        pr_record.pr_state = "merged"
-        pr_record.merged_at = datetime.now(timezone.utc)
-        db.commit()
-        print(f"✅ Updated PR #{pr_number} state to merged in database")
-        _clear_drift_for_merged_pr(db, project, pr_record)
-
-    # Only mark project/workflows as synced when no PRs remain open.
-    # Use pr_state='open' (not != 'merged') so a mix of merged + closed PRs
-    # also triggers the transition instead of leaving status stuck under_review.
-    open_prs = db.query(ProjectPullRequest).filter(
-        ProjectPullRequest.project_id == project.project_id,
-        ProjectPullRequest.pr_state == "open"
-    ).count()
-
-    if open_prs == 0:
-        total_count = db.query(ProjectPullRequest).filter_by(project_id=project.project_id).count()
-        merged_count = db.query(ProjectPullRequest).filter_by(
-            project_id=project.project_id, pr_state="merged"
-        ).count()
-        _apply_all_prs_resolved_transitions(db, project, total_count, merged_count)
-        # Reconcile linked reusable workflows owned by RWX projects
-        if merged_count == total_count:
-            _sync_linked_reusable_workflows_after_merge(db, project.project_id)
-
-    # Create a "pr_merged" version entry for each non-reusable workflow so History shows ⭐
-    _create_pr_merged_version_entries(db, project, pr_number, repo_name)
-
-    # Last, so a rollback's choice about ActionsManager's own copy wins over the
-    # synced_with_github stamping above — this repo no longer holds what AM holds.
-    if pr_record:
-        _apply_rollback_campaign_action(db, pr_record, github_user)
+    # Read before the outcome: the last removal PR of a deletion takes its row with the project.
+    branch_name, target_branch = (pr_record.branch_name, pr_record.target_branch) if pr_record else (None, None)
+    project_deleted = bool(pr_record) and apply_pr_outcome(db, pr_record, "merged", github_user=github_user)
 
     # Attempt to delete the source branch (best-effort; never fails the merge)
     branch_deleted = False
     branch_delete_warning = None
-    if pr_record and pr_record.branch_name and pr_record.target_branch:
+    if branch_name and target_branch:
         branch_deleted, branch_delete_warning = _delete_actions_manager_branch(
             owner=owner,
             repo=repo,
-            branch_name=pr_record.branch_name,
-            target_branch=pr_record.target_branch,
+            branch_name=branch_name,
+            target_branch=target_branch,
             github_user=github_user,
         )
     else:
@@ -7666,22 +7637,22 @@ def _handle_merged_pull_request(*, response, project, repo_name, pr_number, owne
         "merge_method": merge_method,
         "branch_deleted": branch_deleted,
         "branch_delete_warning": branch_delete_warning,
+        "project_deleted": project_deleted,
     }
 
 
-@router.put("/api/merge-pull-request", responses=_responses(400, 401, 403, 404, 500))
+@router.put("/api/merge-pull-request", responses=_responses(400, 401, 403, 404, 409, 500))
 def merge_pull_request(
     payload: MergePullRequestRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """
     Merge a pull request for a project.
     Updates the PR state in the database and triggers project state transition if needed.
     """
     try:
-        github_user = _resolve_github_user(x_github_user, payload.github_user)
+        github_user = account.github_user
         project_name = payload.project_name
         repo_name = payload.repo_name
         pr_number = payload.pr_number
@@ -7702,7 +7673,9 @@ def merge_pull_request(
         if "/" not in repo_name:
             raise HTTPException(status_code=400, detail="Invalid repository name format. Expected 'owner/repo'")
 
-        _require_project_editor(db, github_user, project)
+        # Merging or closing a removal pull request is how a deletion finishes
+        # or is called off, so it stays open to editors while the project is read-only.
+        _require_project_editor(db, github_user, project, settling=True)
         _require_recorded_pull_request(db, project, repo_name, pr_number)
 
         owner, repo = repo_name.split("/", 1)
@@ -7761,22 +7734,21 @@ def merge_pull_request(
         print(f"❌ Error merging pull request: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error merging pull request")
 
 
-@router.patch("/api/close-pull-request", responses=_responses(400, 401, 403, 404, 500))
+@router.patch("/api/close-pull-request", responses=_responses(400, 401, 403, 404, 409, 500))
 def close_pull_request(
     payload: ClosePullRequestRequest,
     db: Annotated[Session, Depends(get_db)],
-
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """
     Close a pull request for a project without merging.
     Updates the PR state in the database and triggers project state transition if needed.
     """
     try:
-        github_user = _resolve_github_user(x_github_user, payload.github_user)
+        github_user = account.github_user
         project_name = payload.project_name
         repo_name = payload.repo_name
         pr_number = payload.pr_number
@@ -7797,7 +7769,9 @@ def close_pull_request(
         if "/" not in repo_name:
             raise HTTPException(status_code=400, detail="Invalid repository name format. Expected 'owner/repo'")
 
-        _require_project_editor(db, github_user, project)
+        # Merging or closing a removal pull request is how a deletion finishes
+        # or is called off, so it stays open to editors while the project is read-only.
+        _require_project_editor(db, github_user, project, settling=True)
         _require_recorded_pull_request(db, project, repo_name, pr_number)
 
         owner, repo = repo_name.split("/", 1)
@@ -7821,32 +7795,13 @@ def close_pull_request(
             pr_data = response.json()
             print(f"✅ Successfully closed PR #{pr_number} in {repo_name}")
             
-            # Update PR state in database
             pr_record = db.query(ProjectPullRequest).filter_by(
                 project_id=project.project_id,
                 repo_name=repo_name,
                 pr_number=pr_number
             ).first()
-            
             if pr_record:
-                pr_record.pr_state = "closed"
-                pr_record.closed_at = datetime.now(timezone.utc)
-                db.commit()
-                print(f"✅ Updated PR #{pr_number} state to closed in database")
-            
-            # Check if any PRs are still open; if not, revert workflow statuses and project state
-            open_prs = db.query(ProjectPullRequest).filter_by(
-                project_id=project.project_id,
-                pr_state="open"
-            ).count()
-            if open_prs == 0:
-                # No remaining open PRs: revert "under_review" workflows to "committed_locally"
-                _update_project_workflows_status(
-                    db, project.project_id, "committed_locally", only_if_status="under_review"
-                )
-                _update_project_custom_files_status(db, project.project_id, "committed_locally", only_if_status="under_review")
-                _update_project_codeowners_status(db, project.project_id, "committed_locally", only_if_status="under_review")
-                _update_project_pr_state(db, project.project_id, "draft")
+                apply_pr_outcome(db, pr_record, "closed", github_user=github_user)
 
             return {
                 "message": "Pull request closed successfully",
@@ -7870,176 +7825,14 @@ def close_pull_request(
         print(f"❌ Error closing pull request: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error closing pull request")
 
 
-@router.get("/api/project-pr-history", responses=_responses(401, 404, 500))
-def get_project_pr_history(
-    github_user: str,
-    project_name: str,
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    state_filter: str = "all",  # "all", "merged", "closed"
-    repo_filter: Optional[str] = None,
-    workflow_filter: Optional[str] = None
-) -> PRHistoryResponse:
-    """
-    Return the PR history (merged and closed PRs) for a project.
-
-    This endpoint is read-only and only surfaces historical PRs — open PRs are
-    intentionally excluded so they remain the exclusive domain of the existing
-    PR Status panel.
-
-    Cross-project visibility
-    ------------------------
-    Pull requests are surfaced across linked Standard ↔ Reusable-Workflow (RWX)
-    project pairs so that users see the full picture from either side:
-
-    * Standard Project queried → also includes PRs created by each linked
-      RWX project (``LinkedReusableWorkflow.rwx_project_id`` rows where
-      ``standard_project_id`` matches).
-    * RWX Project queried → also includes PRs created by each Standard Project
-      that links to it (``LinkedReusableWorkflow.standard_project_id`` rows
-      where ``rwx_project_id`` matches).
-
-    PR records are never duplicated — each ``ProjectPullRequest`` row belongs to
-    exactly one project.  A single query spanning all related ``project_id``
-    values achieves cross-project visibility without redundant data.
-    ``source_project_name`` is populated on response items whose
-    ``project_id`` differs from the queried project so the UI can label them.
-
-    Args:
-        github_user:     GitHub username (must be authenticated).
-        project_name:    Project identifier.
-        state_filter:    "all" (default), "merged", or "closed".
-        repo_filter:     Optional full repo name (owner/repo) to narrow results.
-        workflow_filter: Optional substring to match against stored workflow names.
-        db:              SQLAlchemy database session.
-    """
-    auth_module.assert_session_owns_user(github_user, request, db)
-    try:
-        if github_user not in user_tokens:
-            raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
-
-        project = _find_project_by_name(db, github_user, project_name)
-        if not project:
-            raise HTTPException(status_code=404, detail=PROJECT_ERROR)
-
-        # ------------------------------------------------------------------
-        # Collect related project IDs via LinkedReusableWorkflow so that PR
-        # history is shared across linked Standard ↔ RWX project pairs.
-        # ------------------------------------------------------------------
-        # project_id_map: {project_id -> project_name} for every project whose
-        # PRs should appear in this view (current + linked projects).
-        project_id_map: dict[int, str] = {project.project_id: project.project_name}
-
-        if project.project_type == "standard":
-            # Standard project: include PRs from each linked RWX project.
-            linked_rwx_rows = (
-                db.query(LinkedReusableWorkflow)
-                .filter(LinkedReusableWorkflow.standard_project_id == project.project_id)
-                .all()
-            )
-            rwx_project_ids = {row.rwx_project_id for row in linked_rwx_rows}
-            if rwx_project_ids:
-                rwx_projects = db.query(Project).filter(
-                    Project.project_id.in_(rwx_project_ids)
-                ).all()
-                for rwx_proj in rwx_projects:
-                    project_id_map[rwx_proj.project_id] = rwx_proj.project_name
-        else:
-            # RWX project: include PRs from each Standard project that links to it.
-            linked_std_rows = (
-                db.query(LinkedReusableWorkflow)
-                .filter(LinkedReusableWorkflow.rwx_project_id == project.project_id)
-                .all()
-            )
-            std_project_ids = {row.standard_project_id for row in linked_std_rows}
-            if std_project_ids:
-                std_projects = db.query(Project).filter(
-                    Project.project_id.in_(std_project_ids)
-                ).all()
-                for std_proj in std_projects:
-                    project_id_map[std_proj.project_id] = std_proj.project_name
-
-        # Base query: only resolved (non-open) PRs across all related projects
-        query = db.query(ProjectPullRequest).filter(
-            ProjectPullRequest.project_id.in_(project_id_map.keys()),
-            ProjectPullRequest.pr_state.in_(["merged", "closed"]),
-        )
-
-        if state_filter in ("merged", "closed"):
-            query = query.filter(ProjectPullRequest.pr_state == state_filter)
-
-        if repo_filter:
-            query = query.filter(ProjectPullRequest.repo_name == repo_filter)
-
-        if workflow_filter:
-            query = query.filter(
-                ProjectPullRequest.workflow_names.contains(workflow_filter)
-            )
-
-        prs = query.order_by(ProjectPullRequest.updated_at.desc()).all()
-
-        items: List[PRHistoryItemResponse] = []
-        merged_count = 0
-        closed_count = 0
-
-        for pr in prs:
-            if pr.pr_state == "merged":
-                merged_count += 1
-            else:
-                closed_count += 1
-
-            # Populate source_project_name for cross-linked PRs so the UI can
-            # display which project originally created the pull request.
-            source_project_name = (
-                project_id_map.get(pr.project_id)
-                if pr.project_id != project.project_id
-                else None
-            )
-
-            items.append(PRHistoryItemResponse(
-                pr_id=pr.pr_id,
-                repo_name=pr.repo_name,
-                pr_number=pr.pr_number,
-                pr_url=pr.pr_url,
-                pr_state=pr.pr_state,
-                branch_name=pr.branch_name,
-                target_branch=pr.target_branch,
-                title=pr.title,
-                author=pr.author,
-                body=pr.body,
-                workflow_names=pr.workflow_names,
-                created_at=pr.created_at.isoformat() if pr.created_at else "",
-                updated_at=pr.updated_at.isoformat() if pr.updated_at else "",
-                merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
-                closed_at=pr.closed_at.isoformat() if pr.closed_at else None,
-                source_project_name=source_project_name,
-            ))
-
-        return PRHistoryResponse(
-            pull_requests=items,
-            total=len(items),
-            merged_count=merged_count,
-            closed_count=closed_count,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error fetching PR history: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/api/project-pr-campaigns", responses=_responses(401, 404, 500))
+@router.get("/api/project-pr-campaigns", responses=_responses(401, 404, 409, 500))
 def get_project_pr_campaigns(
-    github_user: str,
     project_name: str,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
     refresh_from_github: bool = False
 ) -> PRCampaignsResponse:
     """
@@ -8051,7 +7844,7 @@ def get_project_pr_campaigns(
     a campaign_id are grouped heuristically by project, workflow set, target
     branch, and creation day so existing PR History data remains visible.
     """
-    auth_module.assert_session_owns_user(github_user, request, db)
+    github_user = account.github_user
     try:
         if github_user not in user_tokens:
             raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
@@ -8092,17 +7885,7 @@ def get_project_pr_campaigns(
             pr.pr_state = _resolve_pr_state(pr, refresh_from_github, github_user, token, db)
 
         if refresh_from_github:
-            projects_by_id = {p.project_id: p for p in visible_projects}
-            for visible_project_id, visible_project in projects_by_id.items():
-                project_prs = [pr for pr in prs if pr.project_id == visible_project_id]
-                if not project_prs:
-                    continue
-                open_count = sum(1 for pr in project_prs if pr.pr_state == "open")
-                merged_count = sum(1 for pr in project_prs if pr.pr_state == "merged")
-                if open_count == 0:
-                    _apply_all_prs_resolved_transitions(
-                        db, visible_project, len(project_prs), merged_count
-                    )
+            settle_project_and_linked(db, project)
 
         grouped: dict[tuple, List[ProjectPullRequest]] = {}
         for pr in prs:
@@ -8275,7 +8058,7 @@ def get_project_pr_campaigns(
         print(f"❌ Error fetching PR campaigns: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error fetching PR campaigns")
 
 
 def _verify_pr_webhook_signature(payload: bytes, signature: str) -> bool:
@@ -8310,93 +8093,6 @@ def _verify_pr_webhook_signature(payload: bytes, signature: str) -> bool:
         digestmod=hashlib.sha256,
     )
     return hmac.compare_digest(mac.hexdigest(), expected)
-
-
-def _handle_pr_merged(db: Session, pr_record, pr_number: int, repo_full_name: str) -> dict:
-    """Handle a PR that was merged on GitHub."""
-    project_id = pr_record.project_id
-
-    pr_record.pr_state = "merged"
-    db.commit()
-    print(f"✅ Updated PR #{pr_number} state to merged in database")
-
-    # No UI drives this path, so without clearing here the caches keep
-    # reporting drift the merge already fixed until someone opens the project.
-    merged_project = db.query(Project).filter(Project.project_id == project_id).first()
-    if merged_project:
-        _clear_drift_for_merged_pr(db, merged_project, pr_record)
-
-    # Only mark project/workflows as synced if ALL remaining PRs are also merged
-    remaining_non_merged = db.query(ProjectPullRequest).filter(
-        ProjectPullRequest.project_id == project_id,
-        ProjectPullRequest.pr_state != "merged",
-    ).count()
-
-    if remaining_non_merged == 0:
-        _update_project_workflows_status(
-            db, project_id, "synced_with_github", only_if_status="under_review"
-        )
-        _update_project_custom_files_status(db, project_id, "synced_with_github", only_if_status="under_review")
-        _update_project_codeowners_status(db, project_id, "synced_with_github", only_if_status="under_review")
-        _update_project_pr_state(db, project_id, "synced")
-        _sync_linked_reusable_workflows_after_merge(db, project_id)
-
-    # Record a version entry so History shows the merge
-    try:
-        nr_workflows = db.query(Workflow).join(ProjectWorkflow).filter(
-            ProjectWorkflow.project_id == project_id,
-            Workflow.reusable_workflow == False,
-        ).all()
-        for wf in nr_workflows:
-            create_workflow_version(
-                db,
-                wf.workflow_id,
-                wf.workflow_yaml,
-                metadata={
-                    "action": "pr_merged",
-                    "pr_number": pr_number,
-                    "repo_name": repo_full_name,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-                commit=False,
-            )
-        db.commit()
-        print(f"✅ Created pr_merged version entries for {len(nr_workflows)} workflow(s)")
-    except Exception as e:
-        print(f"❌ Error creating pr_merged version entries: {str(e)}")
-        db.rollback()
-
-    # Last, so a rollback's choice about ActionsManager's own copy wins over the
-    # synced_with_github stamping above. No user token reaches a webhook, so a
-    # "revert" degrades to "keep" here and drift reports the divergence instead.
-    _apply_rollback_campaign_action(db, pr_record)
-
-    return {"status": "processed", "action": "merged", "pr_number": pr_number, "repo_name": repo_full_name}
-
-
-def _handle_pr_closed_without_merge(db: Session, pr_record, pr_number: int, repo_full_name: str) -> dict:
-    """Handle a PR that was closed without merging on GitHub."""
-    project_id = pr_record.project_id
-
-    pr_record.pr_state = "closed"
-    db.commit()
-    print(f"✅ Updated PR #{pr_number} state to closed in database")
-
-    # Revert workflows if no open PRs remain
-    open_prs = db.query(ProjectPullRequest).filter_by(
-        project_id=project_id,
-        pr_state="open",
-    ).count()
-
-    if open_prs == 0:
-        _update_project_workflows_status(
-            db, project_id, "committed_locally", only_if_status="under_review"
-        )
-        _update_project_custom_files_status(db, project_id, "committed_locally", only_if_status="under_review")
-        _update_project_codeowners_status(db, project_id, "committed_locally", only_if_status="under_review")
-        _update_project_pr_state(db, project_id, "draft")
-
-    return {"status": "processed", "action": "closed", "pr_number": pr_number, "repo_name": repo_full_name}
 
 
 WEBHOOK_DOCS_URL = "https://actionsmanager.io/guides/WEBHOOK_ENDPOINT.html"
@@ -8536,10 +8232,13 @@ async def github_pr_webhook(request: Request, db: Annotated[Session, Depends(get
         print(f"ℹ️ PR #{pr_number} in {repo_full_name} not tracked by Actions Manager, ignoring")
         return {"status": "ignored", "reason": "PR not tracked by Actions Manager"}
 
-    if merged:
-        return _handle_pr_merged(db, pr_record, pr_number, repo_full_name)
-
-    return _handle_pr_closed_without_merge(db, pr_record, pr_number, repo_full_name)
+    state = "merged" if merged else "closed"
+    at = _github_time(pr_data.get("merged_at") if merged else pr_data.get("closed_at"))
+    # Everything returned comes from the payload: a merge that finishes a
+    # project's deletion takes pr_record with it.
+    project_deleted = apply_pr_outcome(db, pr_record, state, at=at)
+    return {"status": "processed", "action": state, "pr_number": pr_number, "repo_name": repo_full_name,
+            "project_deleted": project_deleted}
 
 
 def _fetch_branches_page(branches_url: str, headers: dict, params: dict,
@@ -9281,7 +8980,7 @@ def _fetch_branch_protection(owner: str, repo: str, branch: str, headers: dict,
         }
     except Exception as exc:
         print(f"⚠️ Could not read branch protection for {owner}/{repo}@{branch}: {exc}")
-        return {"status": "unknown", "error": str(exc)[:120]}
+        return {"status": "unknown", "error": failure_kind(exc, _SHOWN_GITHUB_ERRORS)}
 
 
 def _create_or_get_am_branch(owner: str, repo: str, target_branch: str,
@@ -9806,7 +9505,7 @@ def _update_workflow_git_hash(db: Session, workflow_name: str, new_sha: str,
 
     pending_delete rows are excluded because only the upsert path reaches here
     — ``_commit_workflows_to_branch`` sends tombstones to
-    ``_remove_workflow_on_branch`` and continues — so a tombstone is never the
+    ``_remove_on_branch`` and continues — so a tombstone is never the
     row this SHA belongs to. Without the filter, a tombstone sharing a live
     workflow's name can win ``.first()``, and the live row's baseline then never
     updates: real drift on it reads as synchronized.
@@ -9879,49 +9578,92 @@ def _resolve_effective_target_branches(repo_name: str, owner: str, repo: str, pr
         return None, {"error": str(e), "status": 400}
     except Exception as e:
         print(f"❌ Unexpected error resolving branches: {str(e)}")
-        return None, {"error": f"Failed to resolve branches: {str(e)}", "status": 500}
+        return None, {"error": f"Failed to resolve branches: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}", "status": 500}
 
 
-def _delete_workflow_from_branch(owner: str, repo: str, workflow_name: str, project_code: str,
-                                 am_branch: str, headers: dict, user: str, db: Session,
-                                 use_prefix: bool) -> tuple:
-    """Remove a workflow file from ``am_branch``. Returns (outcome, error_message).
+class _DeliveryTarget(NamedTuple):
+    """One (repo, branch) a delivery reaches."""
+    repo_name: str
+    owner: str
+    repo: str
+    branch: str
 
-    ``outcome`` is DELETE_DELETED / DELETE_ABSENT / DELETE_FAILED, matching
-    _delete_custom_file_from_branch — a campaign carrying only removals must be
-    able to tell "took it out" from "it was not there".
-    """
-    file_name = format_workflow_name(workflow_name, project_code, use_prefix)
-    path = quote(f".github/workflows/{file_name}", safe="/")
-    contents_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{path}"
 
-    sha_resp = github_get(contents_url, user, db, headers=headers, params={"ref": am_branch})
-    if sha_resp.status_code == 404:
-        print(f"📌 Workflow '{file_name}' already absent from {am_branch}")
-        return DELETE_ABSENT, None
-    if sha_resp.status_code != 200:
-        return DELETE_FAILED, f"{workflow_name}: HTTP {sha_resp.status_code} fetching SHA"
+def _target_on(repo_name: str, branch: str) -> _DeliveryTarget:
+    owner, repo = repo_name.split("/", 1)
+    return _DeliveryTarget(repo_name, owner, repo, branch)
 
-    del_resp = requests.delete(
-        contents_url,
+
+class _Removal(NamedTuple):
+    """One file to take off a (repo, branch): at *path*, holding the blob *sha* when the record knows it."""
+    kind: str
+    file_id: int
+    name: str
+    path: str
+    sha: Optional[str] = None
+
+
+# What GitHub answers a delete whose SHA is not the file's: 409 for another
+# blob, 422 for one it cannot use.
+_STALE_SHA = (409, 422)
+
+
+def _send_delete(url: str, path: str, branch: str, sha: Optional[str], project_code: str,
+                 headers: dict):
+    return requests.delete(
+        url,
         headers=headers,
         json={
-            "message": f"Delete {file_name} via ActionsManager [{project_code}] [skip ci]",
-            "sha": sha_resp.json().get("sha"),
-            "branch": am_branch,
+            "message": f"Delete {path} via ActionsManager [{project_code}] [skip ci]",
+            "sha": sha,
+            "branch": branch,
         },
         timeout=GITHUB_TIMEOUT_SECONDS,
     )
-    if del_resp.status_code in (200, 201):
-        print(f"✅ Deleted workflow '{file_name}' from {am_branch}")
+
+
+def _delete_outcome(response, path: str, branch: str) -> tuple:
+    if response.status_code in (200, 201):
+        print(f"✅ Deleted '{path}' from {branch}")
         return DELETE_DELETED, None
-    reason = _github_reason(del_resp)
-    print(f"❌ Failed to delete workflow '{file_name}': {del_resp.status_code} - {reason}")
-    return DELETE_FAILED, f"{workflow_name}: HTTP {del_resp.status_code} - {reason}"
+    if response.status_code == 404:
+        print(f"📌 '{path}' already absent from {branch}")
+        return DELETE_ABSENT, None
+    print(f"❌ Failed to delete '{path}' from {branch}: {response.status_code}")
+    return DELETE_FAILED, f"{path}: HTTP {response.status_code} - {_github_reason(response)}"
 
 
-def _record_workflow_removal(workflow_name: str, result: tuple,
-                             committed: list, errors: list) -> None:
+def _delete_path_from_branch(owner: str, repo: str, path: str, branch: str, project_code: str,
+                             user: str, db: Session, headers: dict, known_sha: Optional[str] = None) -> tuple:
+    """Delete *path* from *branch*. Returns (outcome, error_message).
+
+    ``outcome`` is one of DELETE_DELETED / DELETE_ABSENT / DELETE_FAILED. Absent is
+    not an error, but it is not a commit either — callers that go on to open a PR
+    must not count it, or they open one against a branch with no diff.
+
+    *known_sha* is the blob the delivery record holds there. The delete is
+    sent with it straight away, one call where the record is right; only when
+    GitHub refuses it as stale is the file read for its own SHA.
+    """
+    # Encoded at the URL, plain in messages: the stored path must not be able to
+    # reshape the request (a "?" or "#" in it would otherwise start a query or
+    # fragment, and "%xx" would be decoded by GitHub).
+    url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{quote(path, safe='/')}"
+    if known_sha:
+        response = _send_delete(url, path, branch, known_sha, project_code, headers)
+        if response.status_code not in _STALE_SHA:
+            return _delete_outcome(response, path, branch)
+    sha_resp = github_get(url, user, db, headers=headers, params={"ref": branch})
+    if sha_resp.status_code == 404:
+        print(f"📌 '{path}' already absent from {branch}")
+        return DELETE_ABSENT, None
+    if sha_resp.status_code != 200:
+        return DELETE_FAILED, f"{path}: HTTP {sha_resp.status_code} fetching SHA"
+    response = _send_delete(url, path, branch, sha_resp.json().get("sha"), project_code, headers)
+    return _delete_outcome(response, path, branch)
+
+
+def _record_removal(name: str, result: tuple, committed: list, errors: list) -> str:
     """File a removal's outcome into the campaign's committed/error lists.
 
     Absent is neither a commit nor a failure — see _commit_custom_files_to_branch
@@ -9930,102 +9672,156 @@ def _record_workflow_removal(workflow_name: str, result: tuple,
     """
     outcome, error = result
     if outcome == DELETE_DELETED:
-        committed.append(workflow_name)
+        committed.append(name)
     elif outcome == DELETE_FAILED:
         errors.append(error)
+    return outcome
 
 
-def _remove_workflow_on_branch(workflow_name: str, owner: str, repo: str, project_code: str,
-                               am_branch: str, headers: dict, user: str, db: Session,
-                               use_prefix: bool, committed: list, errors: list) -> None:
-    """Take one pending-delete workflow off the AM branch, filing the outcome.
+def _remove_on_branch(removal: _Removal, owner: str, repo: str, project_code: str, am_branch: str,
+                      headers: dict, user: str, db: Session, committed: list, errors: list) -> str:
+    """Take one file off the AM branch, filing and returning the outcome.
 
-    Wrapped like every other iteration of _commit_workflows_to_branch: an
-    unwrapped timeout here would propagate out of the campaign and abandon the
-    AM branches already cut for earlier repos, instead of failing this one
-    target.
+    Wrapped like every other iteration of a commit loop: an unwrapped timeout
+    here would propagate out of the campaign and abandon the AM branches
+    already cut for earlier repos, instead of failing this one target.
     """
     try:
-        result = _delete_workflow_from_branch(
-            owner, repo, workflow_name, project_code, am_branch,
-            headers, user, db, use_prefix
-        )
+        result = _delete_path_from_branch(owner, repo, removal.path, am_branch, project_code,
+                                          user, db, headers, known_sha=removal.sha)
     except Exception as e:
-        errors.append(f"{workflow_name}: {str(e)}")
-        print(f"❌ Exception removing workflow '{workflow_name}': {str(e)}")
-        return
-    _record_workflow_removal(workflow_name, result, committed, errors)
+        errors.append(f"{removal.name}: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}")
+        print(f"❌ Exception removing '{removal.path}': {type(e).__name__}")
+        return DELETE_FAILED
+    return _record_removal(removal.name, result, committed, errors)
 
 
-def _carry_rename_on_branch(workflow: dict, owner: str, repo: str, project_code: str,
-                            am_branch: str, headers: dict, user: str, db: Session,
-                            use_prefix: bool, errors: list) -> None:
-    """Take the old filename off the branch the new one was just written to.
+def _remove_superseded_copy(entry: dict, target: Optional[tuple], branch: str, written: frozenset,
+                            owner: str, repo: str, project_code: str, user: str, db: Session,
+                            headers: dict, errors: list) -> Optional[str]:
+    """Take off *branch* the copy of *entry*'s file that writing it at ``entry["path"]`` left behind.
 
-    Git has no rename operation — a rename is a remove plus an add — so both
-    halves have to land on the same AM branch for the pull request to read as a
-    rename and for merging it to finish the job. Called only after the new file
-    committed successfully: removing the old one first would leave the workflow
-    absent from the repository if the write then failed.
+    That copy is where the delivery record says the file was delivered on
+    *target*, the (repo, target branch) this write delivers to; None means
+    there is no record to supersede. Git has no rename: a rename or a move is
+    a remove plus an add, so both halves land on the same branch, the pull
+    request reads as a rename, and merging it finishes the job. Called only
+    after the write succeeded: removing first would leave the file absent if
+    the write then failed.
 
-    An outcome is deliberately not added to ``committed``. The add already
-    counted this workflow, and counting it twice would report a campaign as
-    carrying more files than it does. Absent is not an error: the file may have
-    been removed by hand, or a previous campaign may have carried the rename and
-    been closed after the remove landed.
+    Never a path the run writes on this target (*written*, lowercased): two
+    files swapping names each sit where the other was delivered.
 
-    Refuses to remove the path that was just written. ``renamed_from`` records a
-    *name*, and two different names can format to one *filename*: without a
-    prefix ``ci`` and ``ci.yml`` are both ``ci.yml``, so renaming between them
-    made the campaign delete the file it had written moments earlier and merging
-    it removed the workflow from every repository. Compared case-insensitively
-    as well, which covers ``ci`` -> ``ci2`` -> ``CI`` — the two-step route
-    ``_assert_not_case_only_rename`` itself recommends. If GitHub's contents API
-    is case-sensitive that leaves an orphan instead, which is the far cheaper
-    mistake.
-
-    Deliberately NOT a blob-SHA comparison. Git blob SHAs are content-addressed,
-    so a rename that does not also edit the YAML produces the same SHA at both
-    paths — the common case — and skipping on that would reintroduce the orphan
-    this function exists to prevent.
+    Returns the outcome, or None when there was nothing to remove. A failure
+    is added to *errors*. Absent is not an error: the copy may have been
+    removed by hand, or by an earlier campaign that was closed after its
+    removal landed.
     """
-    old_name = workflow.get("renamed_from")
-    if not old_name:
-        return
-
-    old_file = format_workflow_name(old_name, project_code, use_prefix)
-    new_file = format_workflow_name(workflow.get("name", ""), project_code, use_prefix)
-    if old_file.lower() == new_file.lower():
-        print(f"📌 '{old_name}' and '{workflow.get('name')}' are both {new_file}; nothing to remove")
-        return
-
+    if target is None:
+        return None
+    old_path = deliveries.superseded_path(db, entry["kind"], entry["id"], *target, entry["path"])
+    if old_path is None or old_path.lower() in written:
+        return None
     try:
-        outcome, error = _delete_workflow_from_branch(
-            owner, repo, old_name, project_code, am_branch,
-            headers, user, db, use_prefix
-        )
+        outcome, error = _delete_path_from_branch(owner, repo, old_path, branch, project_code,
+                                                  user, db, headers)
     except Exception as e:
-        errors.append(f"{old_name}: {str(e)}")
-        print(f"❌ Exception removing the pre-rename file '{old_name}': {str(e)}")
-        return
+        errors.append(f"{old_path}: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}")
+        print(f"❌ Exception removing the superseded copy '{old_path}': {type(e).__name__}")
+        return DELETE_FAILED
     if outcome == DELETE_FAILED:
         errors.append(error)
     elif outcome == DELETE_DELETED:
-        print(f"✅ Carried the rename: removed '{old_name}' from {am_branch}")
+        print(f"✅ Removed '{old_path}' from {branch}: '{entry['path']}' supersedes it")
+    return outcome
+
+
+def _remove_superseded_on_target(db: Session, kind: str, file_id, repo_name: str, branch: str, path: str,
+                                 project_code: str, user: str, headers: dict) -> Optional[str]:
+    """For a direct write of *path* to (repo, branch), before it is recorded: remove the copy it supersedes there.
+
+    Returns why the removal failed, or None.
+    """
+    owner, repo = repo_name.split("/", 1)
+    errors: list = []
+    _remove_superseded_copy(_carried_entry(kind, file_id, path), (repo_name, branch), branch, frozenset(),
+                            owner, repo, project_code, user, db, headers, errors)
+    return errors[0] if errors else None
+
+
+def _superseded_copy_note(removal_error: Optional[str]) -> str:
+    """What a direct write's message adds when the copy it superseded could not be removed."""
+    return f"; the copy it replaces could not be removed ({removal_error})" if removal_error else ""
+
+
+def _paths_written(workflows: List[dict], custom_files: List[dict], codeowners: Optional[dict],
+                   project_code: str, use_prefix: bool) -> frozenset:
+    """Every path a campaign writes on each of its targets, lowercased (see _remove_superseded_copy)."""
+    paths = [_workflow_entry(w, project_code, use_prefix)["path"] for w in workflows if not w.get("pending_delete")]
+    paths += [cf.get("file_path", "") for cf in custom_files if not cf.get("pending_delete")]
+    if codeowners:
+        paths.append(codeowners["file_path"])
+    return frozenset(path.lower() for path in paths)
+
+
+def _carried_entry(kind: str, file_id, path: str, sha=None, delete: bool = False) -> dict:
+    """What one commit put on an AM branch, in the shape ``deliveries.record_pending`` takes."""
+    return {"kind": kind, "id": file_id, "path": path, "sha": sha, "delete": delete}
+
+
+def _workflow_entry(workflow: dict, project_code: str, use_prefix: bool, sha=None, delete: bool = False) -> dict:
+    path = _WORKFLOWS_DIR + format_workflow_name(workflow.get('name', ''), project_code, use_prefix)
+    return _carried_entry(deliveries.WORKFLOW, workflow.get("id"), path, sha, delete)
+
+
+def _note_carried(carried: Optional[list], entry: dict) -> None:
+    if carried is not None:
+        carried.append(entry)
+
+
+def _note_removal(carried: Optional[list], entry: dict, outcome: str) -> None:
+    """A deletion the branch now carries, or one it had nothing to do for."""
+    if outcome == DELETE_DELETED:
+        _note_carried(carried, entry)
+    elif outcome == DELETE_ABSENT:
+        _note_carried(carried, {**entry, "absent": True})
+
+
+def _record_absent_removals(db: Session, carried: list, repo_name: str, target_branch: str) -> list:
+    """Record removals the AM branch had nothing to do for, and return the rest.
+
+    The AM branch is cut fresh from the target branch, so a file it lacks is
+    not on the target either.
+    """
+    for entry in carried:
+        if entry.get("absent"):
+            deliveries.record_removed(db, entry["kind"], entry["id"], repo_name, target_branch)
+    db.commit()
+    return [entry for entry in carried if not entry.get("absent")]
 
 
 def _commit_workflows_to_branch(workflows: List[dict], owner: str, repo: str, project_code: str, am_branch: str,
-                                 headers: dict, repo_name: str, user: str, db: Session, use_prefix: bool) -> tuple:
-    """Commit each workflow to the AM branch. Returns (workflows_committed, workflow_errors)."""
+                                 headers: dict, repo_name: str, user: str, db: Session, use_prefix: bool,
+                                 carried: Optional[list] = None, target: Optional[tuple] = None,
+                                 written: frozenset = frozenset()) -> tuple:
+    """Commit each workflow to the AM branch. Returns (workflows_committed, workflow_errors).
+
+    ``carried`` collects what each commit put on the branch, for the PR's
+    delivery record. ``target`` is the (repo, target branch) the AM branch
+    delivers to and ``written`` every path the run writes there: each write
+    removes the delivered copy it supersedes (_remove_superseded_copy).
+    """
     workflows_committed = []
     workflow_errors = []
     for workflow in workflows:
         workflow_name = workflow.get('name', 'unknown')
         if workflow.get("pending_delete"):
-            _remove_workflow_on_branch(
-                workflow_name, owner, repo, project_code, am_branch,
-                headers, user, db, use_prefix, workflows_committed, workflow_errors,
+            entry = _workflow_entry(workflow, project_code, use_prefix, delete=True)
+            outcome = _remove_on_branch(
+                _Removal(entry["kind"], entry["id"], workflow_name, entry["path"]), owner, repo, project_code,
+                am_branch, headers, user, db, workflows_committed, workflow_errors,
             )
+            _note_removal(carried, entry, outcome)
             continue
         print(f"\n🔍 Committing workflow '{workflow_name}' to {am_branch}")
         try:
@@ -10033,29 +9829,27 @@ def _commit_workflows_to_branch(workflows: List[dict], owner: str, repo: str, pr
                 owner, repo, workflow, project_code, am_branch,
                 headers, repo_name, user, db, use_prefix
             )
-            if status_code in [200, 201]:
-                workflows_committed.append(workflow_name)
-                print(f"✅ Committed workflow '{workflow_name}' (status: {status_code})")
-                _update_workflow_git_hash(db, workflow_name, new_sha, project_code, is_reusable=False)
-                _carry_rename_on_branch(
-                    workflow, owner, repo, project_code, am_branch,
-                    headers, user, db, use_prefix, workflow_errors,
-                )
-            elif status_code == 204:
-                workflows_committed.append(workflow_name)
-                print(f"📌 Workflow '{workflow_name}' unchanged (status: 204)")
-                # 204 means the new name is already on this branch, which still
-                # leaves the old one there when a previous campaign was closed
-                # after the add landed but before the remove did.
-                _carry_rename_on_branch(
-                    workflow, owner, repo, project_code, am_branch,
-                    headers, user, db, use_prefix, workflow_errors,
-                )
-            else:
+            if status_code not in (200, 201, 204):
                 workflow_errors.append(f"{workflow_name}: HTTP {status_code}")
                 print(f"❌ Failed to commit workflow '{workflow_name}': {status_code}")
+                continue
+            workflows_committed.append(workflow_name)
+            # 204 returns the blob already on the branch.
+            entry = _workflow_entry(workflow, project_code, use_prefix, new_sha)
+            _note_carried(carried, entry)
+            print(f"✅ Committed workflow '{workflow_name}' (status: {status_code})")
+            if status_code != 204:
+                # An owned reusable workflow travels this path too (#2084), and a
+                # project may hold a regular and a reusable row of the same name.
+                _update_workflow_git_hash(db, workflow_name, new_sha, project_code,
+                                          is_reusable=bool(workflow.get("is_reusable")))
+            # After a 204 too: the new path already on this branch still leaves
+            # the old one there when a previous campaign was closed after the
+            # add landed but before the remove did.
+            _remove_superseded_copy(entry, target, am_branch, written, owner, repo, project_code,
+                                    user, db, headers, workflow_errors)
         except Exception as e:
-            workflow_errors.append(f"{workflow_name}: {str(e)}")
+            workflow_errors.append(f"{workflow_name}: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}")
             print(f"❌ Exception committing workflow '{workflow_name}': {str(e)}")
             import traceback
             traceback.print_exc()
@@ -10064,8 +9858,13 @@ def _commit_workflows_to_branch(workflows: List[dict], owner: str, repo: str, pr
 
 def _commit_reusable_workflows_to_branch(rxworkflows: List[dict], owner: str, repo: str, project_code: str,
                                           am_branch: str, headers: dict, reusable_repo: str, user: str,
-                                          db: Session, use_prefix: bool) -> tuple:
-    """Commit each reusable workflow to the AM branch. Returns (workflows_committed, workflow_errors)."""
+                                          db: Session, use_prefix: bool, carried: Optional[list] = None,
+                                          target: Optional[tuple] = None,
+                                          written: frozenset = frozenset()) -> tuple:
+    """Commit each reusable workflow to the AM branch. Returns (workflows_committed, workflow_errors).
+
+    ``carried``, ``target`` and ``written`` are as for _commit_workflows_to_branch.
+    """
     workflows_committed = []
     workflow_errors = []
     for workflow in rxworkflows:
@@ -10081,76 +9880,36 @@ def _commit_reusable_workflows_to_branch(rxworkflows: List[dict], owner: str, re
                 owner, repo, workflow, project_code, am_branch,
                 headers, reusable_repo, user, db, use_prefix
             )
-            if status_code in [200, 201]:
-                workflows_committed.append(workflow_name)
-                print(f"✅ Committed reusable workflow '{workflow_name}' (status: {status_code})")
-                _update_workflow_git_hash(db, workflow_name, new_sha, project_code, is_reusable=True)
-                _carry_rename_on_branch(
-                    workflow, owner, repo, project_code, am_branch,
-                    headers, user, db, use_prefix, workflow_errors,
-                )
-            elif status_code == 204:
-                workflows_committed.append(workflow_name)
-                print(f"📌 Reusable workflow '{workflow_name}' unchanged (status: 204)")
-                _carry_rename_on_branch(
-                    workflow, owner, repo, project_code, am_branch,
-                    headers, user, db, use_prefix, workflow_errors,
-                )
-            else:
+            if status_code not in (200, 201, 204):
                 workflow_errors.append(f"{workflow_name}: HTTP {status_code}")
                 print(f"❌ Failed to commit reusable workflow '{workflow_name}': {status_code}")
+                continue
+            workflows_committed.append(workflow_name)
+            entry = _workflow_entry(workflow, project_code, use_prefix, new_sha)
+            _note_carried(carried, entry)
+            print(f"✅ Committed reusable workflow '{workflow_name}' (status: {status_code})")
+            if status_code != 204:
+                _update_workflow_git_hash(db, workflow_name, new_sha, project_code, is_reusable=True)
+            _remove_superseded_copy(entry, target, am_branch, written, owner, repo, project_code,
+                                    user, db, headers, workflow_errors)
         except Exception as e:
-            workflow_errors.append(f"{workflow_name}: {str(e)}")
+            workflow_errors.append(f"{workflow_name}: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}")
             print(f"❌ Exception committing reusable workflow '{workflow_name}': {str(e)}")
             import traceback
             traceback.print_exc()
     return workflows_committed, workflow_errors
 
 
-def _delete_custom_file_from_branch(owner: str, repo: str, cf_path: str, am_branch: str, project_code: str,
-                                    user: str, db: Session, headers: dict) -> tuple:
-    """Delete ``cf_path`` from ``am_branch``. Returns (outcome, error_message).
-
-    ``outcome`` is one of DELETE_DELETED / DELETE_ABSENT / DELETE_FAILED. Absent is
-    not an error, but it is not a commit either — callers that go on to open a PR
-    must not count it, or they open one against a branch with no diff.
-    """
-    # Encoded at the URL, plain in messages: the stored path must not be able to
-    # reshape the request (a "?" or "#" in it would otherwise start a query or
-    # fragment, and "%xx" would be decoded by GitHub).
-    cf_url_path = quote(cf_path, safe="/")
-    sha_resp = github_get(
-        f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{cf_url_path}",
-        user, db,
-        headers=headers,
-        params={"ref": am_branch},
-    )
-    if sha_resp.status_code == 200:
-        current_sha = sha_resp.json().get("sha")
-        del_resp = requests.delete(
-            f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{cf_url_path}",
-            headers=headers,
-            json={
-                "message": f"Delete {cf_path} via ActionsManager [{project_code}] [skip ci]",
-                "sha": current_sha,
-                "branch": am_branch,
-            },
-            timeout=GITHUB_TIMEOUT_SECONDS,
-        )
-        if del_resp.status_code in (200, 201):
-            print(f"✅ Deleted custom file '{cf_path}' from {am_branch}")
-            return DELETE_DELETED, None
-        print(f"❌ Failed to delete custom file '{cf_path}': {del_resp.status_code}")
-        return DELETE_FAILED, f"{cf_path}: HTTP {del_resp.status_code} - {_github_reason(del_resp)}"
-    if sha_resp.status_code == 404:
-        print(f"📌 Custom file '{cf_path}' already absent from {am_branch}")
-        return DELETE_ABSENT, None
-    return DELETE_FAILED, f"{cf_path}: HTTP {sha_resp.status_code} fetching SHA"
-
-
 def _upsert_custom_file_to_am_branch(owner: str, repo: str, cf: dict, am_branch: str, project_code: str,
-                                      user: str, db: Session, headers: dict) -> tuple:
-    """Returns (success, error_message)."""
+                                      user: str, db: Session, headers: dict,
+                                      carried: Optional[list] = None, target: Optional[tuple] = None,
+                                      written: frozenset = frozenset()) -> tuple:
+    """Returns (success, error_message). A commit is added to ``carried``.
+
+    A commit removes the delivered copy it supersedes, as for a workflow
+    (``target`` and ``written`` are _commit_workflows_to_branch's). Its
+    failure is the error of a write that succeeded.
+    """
     cf_path = cf.get("file_path", "")
     cf_url_path = quote(cf_path, safe="/")
     sha_resp = github_get(
@@ -10176,14 +9935,25 @@ def _upsert_custom_file_to_am_branch(owner: str, repo: str, cf: dict, am_branch:
     if put_resp.status_code in (200, 201):
         new_sha = put_resp.json().get("content", {}).get("sha")
         _db_update_custom_file_sha(db, cf["id"], new_sha)
+        entry = _carried_entry(deliveries.CUSTOM_FILE, cf.get("id"), cf_path, new_sha)
+        _note_carried(carried, entry)
         print(f"✅ Committed custom file '{cf_path}' (SHA: {new_sha})")
-        return True, None
+        errors: list = []
+        _remove_superseded_copy(entry, target, am_branch, written, owner, repo, project_code,
+                                user, db, headers, errors)
+        return True, (errors[0] if errors else None)
     print(f"❌ Failed to commit custom file '{cf_path}': {put_resp.status_code}")
     return False, f"{cf_path}: HTTP {put_resp.status_code}"
 
 
-def _project_delivery_targets(db: Session, project: "Project", user: str, headers: dict) -> tuple:
-    """Every (repo_name, owner, repo, branch) ``project`` delivers to.
+def _unresolved(repo_name: str, error: str) -> dict:
+    """A repository whose branches could not be resolved, shaped like the per-target results callers return."""
+    return {"repo": repo_name, "branch": None, "status": DELETE_FAILED, "error": error}
+
+
+def _project_delivery_targets(db: Session, project: "Project", user: str, headers: dict,
+                              only: Optional[Callable[[str], bool]] = None) -> tuple:
+    """Every ``_DeliveryTarget`` ``project`` delivers to, in the repositories *only* accepts when given.
 
     Branches come from ``_resolve_effective_target_branches`` — the same path a PR
     Campaign uses — so a project delivering to ``release/*`` is never silently
@@ -10198,13 +9968,13 @@ def _project_delivery_targets(db: Session, project: "Project", user: str, header
         .join(ProjectRepo, ProjectRepo.repo_id == Repo.repo_id)
         .filter(ProjectRepo.project_id == project.project_id)
         .all()
+        if only is None or only(r.repo_name)
     ]
 
     targets, failures = [], []
     for repo_name in repo_names:
         if "/" not in (repo_name or ""):
-            failures.append({"repo": repo_name, "branch": None, "status": DELETE_FAILED,
-                             "error": f"Invalid repository name '{repo_name}'"})
+            failures.append(_unresolved(repo_name, f"Invalid repository name '{repo_name}'"))
             continue
         owner, repo = repo_name.split("/", 1)
         branches, branch_error = _resolve_effective_target_branches(
@@ -10215,25 +9985,135 @@ def _project_delivery_targets(db: Session, project: "Project", user: str, header
             headers, user,
         )
         if branch_error:
-            failures.append({"repo": repo_name, "branch": None, "status": DELETE_FAILED,
-                             "error": branch_error.get("error")})
+            failures.append(_unresolved(repo_name, branch_error.get("error")))
             continue
-        targets.extend((repo_name, owner, repo, branch) for branch in branches)
+        targets.extend(_DeliveryTarget(repo_name, owner, repo, branch) for branch in branches)
     return targets, failures
 
 
-def _delete_file_on_target_branch(target: tuple, cf_path: str, project_code: str,
-                                  user: str, db: Session, headers: dict) -> dict:
-    """Commit the removal straight to the target branch."""
-    repo_name, owner, repo, branch = target
-    outcome, error = _delete_custom_file_from_branch(
-        owner, repo, cf_path, branch, project_code, user, db, headers
-    )
-    return {"repo": repo_name, "branch": branch, "status": outcome, "error": error}
+def _reusable_delivery_target(reusable_repo: str, user: str, headers: dict, db: Session) -> _DeliveryTarget:
+    """Where reusable workflows are delivered: *reusable_repo*'s default branch.
+
+    Reusable workflows are centralized, not per-branch.
+    """
+    owner, repo = reusable_repo.split("/", 1)
+    return _DeliveryTarget(reusable_repo, owner, repo, get_default_branch(owner, repo, headers, user, db))
 
 
-def delete_custom_file_directly(db: Session, project: "Project", cf_path: str, user: str) -> dict:
-    """Commit the removal of ``cf_path`` straight to every branch ``project`` delivers to.
+def _removable_repos(db: Session, project: "Project", repo_names: Optional[List[str]]) -> Callable[[str], bool]:
+    """Whether a removal may reach a repository: one of the project's own, and of *repo_names* when given.
+
+    Ownership is _project_owns_repo's, the check every deletion makes; the
+    delivery record also remembers repositories since removed from the project.
+    """
+    @functools.lru_cache(maxsize=None)
+    def removable(repo_name: str) -> bool:
+        return (repo_names is None or repo_name in repo_names) and _project_owns_repo(db, project, repo_name)
+    return removable
+
+
+def _configured_targets(db: Session, project: "Project", file, user: str, headers: dict,
+                        removable: Callable[[str], bool]) -> tuple:
+    """Where a campaign would deliver *file* now, in the repositories *removable* allows: (targets, failures)."""
+    if not (isinstance(file, Workflow) and _delivers_to_reusable_repo(project, file)):
+        return _project_delivery_targets(db, project, user, headers, only=removable)
+    reusable_repo = _get_reusable_workflow_repo(project, user, db)
+    if not removable(reusable_repo):
+        return [], []
+    try:
+        return [_reusable_delivery_target(reusable_repo, user, headers, db)], []
+    except Exception as e:
+        print(f"❌ Could not resolve the default branch of {reusable_repo}: {type(e).__name__}")
+        return [], [_unresolved(reusable_repo, f"Failed to resolve branches: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}")]
+
+
+def _removal_of(project: "Project", file) -> _Removal:
+    """*file*, a workflow, custom file or the CODEOWNERS of *project*, as a removal at its current path."""
+    if isinstance(file, CustomFile):
+        return _Removal(deliveries.CUSTOM_FILE, file.id, file.file_path, file.file_path)
+    if isinstance(file, Codeowners):
+        path = file.file_path or ".github/CODEOWNERS"
+        return _Removal(deliveries.CODEOWNERS, file.id, path, path)
+    entry = _workflow_entry({"id": file.workflow_id, "name": file.workflow_name},
+                            project.project_code or "", project.use_prefix)
+    return _Removal(entry["kind"], entry["id"], file.workflow_name, entry["path"])
+
+
+def _places_to_remove(db: Session, project: "Project", file, removal: _Removal, user: str, headers: dict,
+                      removable: Callable[[str], bool], recorded_only: bool) -> tuple:
+    """Where *file* is removed from: ([(target, path, sha)], failures). See _removal_targets."""
+    held = deliveries.delivered_targets(db, removal.kind, removal.file_id, removal.path)
+    if held:
+        return [(_target_on(place.repo_name, place.branch), place.path, place.sha)
+                for place in held if removable(place.repo_name)], []
+    if recorded_only or not _record_never_saw(db, removal.kind, removal.file_id, file):
+        return [], []
+    configured, failures = _configured_targets(db, project, file, user, headers, removable)
+    return [(target, removal.path, None) for target in configured], failures
+
+
+def _removal_targets(db: Session, project: "Project", files: list, user: str = "", headers: Optional[dict] = None,
+                     repo_names: Optional[List[str]] = None, recorded_only: bool = False) -> tuple:
+    """Where removing *files*, workflows, custom files or the CODEOWNERS of *project*, takes each one off.
+
+    Returns ``({_DeliveryTarget: [_Removal]}, failures)``. A file is removed
+    from every (repo, branch) the record holds it delivered to, or an open PR
+    carries it to, at the path it is at there and with the blob the record
+    holds (deliveries.delivered_targets): whatever it is called now, and
+    whatever the project delivers to now. Only a file the record has never
+    seen, which may predate it (_record_never_saw), falls back to where a
+    campaign would deliver it now, at its current path. Either way only in
+    the project's own repositories, and in *repo_names* when given.
+    ``failures`` are repositories that fallback could not resolve branches
+    for, shaped as _project_delivery_targets reports them.
+
+    *recorded_only* leaves out a file the record does not place instead, so
+    the answer is the record's alone and no GitHub call is made: *user* and
+    *headers* are needed only for the fallback.
+    """
+    removable = _removable_repos(db, project, repo_names)
+    targets: dict = {}
+    failures: list = []
+    for file in files:
+        removal = _removal_of(project, file)
+        places, missed = _places_to_remove(db, project, file, removal, user, headers, removable, recorded_only)
+        failures += missed
+        for target, path, sha in places:
+            targets.setdefault(target, []).append(removal._replace(path=path, sha=sha))
+    return targets, failures
+
+
+def _remove_directly(db: Session, project: "Project", target: _DeliveryTarget, removal: _Removal,
+                     user: str, headers: dict) -> dict:
+    """Commit *removal* straight to *target*'s branch; where the file is gone, record so and clear its drift there."""
+    try:
+        status, error = _delete_path_from_branch(target.owner, target.repo, removal.path, target.branch,
+                                                 (project.project_code or "").upper(), user, db, headers,
+                                                 known_sha=removal.sha)
+    except Exception as e:
+        print(f"❌ Exception deleting '{removal.path}' from {target.repo_name} on {target.branch}: {type(e).__name__}")
+        status, error = DELETE_FAILED, f"{removal.path}: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}"
+    if status != DELETE_FAILED:
+        deliveries.record_removed(db, removal.kind, removal.file_id, target.repo_name, target.branch)
+        clear_drift(db, project, removal.kind, removal.file_id, target.repo_name, target.branch)
+    return {"repo": target.repo_name, "branch": target.branch, "status": status, "error": error}
+
+
+def _delete_directly(db: Session, project: "Project", targets: dict, user: str, headers: dict) -> list:
+    """Commit each of *targets*' removals straight to its branch (see _removal_targets).
+
+    The unreviewed path. No branch is listed, and where the record knows the
+    blob nothing is read first: one DELETE per (file, repo, branch). Returns
+    ``{"repo", "branch", "status", "error"}`` per removal.
+    """
+    results = [_remove_directly(db, project, target, removal, user, headers)
+               for target, removals in targets.items() for removal in removals]
+    db.commit()
+    return results
+
+
+def delete_custom_file_directly(db: Session, project: "Project", cf: CustomFile, user: str) -> dict:
+    """Commit the removal of *cf* straight to every branch it is on (_removal_targets).
 
     This is the unreviewed path. Removal through a pull request goes through a real
     PR Campaign instead (``custom_files._delete_via_campaign``), so those deletions
@@ -10247,21 +10127,8 @@ def delete_custom_file_directly(db: Session, project: "Project", cf_path: str, u
     headers = _get_authenticated_headers(user, {"Accept": ACCEPT_HEADER})
     if not headers:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
-
-    project_code = (project.project_code or "").upper()
-    targets, failures = _project_delivery_targets(db, project, user, headers)
-
-    results = list(failures)
-    for target in targets:
-        try:
-            results.append(
-                _delete_file_on_target_branch(target, cf_path, project_code, user, db, headers)
-            )
-        except Exception as e:
-            print(f"❌ Exception deleting '{cf_path}' from {target[0]} on {target[3]}: {e}")
-            results.append({"repo": target[0], "branch": target[3],
-                            "status": DELETE_FAILED, "error": str(e)})
-
+    targets, failures = _removal_targets(db, project, [cf], user, headers)
+    results = failures + _delete_directly(db, project, targets, user, headers)
     errors = [r["error"] for r in results if r["status"] == DELETE_FAILED and r.get("error")]
     return {"targets": results, "removed": not errors, "errors": errors}
 
@@ -10283,17 +10150,23 @@ def _describe_empty_delivery(workflow_errors: list, custom_file_errors: list) ->
 
 
 def _commit_custom_files_to_branch(custom_files: List[dict], owner: str, repo: str, am_branch: str,
-                                    project_code: str, user: str, db: Session, headers: dict) -> tuple:
-    """Delete or upsert each custom file on the AM branch. Returns (custom_files_committed, custom_file_errors)."""
+                                    project_code: str, user: str, db: Session, headers: dict,
+                                    carried: Optional[list] = None, target: Optional[tuple] = None,
+                                    written: frozenset = frozenset()) -> tuple:
+    """Delete or upsert each custom file on the AM branch. Returns (custom_files_committed, custom_file_errors).
+
+    ``carried``, ``target`` and ``written`` are as for _commit_workflows_to_branch.
+    """
     custom_files_committed = []
     custom_file_errors = []
     for cf in custom_files:
         cf_path = cf.get("file_path", "")
         try:
             if cf.get("pending_delete"):
-                outcome, error = _delete_custom_file_from_branch(
+                outcome, error = _delete_path_from_branch(
                     owner, repo, cf_path, am_branch, project_code, user, db, headers
                 )
+                _note_removal(carried, _carried_entry(deliveries.CUSTOM_FILE, cf.get("id"), cf_path, delete=True), outcome)
                 # A file that was already gone leaves the branch identical to its
                 # base. Counting it as committed is what made the campaign open a
                 # PR with no diff and report GitHub's 422 as a bare "Error".
@@ -10302,61 +10175,99 @@ def _commit_custom_files_to_branch(custom_files: List[dict], owner: str, repo: s
                 success = outcome != DELETE_FAILED
             else:
                 success, error = _upsert_custom_file_to_am_branch(
-                    owner, repo, cf, am_branch, project_code, user, db, headers
+                    owner, repo, cf, am_branch, project_code, user, db, headers, carried, target, written,
                 )
             if success:
                 custom_files_committed.append(cf_path)
-            else:
+            if error:
                 custom_file_errors.append(error)
         except Exception as e:
-            custom_file_errors.append(f"{cf_path}: {str(e)}")
+            custom_file_errors.append(f"{cf_path}: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}")
             print(f"❌ Exception committing custom file '{cf_path}': {str(e)}")
     return custom_files_committed, custom_file_errors
 
 
-def _commit_codeowners_to_branch(codeowners_for_repo: Optional[dict], owner: str, repo: str, am_branch: str,
-                                  project_code: str, user: str, db: Session, headers: dict) -> tuple:
-    """Commit CODEOWNERS to the same AM branch as workflows/custom files, so it rides the same PR.
+def _update_codeowners_git_hash(db: Session, codeowners: dict, new_sha: Optional[str]) -> None:
+    """Make the blob a campaign committed the file's git_hash, as _update_workflow_git_hash does.
 
-    Returns (codeowners_committed_path, error_message) — both empty/None when there's nothing to commit.
+    Not when the file was saved again since the campaign read it: that save's
+    zeroed hash marks a change this commit does not carry.
     """
-    if not codeowners_for_repo:
+    if not new_sha:
+        return
+    record = db.query(Codeowners).populate_existing().filter(Codeowners.id == codeowners["id"]).first()
+    if record is not None and (record.content, record.file_path) == (codeowners["content"], codeowners["file_path"]):
+        record.git_hash = new_sha
+        db.commit()
+
+
+def _put_codeowners(codeowners: dict, owner: str, repo: str, am_branch: str, project_code: str,
+                    existing_sha: Optional[str], headers: dict) -> tuple:
+    """Write the CODEOWNERS at its path on *am_branch*. Returns (new blob SHA, error_message)."""
+    co_path = codeowners["file_path"]
+    put_body = {
+        "message": f"Update {co_path} via ActionsManager [{project_code}] [skip ci]",
+        "content": base64.b64encode(codeowners["content"].encode()).decode(),
+        "branch": am_branch,
+    }
+    if existing_sha:
+        put_body["sha"] = existing_sha
+    put_resp = requests.put(
+        f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{quote(co_path, safe='/')}",
+        headers=headers,
+        json=put_body,
+        timeout=GITHUB_TIMEOUT_SECONDS,
+    )
+    if put_resp.status_code not in (200, 201):
+        print(f"❌ Failed to commit CODEOWNERS '{co_path}': {put_resp.status_code}")
+        return None, f"{co_path}: HTTP {put_resp.status_code}"
+    print(f"✅ Committed CODEOWNERS '{co_path}' to {am_branch}")
+    return (put_resp.json().get("content") or {}).get("sha"), None
+
+
+def _commit_codeowners_to_branch(codeowners: Optional[dict], owner: str, repo: str, am_branch: str,
+                                  project_code: str, user: str, db: Session, headers: dict,
+                                  carried: Optional[list] = None, target: Optional[tuple] = None,
+                                  written: frozenset = frozenset()) -> tuple:
+    """Commit the project's CODEOWNERS to the AM branch, so it rides the same PR as workflows/custom files.
+
+    Returns (codeowners_committed_path, error_message) — empty/None when there's
+    nothing to commit. A branch that already holds this file at its path has
+    nothing to commit unless removing the delivered copy it supersedes does:
+    moving the file onto an identical copy is that one change.
+    ``carried``, ``target`` and ``written`` are as for _commit_workflows_to_branch.
+    """
+    if not codeowners:
         return "", None
-    co_path = codeowners_for_repo["file_path"]
-    co_url_path = quote(co_path, safe="/")
+    co_path = codeowners["file_path"]
+    errors: list = []
     try:
         sha_resp = github_get(
-            f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{co_url_path}",
+            f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{quote(co_path, safe='/')}",
             user, db,
             headers=headers,
             params={"ref": am_branch},
         )
         existing_sha = sha_resp.json().get("sha") if sha_resp.status_code == 200 else None
-        put_body = {
-            "message": f"Update {co_path} via ActionsManager [{project_code}] [skip ci]",
-            "content": base64.b64encode(codeowners_for_repo["content"].encode()).decode(),
-            "branch": am_branch,
-        }
-        if existing_sha:
-            put_body["sha"] = existing_sha
-        put_resp = requests.put(
-            f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{co_url_path}",
-            headers=headers,
-            json=put_body,
-            timeout=GITHUB_TIMEOUT_SECONDS,
-        )
-        if put_resp.status_code in (200, 201):
-            new_co_sha = put_resp.json().get("content", {}).get("sha")
-            _mark_codeowners_committed(
-                db, codeowners_for_repo["project_id"], codeowners_for_repo["repo_id"], new_co_sha
-            )
-            print(f"✅ Committed CODEOWNERS '{co_path}' to {am_branch}")
-            return co_path, None
-        print(f"❌ Failed to commit CODEOWNERS '{co_path}': {put_resp.status_code}")
-        return "", f"{co_path}: HTTP {put_resp.status_code}"
+        already_there = existing_sha == deliveries.blob_sha(codeowners["content"])
+        if already_there:
+            print(f"📌 CODEOWNERS '{co_path}' already on {am_branch}")
+            new_sha = existing_sha
+        else:
+            new_sha, error = _put_codeowners(codeowners, owner, repo, am_branch, project_code, existing_sha, headers)
+            if error:
+                return "", error
+        entry = _carried_entry(deliveries.CODEOWNERS, codeowners.get("id"), co_path, new_sha)
+        removed = _remove_superseded_copy(entry, target, am_branch, written, owner, repo, project_code,
+                                          user, db, headers, errors)
+        if already_there and removed != DELETE_DELETED:
+            return "", (errors[0] if errors else None)
+        _update_codeowners_git_hash(db, codeowners, new_sha)
+        _note_carried(carried, entry)
+        return co_path, (errors[0] if errors else None)
     except Exception as e:
-        print(f"❌ Exception committing CODEOWNERS '{co_path}': {str(e)}")
-        return "", f"{co_path}: {str(e)}"
+        print(f"❌ Exception committing CODEOWNERS '{co_path}': {type(e).__name__}")
+        return "", f"{co_path}: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}"
 
 
 def _build_pr_error_result(workflows_committed: list, workflow_errors: list, custom_files_result: Optional[dict],
@@ -10414,7 +10325,8 @@ def _finalize_pr_result(owner: str, repo: str, am_branch: str, target_branch: st
 
     Shared by the regular and reusable workflow update flows. ``delivery`` carries
     what this target actually received and the campaign context describing it:
-    ``workflows_committed``, ``workflow_errors``, ``base_sha``, ``campaign_meta``,
+    ``workflows_committed``, ``workflow_errors``, ``deliveries`` (the entries
+    ``deliveries.record_pending`` takes), ``base_sha``, ``campaign_meta``,
     an optional ``pr_title``, and ``custom_files_result`` (custom_files_committed/
     custom_file_errors/codeowners_committed). Leave ``custom_files_result`` out —
     the reusable flow's case — to omit those keys from the result entirely.
@@ -10444,10 +10356,163 @@ def _finalize_pr_result(owner: str, repo: str, am_branch: str, target_branch: st
             am_branch, target_branch, progress_callback, result_key, reason
         )
 
-    return _build_pr_success_result(
+    result = _build_pr_success_result(
         pr, existing_pr, am_branch, workflows_committed, workflow_errors,
         custom_files_result, progress_callback, result_key
     )
+    result["deliveries"] = delivery.get("deliveries", [])
+    return result
+
+
+class _DeliveryRun:
+    """What every target of one delivery shares, and what the targets report back."""
+
+    def __init__(self, project_code: str, headers: dict, user: str, db: Session,
+                 progress_callback=None, campaign_meta: Optional[dict] = None):
+        self.project_code, self.headers, self.user, self.db = project_code, headers, user, db
+        self.progress_callback, self.campaign_meta = progress_callback, campaign_meta
+        self.results: dict = {}
+        self.base_commits: dict = {}
+        self.protection: dict = {}
+
+    def progress(self, result_key: str, step: str, status: str, *error) -> None:
+        if self.progress_callback:
+            self.progress_callback(result_key, step, status, *error)
+
+    def finish(self) -> dict:
+        _stamp_target_metadata(self.results, self.base_commits, self.protection)
+        return self.results
+
+
+def _files_delivery(workflows_committed: list, workflow_errors: list, carried: list,
+                    custom_files_committed: list, custom_file_errors: list, codeowners_committed: str = "") -> dict:
+    """What one target received, in the shape _finalize_pr_result describes it by."""
+    return {
+        "workflows_committed": workflows_committed,
+        "workflow_errors": workflow_errors,
+        "deliveries": carried,
+        "custom_files_result": {
+            "custom_files_committed": custom_files_committed,
+            "custom_file_errors": custom_file_errors,
+            "codeowners_committed": codeowners_committed,
+        },
+    }
+
+
+def _cut_am_branch(target: _DeliveryTarget, result_key: str, run: _DeliveryRun) -> tuple:
+    """Cut *target*'s AM branch and read its protection. Returns (am_branch, created); no branch on failure."""
+    branch_shas: dict = {}
+    am_branch, branch_created, error_msg = _create_or_get_am_branch(
+        target.owner, target.repo, target.branch, run.project_code, run.headers, run.user, run.db,
+        base_shas=branch_shas,
+    )
+    run.base_commits[result_key] = branch_shas.get(target.branch)
+    if not am_branch:
+        # A 404 here would be the missing repo/branch, not "no protection
+        # configured" — recording "none" would assert something about a
+        # target this campaign never reached. Skips a wasted call too.
+        run.protection[result_key] = {"status": "unknown", "error": error_msg}
+        print(f"❌ Failed to create/get AM branch: {error_msg}")
+        run.results[result_key] = {"status": "error", "error": error_msg}
+        run.progress(result_key, PROGRESS_CREATING_BRANCH, "error", error_msg)
+        return None, False
+    print(f"{'✅ Created' if branch_created else '📌 Using existing'} AM branch: {am_branch}")
+    run.protection[result_key] = _fetch_branch_protection(
+        target.owner, target.repo, target.branch, run.headers, run.user, run.db
+    )
+    return am_branch, branch_created
+
+
+def _committed_anything(delivery: dict) -> bool:
+    files = delivery.get("custom_files_result") or {}
+    return bool(delivery["workflows_committed"] or files.get("custom_files_committed")
+                or files.get("codeowners_committed"))
+
+
+def _nothing_delivered(target: _DeliveryTarget, am_branch: str, branch_created: bool, delivery: dict,
+                       run: _DeliveryRun, result_key: str) -> dict:
+    """The result of a target that received nothing, its AM branch dropped when this run cut it."""
+    files = delivery.get("custom_files_result")
+    workflow_errors = delivery["workflow_errors"]
+    custom_file_errors = files["custom_file_errors"] if files is not None else []
+    nothing_committed = _describe_empty_delivery(workflow_errors, custom_file_errors)
+    print(f"❌ Nothing was committed to {am_branch}: {nothing_committed}")
+    # A branch this run created is byte-identical to its base and can only
+    # ever produce an empty PR, so it is dropped rather than left as a dead
+    # actions-manager/* ref. Only when this run created it:
+    # _create_or_get_am_branch also returns a pre-existing branch (a 422
+    # "already exists"), and that one may carry an open PR whose work deleting
+    # the ref would close.
+    if branch_created:
+        _delete_actions_manager_branch(target.owner, target.repo, am_branch, target.branch, run.user)
+    result = {"status": "error", "error": nothing_committed, "workflow_errors": workflow_errors}
+    if files is not None:
+        result["custom_file_errors"] = custom_file_errors
+    # Distinguishes "the branch never had it" from "this target failed", which
+    # a caller cannot tell from status alone.
+    result["nothing_to_deliver"] = not (workflow_errors or custom_file_errors)
+    run.progress(result_key, PROGRESS_COMMITTING_FILES, "error", nothing_committed)
+    return result
+
+
+def _deliver_to_target(target: _DeliveryTarget, commit: Callable, run: _DeliveryRun) -> None:
+    """Deliver one (repo, branch) on its own AM branch, recording its result on *run*.
+
+    Cuts the AM branch, reads the target's branch protection, commits with
+    ``commit(target, am_branch)``, which returns what it committed in
+    _files_delivery's shape (``custom_files_result`` left out where the
+    delivery carries no custom files), records the removals the branch had
+    nothing to do for, drops a branch left empty, and otherwise opens or
+    updates the pull request (_finalize_pr_result).
+    """
+    result_key = f"{target.repo_name} on {target.branch}"
+    print(f"\n🔍 Processing target branch: {target.branch}")
+    run.progress(result_key, PROGRESS_CREATING_BRANCH, "running")
+    am_branch, branch_created = _cut_am_branch(target, result_key, run)
+    if not am_branch:
+        return
+    run.progress(result_key, PROGRESS_COMMITTING_FILES, "running")
+    delivery = commit(target, am_branch)
+    delivery["deliveries"] = _record_absent_removals(run.db, delivery["deliveries"], target.repo_name, target.branch)
+    if not _committed_anything(delivery):
+        run.results[result_key] = _nothing_delivered(target, am_branch, branch_created, delivery, run, result_key)
+        return
+    run.progress(result_key, PROGRESS_OPENING_PR, "running")
+    run.results[result_key] = _finalize_pr_result(
+        target.owner, target.repo, am_branch, target.branch, run.headers, run.user, run.db,
+        run.project_code, run.progress_callback, result_key,
+        delivery={**delivery, "base_sha": run.base_commits.get(result_key), "campaign_meta": run.campaign_meta},
+    )
+
+
+class _ProjectFiles(NamedTuple):
+    """What one campaign commits to every caller-repository target."""
+    workflows: List[dict]
+    custom_files: List[dict]
+    codeowners: Optional[dict]
+    use_prefix: bool
+    written: frozenset
+
+
+def _commit_project_files(files: _ProjectFiles, run: _DeliveryRun, target: _DeliveryTarget, am_branch: str) -> dict:
+    """Commit the workflows, custom files and CODEOWNERS to the AM branch."""
+    where = {"carried": [], "target": (target.repo_name, target.branch), "written": files.written}
+    workflows_committed, workflow_errors = _commit_workflows_to_branch(
+        files.workflows, target.owner, target.repo, run.project_code, am_branch, run.headers, target.repo_name,
+        run.user, run.db, files.use_prefix, **where,
+    )
+    custom_files_committed, custom_file_errors = _commit_custom_files_to_branch(
+        files.custom_files, target.owner, target.repo, am_branch, run.project_code, run.user, run.db, run.headers,
+        **where,
+    )
+    codeowners_committed, codeowners_error = _commit_codeowners_to_branch(
+        files.codeowners, target.owner, target.repo, am_branch, run.project_code, run.user, run.db, run.headers,
+        **where,
+    )
+    if codeowners_error:
+        custom_file_errors.append(codeowners_error)
+    return _files_delivery(workflows_committed, workflow_errors, where["carried"],
+                           custom_files_committed, custom_file_errors, codeowners_committed)
 
 
 def _process_regular_workflows_update(repo_names: List[str], workflows: List[dict],
@@ -10456,7 +10521,7 @@ def _process_regular_workflows_update(repo_names: List[str], workflows: List[dic
                                     headers: dict, db: Session, user: str = None, use_prefix: bool = True,
                                     project: "Project" = None, progress_callback=None,
                                     custom_files: Optional[List[dict]] = None,
-                                    codeowners_files: Optional[dict] = None,
+                                    codeowners: Optional[dict] = None,
                                     campaign_meta: Optional[dict] = None) -> dict:
     """
     Process updates for regular workflows across multiple repositories.
@@ -10470,129 +10535,52 @@ def _process_regular_workflows_update(repo_names: List[str], workflows: List[dic
     ``custom_files`` (list of dicts with id/file_path/file_content/pending_delete) are
     committed to the same AM branch as workflows so they land in the same PR.
 
-    ``codeowners_files`` (dict keyed by repo_name, with file_path/content/repo_id/
-    project_id) are committed to that repo's same AM branch for the same reason —
-    so CODEOWNERS never opens a second PR against a repo already getting one here.
+    ``codeowners`` (the project's CODEOWNERS, file_path/content) is committed to
+    every AM branch the same way.
 
     Returns:
         dict: Results with PR URLs and status per repo/branch combination
     """
-    results = {}
-    base_commits: dict = {}
-    protection: dict = {}
     custom_files = custom_files or []
-    codeowners_files = codeowners_files or {}
+    files = _ProjectFiles(workflows, custom_files, codeowners, use_prefix,
+                          _paths_written(workflows, custom_files, codeowners, project_code, use_prefix))
+    run = _DeliveryRun(project_code, headers, user, db, progress_callback, campaign_meta)
+    commit = functools.partial(_commit_project_files, files, run)
 
-    print(f"🔍 _process_regular_workflows_update starting:")
+    print("🔍 _process_regular_workflows_update starting:")
     print(f"   Repositories: {repo_names}")
     print(f"   Workflows: {[w.get('name') for w in workflows]}")
     print(f"   Custom files: {[cf.get('file_path') for cf in custom_files]}")
-    print(f"   CODEOWNERS repos: {list(codeowners_files.keys())}")
+    print(f"   CODEOWNERS: {codeowners['file_path'] if codeowners else None}")
     print(f"   Project code: {project_code}")
     print(f"   Use prefix: {use_prefix}")
-    
+
     for repo_name in repo_names:
         print(f"🔍 Processing repo: {repo_name}")
         owner, repo = repo_name.split("/")
-        codeowners_for_repo = codeowners_files.get(repo_name)
-
         target_branches, branch_error = _resolve_effective_target_branches(
             repo_name, owner, repo, project, db, branch_option, regex_pattern, branch_max_age_days, headers, user
         )
         if branch_error:
             return branch_error
-
-        # Process each target branch separately
         for target_branch in target_branches:
-            print(f"\n🔍 Processing target branch: {target_branch}")
-            result_key = f"{repo_name} on {target_branch}"
-            if progress_callback:
-                progress_callback(result_key, PROGRESS_CREATING_BRANCH, "running")
+            _deliver_to_target(_DeliveryTarget(repo_name, owner, repo, target_branch), commit, run)
 
-            # Step 1: Create or get the Actions Manager dedicated branch
-            branch_shas: dict = {}
-            am_branch, branch_created, error_msg = _create_or_get_am_branch(
-                owner, repo, target_branch, project_code, headers, user, db, base_shas=branch_shas
-            )
-            base_commits[result_key] = branch_shas.get(target_branch)
-
-            if not am_branch:
-                # A 404 here would be the missing repo/branch, not "no protection
-                # configured" — recording "none" would assert something about a
-                # target this campaign never reached. Skips a wasted call too.
-                protection[result_key] = {"status": "unknown", "error": error_msg}
-                print(f"❌ Failed to create/get AM branch: {error_msg}")
-                results[result_key] = {"status": "error", "error": error_msg}
-                if progress_callback:
-                    progress_callback(result_key, PROGRESS_CREATING_BRANCH, "error", error_msg)
-                continue
-
-            print(f"{'✅ Created' if branch_created else '📌 Using existing'} AM branch: {am_branch}")
-            protection[result_key] = _fetch_branch_protection(
-                owner, repo, target_branch, headers, user, db
-            )
-            if progress_callback:
-                progress_callback(result_key, PROGRESS_COMMITTING_FILES, "running")
-
-            # Step 2: commit workflows, custom files, and CODEOWNERS to the AM branch
-            workflows_committed, workflow_errors = _commit_workflows_to_branch(
-                workflows, owner, repo, project_code, am_branch, headers, repo_name, user, db, use_prefix
-            )
-            custom_files_committed, custom_file_errors = _commit_custom_files_to_branch(
-                custom_files, owner, repo, am_branch, project_code, user, db, headers
-            )
-            codeowners_committed, codeowners_error = _commit_codeowners_to_branch(
-                codeowners_for_repo, owner, repo, am_branch, project_code, user, db, headers
-            )
-            if codeowners_error:
-                custom_file_errors.append(codeowners_error)
-
-            if not workflows_committed and not custom_files_committed and not codeowners_committed:
-                nothing_committed = _describe_empty_delivery(workflow_errors, custom_file_errors)
-                print(f"❌ Nothing was committed to {am_branch}: {nothing_committed}")
-                # A branch this run created is byte-identical to its base and can
-                # only ever produce an empty PR, so it is dropped rather than left
-                # as a dead actions-manager/* ref. Only when this run created it:
-                # _create_or_get_am_branch also returns a pre-existing branch (a
-                # 422 "already exists"), and that one may carry an open PR whose
-                # work deleting the ref would close.
-                if branch_created:
-                    _delete_actions_manager_branch(owner, repo, am_branch, target_branch, user)
-                results[result_key] = {
-                    "status": "error",
-                    "error": nothing_committed,
-                    "workflow_errors": workflow_errors,
-                    "custom_file_errors": custom_file_errors,
-                    # Distinguishes "the branch never had it" from "this target
-                    # failed", which a caller cannot tell from status alone.
-                    "nothing_to_deliver": not (workflow_errors or custom_file_errors),
-                }
-                if progress_callback:
-                    progress_callback(result_key, PROGRESS_COMMITTING_FILES, "error", nothing_committed)
-                continue
-
-            # Step 3/4: update existing PR, or create a new one
-            if progress_callback:
-                progress_callback(result_key, PROGRESS_OPENING_PR, "running")
-            results[result_key] = _finalize_pr_result(
-                owner, repo, am_branch, target_branch, headers, user, db,
-                project_code, progress_callback, result_key,
-                delivery={
-                    "workflows_committed": workflows_committed,
-                    "workflow_errors": workflow_errors,
-                    "custom_files_result": {
-                        "custom_files_committed": custom_files_committed,
-                        "custom_file_errors": custom_file_errors,
-                        "codeowners_committed": codeowners_committed,
-                    },
-                    "base_sha": base_commits.get(result_key),
-                    "campaign_meta": campaign_meta,
-                },
-            )
-
-    _stamp_target_metadata(results, base_commits, protection)
+    results = run.finish()
     print(f"\n🔍 _process_regular_workflows_update complete. Results: {results}")
     return results
+
+
+def _commit_reusable_files(rxworkflows: List[dict], use_prefix: bool, run: _DeliveryRun,
+                           target: _DeliveryTarget, am_branch: str) -> dict:
+    """Commit the reusable workflows to the AM branch."""
+    carried: list = []
+    workflows_committed, workflow_errors = _commit_reusable_workflows_to_branch(
+        rxworkflows, target.owner, target.repo, run.project_code, am_branch, run.headers, target.repo_name,
+        run.user, run.db, use_prefix, carried=carried, target=(target.repo_name, target.branch),
+        written=_paths_written(rxworkflows, [], None, run.project_code, use_prefix),
+    )
+    return {"workflows_committed": workflows_committed, "workflow_errors": workflow_errors, "deliveries": carried}
 
 
 def _process_reusable_workflows_update(rxworkflows: List[dict], user: str,
@@ -10613,126 +10601,22 @@ def _process_reusable_workflows_update(rxworkflows: List[dict], user: str,
     Returns:
         dict: Results with PR URLs and status per branch combination
     """
-    results = {}
-    base_commits: dict = {}
-    protection: dict = {}
     if not reusable_repo:
         reusable_repo = f"{user}/am-reuseable-workflow"
-    
     if "/" not in reusable_repo:
         return {"error": f"Invalid repo name format: '{reusable_repo}'", "status": 400}
-        
-    owner, repo = reusable_repo.split("/", 1)
-    
-    print(f"🔍 _process_reusable_workflows_update starting:")
+
+    print("🔍 _process_reusable_workflows_update starting:")
     print(f"   Reusable repo: {reusable_repo}")
     print(f"   Workflows: {[w.get('name') for w in rxworkflows]}")
     print(f"   Project code: {project_code}")
 
-    # For reusable workflows, we always target default branch
-    # (reusable workflows are centralized, not per-branch)
-    target_branches = [get_default_branch(owner, repo, headers, user, db)]
-    
-    print(f"🔍 Resolved target branches: {target_branches}")
-    
-    # Process each target branch separately
-    for target_branch in target_branches:
-        print(f"\n🔍 Processing target branch: {target_branch}")
-        result_key = f"{reusable_repo} on {target_branch}"
-        if progress_callback:
-            progress_callback(result_key, PROGRESS_CREATING_BRANCH, "running")
-
-        # Step 1: Create or get the Actions Manager dedicated branch
-        branch_shas: dict = {}
-        am_branch, branch_created, error_msg = _create_or_get_am_branch(
-            owner, repo, target_branch, project_code, headers, user, db, base_shas=branch_shas
-        )
-        base_commits[result_key] = branch_shas.get(target_branch)
-
-        if not am_branch:
-            protection[result_key] = {"status": "unknown", "error": error_msg}
-            print(f"❌ Failed to create/get AM branch: {error_msg}")
-            results[result_key] = {"status": "error", "error": error_msg}
-            if progress_callback:
-                progress_callback(result_key, PROGRESS_CREATING_BRANCH, "error", error_msg)
-            continue
-
-        print(f"{'✅ Created' if branch_created else '📌 Using existing'} AM branch: {am_branch}")
-        protection[result_key] = _fetch_branch_protection(
-            owner, repo, target_branch, headers, user, db
-        )
-        if progress_callback:
-            progress_callback(result_key, PROGRESS_COMMITTING_FILES, "running")
-
-        # Step 2: Commit all reusable workflows to the AM branch
-        workflows_committed, workflow_errors = _commit_reusable_workflows_to_branch(
-            rxworkflows, owner, repo, project_code, am_branch, headers, reusable_repo, user, db, use_prefix
-        )
-
-        if not workflows_committed:
-            nothing_committed = _describe_empty_delivery(workflow_errors, [])
-            print(f"❌ Nothing was committed to {am_branch}: {nothing_committed}")
-            # Only a branch this run created — see the caller-repo path above.
-            if branch_created:
-                _delete_actions_manager_branch(owner, repo, am_branch, target_branch, user)
-            results[result_key] = {
-                "status": "error",
-                "error": nothing_committed,
-                "workflow_errors": workflow_errors,
-                "nothing_to_deliver": not workflow_errors,
-            }
-            if progress_callback:
-                progress_callback(result_key, PROGRESS_COMMITTING_FILES, "error", nothing_committed)
-            continue
-
-        # Step 3/4: update existing PR, or create a new one
-        if progress_callback:
-            progress_callback(result_key, PROGRESS_OPENING_PR, "running")
-        results[result_key] = _finalize_pr_result(
-            owner, repo, am_branch, target_branch, headers, user, db,
-            project_code, progress_callback, result_key,
-            delivery={
-                "workflows_committed": workflows_committed,
-                "workflow_errors": workflow_errors,
-                "base_sha": base_commits.get(result_key),
-                "campaign_meta": campaign_meta,
-            },
-        )
-
-    _stamp_target_metadata(results, base_commits, protection)
+    run = _DeliveryRun(project_code, headers, user, db, progress_callback, campaign_meta)
+    _deliver_to_target(_reusable_delivery_target(reusable_repo, user, headers, db),
+                       functools.partial(_commit_reusable_files, rxworkflows, use_prefix, run), run)
+    results = run.finish()
     print(f"\n🔍 _process_reusable_workflows_update complete. Results: {results}")
     return results
-
-
-def _validate_reusable_workflows_for_caller(
-    project: "Project", rxworkflows: list, db: Session
-) -> Optional[dict]:
-    """Validate linked reusable workflows for a caller (standard) project.
-
-    Returns an error dict if validation fails, otherwise None.
-    """
-    selected_norm = {
-        _normalize_reusable_workflow_name(w.get("name"))
-        for w in rxworkflows
-        if w.get("name")
-    }
-    linked_rows = db.query(Workflow, LinkedReusableWorkflow, Project).join(
-        LinkedReusableWorkflow, LinkedReusableWorkflow.workflow_id == Workflow.workflow_id
-    ).join(
-        Project, Project.project_id == LinkedReusableWorkflow.rwx_project_id
-    ).filter(
-        LinkedReusableWorkflow.standard_project_id == project.project_id
-    ).all()
-    for workflow, _link, rwx_project in linked_rows:
-        if _normalize_reusable_workflow_name(workflow.workflow_name) not in selected_norm:
-            continue
-        validation = validate_reusable_workflow_link(project, rwx_project, db)
-        if not validation.allowed:
-            return {
-                "error": validation.reason or "Unable to validate reusable workflow compatibility. Please refresh and try again.",
-                "status": 400,
-            }
-    return None
 
 
 def _resolve_effective_rwx_params(
@@ -10756,182 +10640,99 @@ def _resolve_effective_rwx_params(
     return project_code, project.use_prefix
 
 
-def _restore_under_review_after_pr_update(
-    db: Session, project: "Project", workflows: list, rxworkflows: list, results: dict
-) -> None:
-    """Restore under_review status for workflows after a successful PR update.
+_ERR_NO_PROJECT_REPOS_SELECTED = (
+    "None of the selected repositories belong to this project. Save the project "
+    "to add a newly selected repository, then push again."
+)
 
-    save_workflows resets status to committed_locally; this re-applies under_review
-    so the PR-backed lock persists across reloads.
+
+def _only_project_repos(db: Session, project: "Project", repo_names: list) -> tuple:
+    """Split the requested repositories into (this project's, the rest) (#2316).
+
+    Save-and-push commits to every repository it is given, and the list comes
+    from the request, so without this an editor of one project could open
+    branches and pull requests carrying its workflows in any repository their
+    token can write to. A repository outside the project is skipped and
+    reported rather than refusing the push, as campaigns skip it
+    (_get_filtered_repo_names): the editor sends every ticked repository, a
+    newly ticked one included before the project is saved, while the push it
+    makes is to the project's own. Ownership is _project_owns_repo's, the
+    check deletion uses.
     """
-    has_pr_result = any(
-        isinstance(r, dict) and r.get("status") in ("pr_updated", "pr_created")
-        for r in results.values()
-    )
-    if not has_pr_result:
-        return
-
-    updated_workflow_names: List[str] = []
-    updated_workflow_names.extend(w.get("name") for w in workflows if w.get("name"))
-    updated_workflow_names.extend(w.get("name") for w in rxworkflows if w.get("name"))
-    if not updated_workflow_names:
-        return
-
-    _update_project_workflows_status(
-        db, project.project_id, "under_review",
-        workflow_names=updated_workflow_names
-    )
-    print(f"✅ Restored under_review status for {len(updated_workflow_names)} workflow(s) after PR update")
-
-    linked_wf_ids = _get_linked_workflow_ids_for_project(
-        db, project.project_id, workflow_names=updated_workflow_names
-    )
-    if linked_wf_ids:
-        db.query(Workflow).filter(
-            Workflow.workflow_id.in_(linked_wf_ids)
-        ).update({"workflow_status": "under_review"}, synchronize_session=False)
-        db.commit()
-        print(f"✅ Restored under_review status for {len(linked_wf_ids)} linked workflow(s) after PR update")
+    kept, skipped = [], []
+    for name in repo_names:
+        cleaned = name.strip() if isinstance(name, str) else ""
+        if cleaned and _project_owns_repo(db, project, cleaned):
+            kept.append(cleaned)
+        else:
+            skipped.append(name)
+    if skipped:
+        print(f"⚠️ update_project_files: skipped {len(skipped)} repository name(s) outside "
+              f"project {project.project_id}")
+    return kept, skipped
 
 
-def _handle_regular_workflows_section(
-    repo_names: list, workflows: list, project_code: str, branch_option: str,
-    regex_pattern: str, branch_max_age_days: int, headers: dict, db: Session,
-    user: str, project: "Project", results: dict
-) -> Optional[dict]:
-    """Process regular workflows and merge into results.
-
-    Returns an error dict if processing fails, otherwise None.
-    """
-    if not repo_names:
-        print(f"⚠️ Skipping regular workflows: No repo_names provided")
-        return None
-    if not workflows:
-        print(f"⚠️ Skipping regular workflows: No workflows provided")
-        return None
-
-    print(f"✅ Processing {len(workflows)} regular workflows across {len(repo_names)} repositories")
-    regular_results = _process_regular_workflows_update(
-        repo_names, workflows, project_code, branch_option,
-        regex_pattern, branch_max_age_days, headers, db, user,
-        project=project,
-    )
-
-    if "error" in regular_results:
-        return regular_results
-    results.update(regular_results)
-    return None
+class _PushedWorkflow(BaseModel):
+    name: str = ""
 
 
-def _handle_reusable_workflows_section(
-    rxworkflows: list, project: "Project", project_code: str,
-    regex_pattern: str, branch_max_age_days: int, headers: dict,
-    db: Session, user: str, results: dict
-) -> Optional[dict]:
-    """Process reusable workflows and merge into results.
-
-    Returns an error dict if validation/processing fails, otherwise None.
-    """
-    if not rxworkflows:
-        print(f"⚠️ Skipping reusable workflows: No rxworkflows provided")
-        return None
-
-    if project.project_type == "standard":
-        validation_error = _validate_reusable_workflows_for_caller(project, rxworkflows, db)
-        if validation_error:
-            return validation_error
-
-    effective_code, effective_prefix = _resolve_effective_rwx_params(project, project_code, db)
-    print(f"✅ Processing {len(rxworkflows)} reusable workflows")
-    reusable_results = _process_reusable_workflows_update(
-        rxworkflows, user, effective_code,
-        regex_pattern, branch_max_age_days, headers, db,
-        reusable_repo=_get_reusable_workflow_repo(project, user, db),
-        use_prefix=effective_prefix
-    )
-
-    if "error" in reusable_results:
-        return reusable_results
-    results.update(reusable_results)
-    return None
+class UpdateProjectFilesRequest(BaseModel):
+    project_name: str
+    repo_names: List[str] = []
+    workflows: List[_PushedWorkflow] = []
+    rxworkflows: List[_PushedWorkflow] = []
+    custom_file_ids: List[int] = []
+    include_codeowners: bool = False
 
 
-@router.post("/api/update-workflow", responses=_responses(401))
-async def update_workflow(
-    request: Request,
+def _pushed_names(pushed: List[_PushedWorkflow]) -> Optional[List[str]]:
+    names = [w.name.strip() for w in pushed if w.name.strip()]
+    return names or None
+
+
+@router.post("/api/update-project-files", responses=_responses(400, 401, 403, 404, 409, 500))
+def update_project_files(
+    payload: UpdateProjectFilesRequest,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
-    """Updates GitHub workflows and rxworkflows (reusable workflows)."""
-    try:
-        data = await request.json()
-        # Use the authenticated header user; fall back to body for legacy clients
-        user = _resolve_github_user(x_github_user, data.get("user"))
-        repo_names = data.get("repo_names") or []
-        workflows = data.get("workflows") or []
-        rxworkflows = data.get("rxworkflows") or []
-        regex_pattern = str(data.get("regex_pattern", "")).strip()
-        branch_option = data.get("branch_option", "default").strip()
-        project_name = data.get("project_name", "").strip()
+    """Push saved project files to the project's pull requests: a PR campaign of just those.
 
-        print(f"📌 update_workflow called with:")
-        print(f"   user: {user}")
-        print(f"   project_name: {project_name}")
-        print(f"   repo_names: {repo_names}")
-        print(f"   workflows count: {len(workflows)}")
-        print(f"   rxworkflows count: {len(rxworkflows)}")
-        print(f"   branch_option: {branch_option}")
-
-        if user not in user_tokens:
-            return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
-
-        token = user_tokens[user]
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": ACCEPT_HEADER,
-            "X-GitHub-Api-Version": X_API_VERSION
-        }
-
-        # A global name match here let any member push to, and change the stored
-        # workflow status of, a project they could only view.
-        project = _find_project_by_name(db, user, project_name)
-        if not project:
-            return {"error": f"Project '{project_name}' not found in database", "status": 404}
-        _require_project_editor(db, user, project)
-
-        project_code = project.project_code.upper()
-        branch_max_age_days = project.branch_max_age_days or 30
-        print(f"📌 Debug: Using Project Code: {project_code}, branch_max_age_days: {branch_max_age_days}")
-
-        results = {}
-
-        error = _handle_regular_workflows_section(
-            repo_names, workflows, project_code, branch_option,
-            regex_pattern, branch_max_age_days, headers, db, user, project, results
-        )
-        if error:
-            return error
-
-        error = _handle_reusable_workflows_section(
-            rxworkflows, project, project_code,
-            regex_pattern, branch_max_age_days, headers, db, user, results
-        )
-        if error:
-            return error
-
-        if not results:
-            print(f"⚠️ No workflows were processed - check that repo_names and workflows/rxworkflows are provided")
-            return {"message": "⚠️ No workflows processed - missing repo_names or workflows data", "results": {}}
-
-        _restore_under_review_after_pr_update(db, project, workflows, rxworkflows, results)
-
-        return {"message": "✅ All workflows updated", "results": results}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error updating workflows: {str(e)}")
-        return {"error": str(e), "status": 500}
+    The editor's "Commit and update PR", for workflows, custom files and the
+    project's CODEOWNERS alike. It used to push the request's copy of a
+    workflow through a commit path of its own that saved no PR row, so the
+    delivery record never learned what the push carried. A campaign records
+    it, and delivers from what is stored, which the editor saves first.
+    """
+    user = account.github_user
+    project = _find_project_by_name(db, user, payload.project_name.strip())
+    if not project:
+        raise HTTPException(status_code=404, detail=PROJECT_ERROR)
+    _require_project_editor(db, user, project)
+    repo_names, skipped_repos = _only_project_repos(db, project, payload.repo_names)
+    names_files = bool(payload.custom_file_ids or payload.include_codeowners)
+    campaign = CreatePullRequestsRequest(
+        project_name=project.project_name,
+        project_id=project.project_id,
+        selected_repos=repo_names or None,
+        # [] keeps a files-only push on the project's repositories without
+        # selecting a workflow; None there would select every one.
+        selected_workflows=_pushed_names(payload.workflows) or ([] if names_files else None),
+        selected_reusable_workflows=_pushed_names(payload.rxworkflows),
+        selected_custom_file_ids=payload.custom_file_ids,
+        include_codeowners=payload.include_codeowners,
+    )
+    if campaign.selected_workflows is None and campaign.selected_reusable_workflows is None:
+        # A campaign selecting neither delivers every workflow in the project.
+        return {"message": "⚠️ Nothing processed - no project files were named", "results": {},
+                "skipped_repos": skipped_repos}
+    # Every repository it named is someone else's: say so rather than deliver to
+    # all of the project's, which is what a campaign does with no selection.
+    if not repo_names and _includes_regular_workflows(campaign, project, db):
+        return {"error": _ERR_NO_PROJECT_REPOS_SELECTED, "status": 400, "skipped_repos": skipped_repos}
+    outcome = create_pull_requests(campaign, BackgroundTasks(), db, github_user=user)
+    return {"message": "✅ All workflows updated", "results": outcome["results"],
+            "skipped_repos": skipped_repos}
 
 
 
@@ -10990,28 +10791,306 @@ def _campaign_found_nothing_to_remove(results: dict) -> bool:
     )
 
 
-def _delete_workflow_via_campaign(db: Session, project: Project, workflow_name: str,
-                                  user: str, repo_names: Optional[List[str]] = None) -> dict:
-    """Run a PR Campaign whose only change is removing this workflow.
+class _CampaignLabel(NamedTuple):
+    """A campaign's name and description, read as a campaign request's are (_campaign_meta)."""
+    campaign_name: str
+    campaign_description: str
 
-    Mirrors ``custom_files._delete_via_campaign``: the campaign machinery already
-    cuts the AM branch, removes the file on it, opens the pull request and records
-    a ProjectPRCampaign linking them, so the deletion lands in PR Campaigns with
-    the grouping, status and merge every other delivery gets rather than as a
-    direct commit nobody reviewed.
 
-    The row stays until the campaign merges — that is what
-    _update_project_workflow_statuses drops on the synced_with_github transition.
+def _commit_removals(targets: dict, run: _DeliveryRun, target: _DeliveryTarget, am_branch: str) -> dict:
+    """Take *target*'s removals off its AM branch.
+
+    A CODEOWNERS removal is reported as a campaign reports delivering it, its
+    error among the custom files' (_commit_project_files).
     """
-    workflow = db.query(Workflow).join(ProjectWorkflow).filter(
+    carried: list = []
+    committed: dict = {kind: [] for kind in _FILE_STATUS}
+    errors: dict = {kind: [] for kind in _FILE_STATUS}
+    for removal in targets[target]:
+        outcome = _remove_on_branch(removal, target.owner, target.repo, run.project_code, am_branch, run.headers,
+                                    run.user, run.db, committed[removal.kind], errors[removal.kind])
+        _note_removal(carried, _carried_entry(removal.kind, removal.file_id, removal.path, delete=True), outcome)
+    return _files_delivery(committed[deliveries.WORKFLOW], errors[deliveries.WORKFLOW], carried,
+                           committed[deliveries.CUSTOM_FILE],
+                           errors[deliveries.CUSTOM_FILE] + errors[deliveries.CODEOWNERS],
+                           ", ".join(committed[deliveries.CODEOWNERS]))
+
+
+def _open_removal_prs(db: Session, project: Project, targets: dict, user: str, headers: dict,
+                      label: _CampaignLabel) -> dict:
+    """Open a pull request on each of *targets* taking its removals off it (see _removal_targets).
+
+    By the steps every campaign delivers a target by (_deliver_to_target), so
+    a target the file is already gone from gets no empty pull request. No
+    preflight: a removal adds nothing to validate. The results are keyed and
+    shaped as create_pull_requests's, for _save_prs_and_update_status.
+    """
+    names = sorted({r.name for removals in targets.values() for r in removals if r.kind == deliveries.WORKFLOW})
+    run = _DeliveryRun(project.project_code, headers, user, db,
+                       campaign_meta=_campaign_meta(label, project, db, names))
+    commit = functools.partial(_commit_removals, targets, run)
+    for target in targets:
+        _deliver_to_target(target, commit, run)
+    return run.finish()
+
+
+def _run_removal_campaign(db: Session, project: Project, file, targets: dict, failures: list,
+                          user: str, headers: dict) -> dict:
+    """The PR Campaign whose only change is removing *file*, a workflow or custom file of *project*.
+
+    *targets* and *failures* are _removal_targets's; a failure is reported
+    among the results, keyed by its repository. Returns what
+    create_pull_requests returns.
+    """
+    name = _removal_of(project, file).name
+    label = _CampaignLabel(f"Remove {name}", f"Removes {name} from {project.project_name}.")
+    results = _open_removal_prs(db, project, targets, user, headers, label)
+    results.update({failure["repo"]: {"status": "error", "error": failure["error"]} for failure in failures})
+    is_workflow = isinstance(file, Workflow)
+    pr_count, campaign_id = _save_prs_and_update_status(
+        results, project, [file.workflow_name] if is_workflow else [], [], db, github_user=user,
+        custom_file_ids=None if is_workflow else [file.id],
+        repo_names=sorted({target.repo_name for target in targets}),
+        campaign_name=label.campaign_name, campaign_description=label.campaign_description,
+    )
+    return {"results": results, "prs_created": pr_count, "campaign_id": campaign_id}
+
+
+def _project_files(db: Session, project: Project) -> list:
+    """Every file *project* owns: its workflows, its reusable ones among them, its custom files and its CODEOWNERS."""
+    workflows = db.query(Workflow).join(ProjectWorkflow).filter(
+        ProjectWorkflow.project_id == project.project_id,
+    ).order_by(Workflow.workflow_name).all()
+    custom = db.query(CustomFile).filter(CustomFile.project_id == project.project_id).order_by(CustomFile.file_path).all()
+    codeowners = _project_codeowners(db, project.project_id)
+    return [*workflows, *custom, *([codeowners] if codeowners else [])]
+
+
+def _project_removal_targets(db: Session, project: Project, files: list) -> dict:
+    """Where deleting *project* with its files takes each of *files* off: where the record holds it, and only there.
+
+    No fallback for a file the record has never placed (_removal_targets's
+    recorded_only), so this never calls GitHub. project_removal_plan names
+    those files instead.
+    """
+    targets, _ = _removal_targets(db, project, files, recorded_only=True)
+    return targets
+
+
+def _described(removal: _Removal) -> dict:
+    return {"kind": removal.kind, "name": removal.name, "path": removal.path}
+
+
+def project_removal_plan(db: Session, project: Project) -> dict:
+    """What deleting *project* with its files would remove, read from the delivery record alone: no GitHub call.
+
+    ``removal_targets`` are the (repo, branch) a removal pull request would be
+    opened on, each with the files it removes there, at their path there.
+    ``unrecorded_files`` may be on GitHub although the record has never placed
+    them (_record_never_saw), so no pull request removes them.
+    """
+    files = _project_files(db, project)
+    targets = _project_removal_targets(db, project, files)
+    planned = {(r.kind, r.file_id) for removals in targets.values() for r in removals}
+    removals = [(file, _removal_of(project, file)) for file in files]
+    return {
+        "removal_targets": [
+            {"repository": target.repo_name, "branch": target.branch, "files": [_described(r) for r in held]}
+            for target, held in sorted(targets.items())
+        ],
+        "unrecorded_files": [
+            _described(r) for file, r in removals
+            if (r.kind, r.file_id) not in planned and _record_never_saw(db, r.kind, r.file_id, file)
+        ],
+    }
+
+
+def _open_prs_holding(db: Session, project: Project) -> list:
+    """The open PRs removing *project*'s files must wait for: its own, and other projects' carrying its files."""
+    carried = deliveries.open_pr_ids_carrying_project(db, project.project_id)
+    return db.query(ProjectPullRequest).filter(
+        ProjectPullRequest.pr_state == "open",
+        or_(ProjectPullRequest.project_id == project.project_id, ProjectPullRequest.pr_id.in_(carried)),
+    ).order_by(ProjectPullRequest.repo_name, ProjectPullRequest.pr_number).all()
+
+
+def _linked_callers(db: Session, account: Optional[Account], project: Project) -> list:
+    """The Caller Workflow Projects linking *project*'s reusable workflows, by name, those *account* may not see as a count."""
+    if project.project_type != "rwx":
+        return []
+    ids = [pid for pid in _get_pr_visibility_project_map(db, project) if pid != project.project_id]
+    callers = db.query(Project).filter(Project.project_id.in_(ids)).all()
+    names = sorted(p.project_name for p in callers if project_role(db, account, p) is not None)
+    hidden = len(callers) - len(names)
+    return names + ([f"{hidden} other project(s)"] if hidden else [])
+
+
+def _repos_out_of_reach(db: Session, project: Project) -> list:
+    """Repositories the record holds *project*'s files delivered to that no removal may reach (_removable_repos)."""
+    removable = _removable_repos(db, project, None)
+    return [name for name in deliveries.project_delivered_repos(db, project.project_id) if not removable(name)]
+
+
+_KEEP_FILES_INSTEAD = "or delete the project and keep its files"
+
+
+def project_removal_blocker(db: Session, account: Optional[Account], project: Project) -> Optional[dict]:
+    """Why *project* cannot be deleted with its files now, or None. Deleting it keeping them is never refused here.
+
+    Shaped as a 409's detail: ``message`` says why and what to do, and the
+    list it is about follows it.
+
+    - An open PR, its own or another project's carrying one of its files:
+      its outcome would settle the deletion's (settle_project_prs).
+    - Caller projects linking a Reusable Workflow Project: removing its
+      reusable workflows breaks their ``uses:`` lines.
+    - Files delivered to repositories no longer in the project: no removal may
+      reach them, so the deletion would only be called off once the rest
+      merged (_settle_deletion).
+    """
+    open_prs = _open_prs_holding(db, project)
+    if open_prs:
+        listed = ", ".join(f"{pr.repo_name}#{pr.pr_number}" for pr in open_prs)
+        return {"message": f"Merge or close its open pull requests first: {listed}.",
+                "open_prs": [{"repo_name": pr.repo_name, "pr_number": pr.pr_number, "pr_url": pr.pr_url,
+                              "target_branch": pr.target_branch} for pr in open_prs]}
+    callers = _linked_callers(db, account, project)
+    if callers:
+        return {"message": f"Caller projects use its reusable workflows: {', '.join(callers)}. Removing them would "
+                           f"break those projects' workflows. Unlink them first, {_KEEP_FILES_INSTEAD}.",
+                "linked_projects": callers}
+    out_of_reach = _repos_out_of_reach(db, project)
+    if out_of_reach:
+        return {"message": f"Some of its files are in repositories no longer in the project: {', '.join(out_of_reach)}. "
+                           f"Add them back to remove the files there too, {_KEEP_FILES_INSTEAD}.",
+                "repositories": out_of_reach}
+    return None
+
+
+class ProjectDeletionOutcome(NamedTuple):
+    """What deleting a project did: deleted it, or left it Deleting while its *prs_created* removal PRs are open.
+
+    *results* are keyed and shaped as create_pull_requests's.
+    """
+    project_deleted: bool
+    pr_state: Optional[str]
+    campaign_id: Optional[int]
+    prs_created: int
+    results: dict
+
+
+def _deletion_outcome(results: dict, campaign_id: Optional[int] = None, prs_created: int = 0) -> ProjectDeletionOutcome:
+    deleting = prs_created > 0
+    return ProjectDeletionOutcome(not deleting, PROJECT_DELETING if deleting else None, campaign_id, prs_created,
+                                  results)
+
+
+def _deleted_now(db: Session, project: Project, results: dict) -> ProjectDeletionOutcome:
+    delete_project_record(db, project)
+    return _deletion_outcome(results)
+
+
+def start_project_removal(db: Session, project: Project, user: str) -> ProjectDeletionOutcome:
+    """Delete *project* with its files: remove them from GitHub by a last PR Campaign, never a direct commit.
+
+    One pull request per (repo, branch) the delivery record holds any of its
+    workflows, custom files or CODEOWNERS on, removing each at its path there
+    (_project_removal_targets). While they are open the project is Deleting,
+    read-only to everyone (authorization.project_role); settle_project_prs
+    deletes it once all have merged, and calls the deletion off when one
+    closes. With nothing to remove it is deleted now. When no pull request
+    could be opened for any other reason it is a 502 and the project is left
+    as it was. The caller refuses first what project_removal_blocker refuses.
+    """
+    headers = _get_authenticated_headers(user, {"Accept": ACCEPT_HEADER})
+    if not headers:
+        raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
+    targets = _project_removal_targets(db, project, _project_files(db, project))
+    if not targets:
+        return _deleted_now(db, project, {})
+    name = project.project_name
+    label = _CampaignLabel(f"Delete project {name}", f"Removes the files of {name} from GitHub. Merging every "
+                                                     "pull request deletes the project; closing one keeps it.")
+    results = _open_removal_prs(db, project, targets, user, headers, label)
+    pr_count, campaign_id = _save_prs_and_update_status(
+        results, project, [], [], db, github_user=user, repo_names=sorted({t.repo_name for t in targets}),
+        campaign_name=label.campaign_name, campaign_description=label.campaign_description,
+        project_state=PROJECT_DELETING,
+    )
+    if pr_count:
+        return _deletion_outcome(results, campaign_id, pr_count)
+    if _campaign_found_nothing_to_remove(results):
+        return _deleted_now(db, project, results)
+    raise HTTPException(status_code=502, detail={
+        "message": f"No pull request could be opened to remove the files of '{name}', so it was not deleted.",
+        "results": results,
+    })
+
+
+def _project_workflow_named(db: Session, project: Project, workflow_name: str):
+    """*project*'s workflow called *workflow_name*, matched exactly but for case.
+
+    Never ilike: "_" is a LIKE wildcard and workflow names routinely contain one.
+    """
+    return db.query(Workflow).join(ProjectWorkflow).filter(
         ProjectWorkflow.project_id == project.project_id,
         func.lower(Workflow.workflow_name) == workflow_name.lower(),
     ).first()
+
+
+def _removed_without_campaign(db: Session, project: Project, workflow, message: str,
+                              results: Optional[dict] = None) -> dict:
+    """Drop *workflow* from *project* when there is no GitHub copy for a pull request to review."""
+    workflow_id = workflow.workflow_id
+    _detach_workflow_from_project(db, project.project_id, workflow)
+    db.commit()
+    drop_workflow_drift(db, project, workflow_id)
+    return {"message": message, "delivery": DELIVERY_CAMPAIGN, "prs_created": 0, "results": results or {}}
+
+
+def _removed_as_absent(db: Session, project: Project, workflow, results: Optional[dict] = None) -> dict:
+    return _removed_without_campaign(
+        db, project, workflow, f"✅ '{workflow.workflow_name}' removed — it was not present in any target branch",
+        results,
+    )
+
+
+def _no_removal_pr(db: Session, project: Project, workflow, results: dict) -> dict:
+    """A removal campaign opened nothing: removed if no target had the file, else a 502."""
+    if _campaign_found_nothing_to_remove(results):
+        # Nothing failed — the file is not on any target branch, so there is
+        # no removal to review. Erroring here would leave a workflow the user
+        # asked to delete both undeleted and unexplained.
+        return _removed_as_absent(db, project, workflow, results)
+    raise HTTPException(
+        status_code=502,
+        detail={"message": f"No pull request was opened to remove '{workflow.workflow_name}'", "results": results},
+    )
+
+
+def _delete_workflow_via_campaign(db: Session, project: Project, workflow_name: str, user: str,
+                                  headers: dict, repo_names: Optional[List[str]] = None) -> dict:
+    """Run a PR Campaign whose only change is removing this workflow.
+
+    Mirrors ``custom_files._delete_via_campaign``: each pull request removes the
+    file where the delivery record says it is (_removal_targets), and the
+    campaign record links them, so the deletion lands in PR Campaigns with the
+    grouping, status and merge every other delivery gets rather than as a
+    direct commit nobody reviewed. A Reusable Workflow Project's own reusable
+    workflows too, in its repository.
+
+    The row stays until the campaign merges — that is what
+    _update_project_workflows_status drops on the synced_with_github transition.
+    """
+    workflow = _project_workflow_named(db, project, workflow_name)
     if not workflow:
         raise HTTPException(
             status_code=404,
             detail=f"Workflow '{workflow_name}' not found in project '{project.project_name}'",
         )
+    if _delivers_to_reusable_repo(project, workflow):
+        # The lock a campaign carrying it would meet (_build_reusable_workflow_results).
+        _check_reusable_workflow_locks(db, [workflow], project.project_id)
 
     # A project with no repositories has nowhere to deliver to, so a campaign
     # would have no target. There is no GitHub copy to review the removal of:
@@ -11019,16 +11098,16 @@ def _delete_workflow_via_campaign(db: Session, project: Project, workflow_name: 
     # would leave the workflow undeletable for anyone who left the preselected
     # campaign option alone.
     if not db.query(ProjectRepo).filter_by(project_id=project.project_id).first():
-        workflow_id = workflow.workflow_id
-        _detach_workflow_from_project(db, project.project_id, workflow)
-        db.commit()
-        drop_workflow_drift(db, project, workflow_id)
-        return {
-            "message": f"✅ '{workflow_name}' removed — this project has no repositories to deliver to",
-            "delivery": DELIVERY_CAMPAIGN,
-            "prs_created": 0,
-            "results": {},
-        }
+        return _removed_without_campaign(
+            db, project, workflow, f"✅ '{workflow_name}' removed — this project has no repositories to deliver to",
+        )
+
+    # Before the mark below, whose status reads as a delivery made before the
+    # record existed. _authorize_workflow_deletion vetted repo_names; none
+    # means every project repository.
+    targets, failures = _removal_targets(db, project, [workflow], user, headers, repo_names or None)
+    if not targets and not failures:
+        return _removed_as_absent(db, project, workflow)
 
     previous_status = workflow.workflow_status
     workflow.pending_delete = True
@@ -11040,74 +11119,72 @@ def _delete_workflow_via_campaign(db: Session, project: Project, workflow_name: 
         workflow.workflow_status = previous_status
         db.commit()
 
-    payload = CreatePullRequestsRequest(
-        project_name=project.project_name,
-        github_user=user,
-        # Scoped to this one removal. None would mean "everything changed" and
-        # sweep unrelated work into a campaign the user asked for by clicking
-        # Delete.
-        selected_workflows=[workflow.workflow_name],
-        selected_reusable_workflows=[],
-        selected_custom_file_ids=[],
-        selected_codeowners_repos=[],
-        # _authorize_workflow_deletion vetted these. Passing None would make
-        # _get_filtered_repo_names return every project repository, so a caller
-        # who asked to remove the file from two of eight would get all eight.
-        selected_repos=repo_names or None,
-        campaign_name=f"Remove {workflow.workflow_name}",
-        campaign_description=f"Removes {workflow.workflow_name} from {project.project_name}.",
-    )
-
     try:
-        campaign = create_pull_requests(payload, BackgroundTasks(), db, github_user=user)
+        campaign = _run_removal_campaign(db, project, workflow, targets, failures, user, headers)
     except Exception:
         _unmark()
         raise
 
-    if not campaign.get("prs_created"):
-        # A campaign can return 200 having opened nothing. Leaving the workflow
-        # marked for a deletion no pull request will carry out would strand it.
+    if not campaign["prs_created"]:
+        # Leaving the workflow marked for a deletion no pull request will carry
+        # out would strand it.
         _unmark()
-        results = campaign.get("results") or {}
-        if _campaign_found_nothing_to_remove(results):
-            # Nothing failed — the file is not on any target branch, so there is
-            # no removal to review. Erroring here would leave a workflow the user
-            # asked to delete both undeleted and unexplained.
-            workflow_id = workflow.workflow_id
-            _detach_workflow_from_project(db, project.project_id, workflow)
-            db.commit()
-            drop_workflow_drift(db, project, workflow_id)
-            return {
-                "message": f"✅ '{workflow_name}' removed — it was not present in any target branch",
-                "delivery": DELIVERY_CAMPAIGN,
-                "prs_created": 0,
-                "results": results,
-            }
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": f"No pull request was opened to remove '{workflow.workflow_name}'",
-                "results": results,
-            },
-        )
+        return _no_removal_pr(db, project, workflow, campaign["results"])
 
     return {
         "message": f"✅ PR Campaign opened to remove '{workflow.workflow_name}'",
         "delivery": DELIVERY_CAMPAIGN,
-        "campaign_id": campaign.get("campaign_id"),
+        "campaign_id": campaign["campaign_id"],
         "prs_created": campaign["prs_created"],
-        "results": campaign.get("results", {}),
+        "results": campaign["results"],
     }
 
 
-@router.delete("/api/delete-workflow", responses=_responses(400, 401, 404, 500))
-async def delete_workflow(request: Request, db: Annotated[Session, Depends(get_db)]):
-    """Deletes a GitHub workflow file from all branches where it exists."""
+def _results_by_repo(outcomes: list, failures: list, repo_names: List[str]) -> dict:
+    """``{repo: {"deleted": [branches], "failed": {branch: reason}}}`` for each of *repo_names*.
+
+    The shape the direct workflow deletes report. A repository whose branches
+    could not be resolved also carries the ``error``.
+    """
+    results: dict = {}
+
+    def entry(repo_name: str) -> dict:
+        return results.setdefault(repo_name, {"deleted": [], "failed": {}})
+
+    for name in repo_names:
+        entry(name)
+    for outcome in outcomes:
+        if outcome["status"] == DELETE_DELETED:
+            entry(outcome["repo"])["deleted"].append(outcome["branch"])
+        elif outcome["status"] == DELETE_FAILED:
+            entry(outcome["repo"])["failed"][outcome["branch"]] = outcome["error"]
+    for failure in failures:
+        entry(failure["repo"])["error"] = failure["error"]
+    return results
+
+
+def _delete_workflow_directly(db: Session, project: Project, workflow_name: str, user: str, headers: dict,
+                              repo_names: List[str]) -> dict:
+    """Commit the removal of *project*'s workflow straight to each branch of *repo_names* it is on."""
+    workflow = _project_workflow_named(db, project, workflow_name)
+    if workflow is None:
+        return _results_by_repo([], [], repo_names)
+    targets, failures = _removal_targets(db, project, [workflow], user, headers, repo_names)
+    return _results_by_repo(_delete_directly(db, project, targets, user, headers), failures, repo_names)
+
+
+@router.delete("/api/delete-workflow", responses=_responses(400, 401, 404, 409, 500))
+async def delete_workflow(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
+):
+    """Deletes a workflow file from the branches the delivery record says it is on (_removal_targets)."""
     try:
         data = await request.json()
         print(f"📌 Debug: Incoming Delete Request: {data}")
 
-        user = _resolve_github_user(request.headers.get("X-GitHub-User"), data.get("user"))
+        user = account.github_user
         repo_names = data.get("repo_names", [])
         project_name = data.get("project_name", "").strip()
 
@@ -11120,46 +11197,17 @@ async def delete_workflow(request: Request, db: Annotated[Session, Depends(get_d
         if user not in user_tokens:
             raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
-        token = user_tokens[user]
         headers = {
-            "Authorization": f"token {token}",
+            "Authorization": f"token {user_tokens[user]}",
             "Accept": ACCEPT_HEADER
         }
 
         project = _authorize_workflow_deletion(db, user, project_name, repo_names)
 
-        project_code = project.project_code.upper()
-        use_prefix = project.use_prefix
-        print(f"📌 Debug: Using Project Code: {project_code}, Use Prefix: {use_prefix}")
-
         if _validated_delete_delivery(data) == DELIVERY_CAMPAIGN:
-            return _delete_workflow_via_campaign(db, project, workflow_name, user, repo_names)
+            return _delete_workflow_via_campaign(db, project, workflow_name, user, headers, repo_names)
 
-        results = {}
-        formatted_workflow_name = format_workflow_name(workflow_name, project_code, use_prefix)
-
-        async with httpx.AsyncClient() as client:
-            for repo_name in repo_names:
-                results[repo_name] = await _delete_workflow_from_repo(
-                    client, repo_name, formatted_workflow_name, workflow_name, headers
-                )
-
-        # Persisted drift compares the managed version against a file that no
-        # longer exists in these repos, so it is stale. Scoped to repos the
-        # delete actually succeeded in - a failed one may still be drifted.
-        deleted_repos = [
-            name for name, outcome in results.items()
-            if isinstance(outcome, dict) and outcome.get("deleted")
-        ]
-        if deleted_repos:
-            deleted_wf = db.query(Workflow).join(ProjectWorkflow).filter(
-                ProjectWorkflow.project_id == project.project_id,
-                func.lower(Workflow.workflow_name) == workflow_name.lower(),
-            ).first()
-            if deleted_wf:
-                for repo_name in deleted_repos:
-                    clear_workflow_drift(db, project, deleted_wf.workflow_id, repo_name)
-
+        results = _delete_workflow_directly(db, project, workflow_name, user, headers, repo_names)
         return {"message": "✅ Workflow deletions completed!", "results": results}
 
     except HTTPException:
@@ -11167,68 +11215,7 @@ async def delete_workflow(request: Request, db: Annotated[Session, Depends(get_d
         raise
     except Exception as e:
         print(f"❌ Error deleting workflows: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-async def _delete_workflow_from_repo(client, repo_name: str, formatted_workflow_name: str, workflow_name: str, headers: dict):
-    """Delete a workflow file from all branches in a single repository."""
-    owner, repo = repo_name.split("/")
-    workflow_path = quote(f".github/workflows/{formatted_workflow_name}", safe="/")
-
-    # Fetch all branches
-    branches_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/branches"
-    branches_response = await client.get(branches_url, headers=headers)
-
-    if branches_response.status_code != 200:
-        print(f"❌ Error: Failed to fetch branches for {repo_name}")
-        return "Branch fetch failed"
-
-    branches = [branch["name"] for branch in branches_response.json()]
-    deleted_branches = []
-    failed_branches = {}
-
-    for branch in branches:
-        workflow_file_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{workflow_path}?ref={branch}"
-
-        # Check if workflow file exists
-        response = await client.get(workflow_file_url, headers=headers)
-        if response.status_code != 200:
-            print(f"⚠️ Workflow {workflow_name} not found in {repo_name} on branch {branch}")
-            continue
-
-        sha = response.json().get("sha")
-        if not sha:
-            print(f"❌ Error: Could not retrieve SHA for {workflow_path} in {repo_name} on {branch}")
-            failed_branches[branch] = "SHA retrieval failed"
-            continue
-
-        print(f"📌 Debug: Deleting {workflow_path} in {repo_name} on branch {branch}")
-
-        # Send DELETE request with JSON body using request() method
-        delete_payload = {
-            "message": f"Deleting {formatted_workflow_name} workflow",
-            "sha": sha,
-            "branch": branch
-        }
-
-        # Add Content-Type header for JSON payload
-        delete_headers = {**headers, "Content-Type": "application/json"}
-        delete_response = await client.request(
-            "DELETE",
-            workflow_file_url,
-            content=json.dumps(delete_payload),
-            headers=delete_headers
-        )
-
-        if delete_response.status_code == 200:
-            deleted_branches.append(branch)
-        else:
-            failed_branches[branch] = delete_response.status_code
-
-    return {
-        "deleted": deleted_branches,
-        "failed": failed_branches
-    }
+        raise HTTPException(status_code=500, detail="Error deleting workflows")
 
 
 _ERR_REUSABLE_NOT_OURS = (
@@ -11261,14 +11248,18 @@ def _require_owns_reusable_repo(db: Session, project: Project, user: str) -> str
     return reusable_repo
 
 
-@router.delete("/api/delete-reusable-workflow", responses=_responses(400, 401, 404, 500))
-async def delete_reusable_workflow(request: Request, db: Annotated[Session, Depends(get_db)]):
-    """Deletes a reusable workflow from the am-reuseable-workflow repository."""
+@router.delete("/api/delete-reusable-workflow", responses=_responses(400, 401, 404, 409, 500))
+async def delete_reusable_workflow(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
+):
+    """Deletes a reusable workflow from the branches of the reusable-workflow repository it is on."""
     try:
         data = await request.json()
         print(f"📌 Debug: Incoming Delete Reusable Workflow Request: {data}")
 
-        user = _resolve_github_user(request.headers.get("X-GitHub-User"), data.get("user"))
+        user = account.github_user
         workflow_name = data.get("workflow_name", "").strip()
         project_name = data.get("project_name", "").strip()
 
@@ -11278,9 +11269,8 @@ async def delete_reusable_workflow(request: Request, db: Annotated[Session, Depe
         if user not in user_tokens:
             raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
-        token = user_tokens[user]
         headers = {
-            "Authorization": f"token {token}",
+            "Authorization": f"token {user_tokens[user]}",
             "Accept": ACCEPT_HEADER
         }
 
@@ -11292,76 +11282,10 @@ async def delete_reusable_workflow(request: Request, db: Annotated[Session, Depe
         _require_project_editor(db, user, project)
         reusable_repo_name = _require_owns_reusable_repo(db, project, user)
 
-        project_code = project.project_code.upper()
-        use_prefix = project.use_prefix
-        print(f"📌 Debug: Using Project Code: {project_code}, Use Prefix: {use_prefix}")
-
         if "/" not in reusable_repo_name:
             raise HTTPException(status_code=400, detail=f"Invalid reusable repository name: '{reusable_repo_name}'")
-            
-        owner, repo = reusable_repo_name.split("/", 1)
-        formatted_workflow_name = format_workflow_name(workflow_name, project_code, use_prefix)
-        workflow_path = f".github/workflows/{formatted_workflow_name}"
 
-        # Fetch all branches
-        branches_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/branches"
-        
-        async with httpx.AsyncClient() as client:
-            branches_response = await client.get(branches_url, headers=headers)
-
-            if branches_response.status_code != 200:
-                print(f"❌ Error: Failed to fetch branches for {reusable_repo_name}")
-                raise HTTPException(status_code=branches_response.status_code, detail=f"Failed to fetch branches for {reusable_repo_name}")
-
-            branches = [branch["name"] for branch in branches_response.json()]
-            deleted_branches = []
-            failed_branches = {}
-
-            for branch in branches:
-                workflow_file_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{workflow_path}?ref={branch}"
-
-                # Check if workflow file exists
-                response = await client.get(workflow_file_url, headers=headers)
-                if response.status_code != 200:
-                    print(f"⚠️ Reusable workflow {workflow_name} not found in {reusable_repo_name} on branch {branch}")
-                    continue  # Skip to next branch
-
-                sha = response.json().get("sha")
-                if not sha:
-                    print(f"❌ Error: Could not retrieve SHA for {workflow_path} in {reusable_repo_name} on {branch}")
-                    failed_branches[branch] = "SHA retrieval failed"
-                    continue
-
-                print(f"📌 Debug: Deleting reusable workflow {workflow_path} in {reusable_repo_name} on branch {branch}")
-
-                # Send DELETE request with JSON body using request() method
-                delete_payload = {
-                    "message": f"Deleting reusable workflow {formatted_workflow_name}",
-                    "sha": sha,
-                    "branch": branch
-                }
-
-                # Add Content-Type header for JSON payload
-                delete_headers = {**headers, "Content-Type": "application/json"}
-                delete_response = await client.request(
-                    "DELETE",
-                    workflow_file_url,
-                    content=json.dumps(delete_payload),
-                    headers=delete_headers
-                )
-
-                if delete_response.status_code == 200:
-                    deleted_branches.append(branch)
-                else:
-                    failed_branches[branch] = delete_response.status_code
-
-        results = {
-            reusable_repo_name: {
-                "deleted": deleted_branches,
-                "failed": failed_branches
-            }
-        }
-
+        results = _delete_workflow_directly(db, project, workflow_name, user, headers, [reusable_repo_name])
         return {"message": "✅ Reusable workflow deletion completed!", "results": results}
 
     except HTTPException:
@@ -11369,11 +11293,15 @@ async def delete_reusable_workflow(request: Request, db: Annotated[Session, Depe
         raise
     except Exception as e:
         print(f"❌ Error deleting reusable workflow: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error deleting reusable workflow")
 
 
-@router.delete("/api/delete-db-workflow", responses=_responses(400, 401, 404, 500))
-async def delete_db_workflow(request: Request, db: Annotated[Session, Depends(get_db)]):
+@router.delete("/api/delete-db-workflow", responses=_responses(400, 401, 404, 409, 500))
+async def delete_db_workflow(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
+):
     """
     Deletes a workflow from the specified project and removes it completely 
     only if no other projects are using it.
@@ -11382,7 +11310,7 @@ async def delete_db_workflow(request: Request, db: Annotated[Session, Depends(ge
         data = await request.json()
         print(f"📌 Debug: Incoming Delete DB Workflow Request: {data}")
 
-        user = _resolve_github_user(request.headers.get("X-GitHub-User"), data.get("user"))
+        user = account.github_user
         workflow_name = data.get("workflow_name", "").strip()
         project_name = data.get("project_name", "").strip()
 
@@ -11433,122 +11361,7 @@ async def delete_db_workflow(request: Request, db: Annotated[Session, Depends(ge
     except Exception as e:
         print(f"❌ Error deleting workflow from database: {str(e)}")
         db.rollback()  # Ensure database consistency
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-async def _fetch_single_workflow_status(client, owner: str, repo: str, formatted_workflow_name: str, headers: dict) -> dict:
-    """Fetch the latest run status for a single workflow in a repository."""
-    try:
-        workflows_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows"
-        workflows_response = await client.get(workflows_url, headers=headers)
-
-        if workflows_response.status_code != 200:
-            return {"status": "error", "message": f"Failed to fetch workflows: {workflows_response.status_code}", "html_url": None}
-
-        workflows_data = workflows_response.json()
-        target_workflow = None
-        for workflow in workflows_data.get("workflows", []):
-            if workflow.get("path", "").endswith(formatted_workflow_name):
-                target_workflow = workflow
-                break
-
-        if not target_workflow:
-            return {"status": "not_found", "message": "Workflow not found in repository", "html_url": None}
-
-        workflow_id = target_workflow["id"]
-        runs_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs?per_page=1"
-        runs_response = await client.get(runs_url, headers=headers)
-
-        if runs_response.status_code != 200:
-            return {"status": "error", "message": f"Failed to fetch runs: {runs_response.status_code}", "html_url": None}
-
-        runs_data = runs_response.json()
-        if not runs_data.get("workflow_runs"):
-            return {"status": "no_runs", "message": "No workflow runs found", "html_url": None}
-
-        latest_run = runs_data["workflow_runs"][0]
-        return {
-            "status": latest_run["conclusion"] or latest_run["status"],
-            "run_number": latest_run["run_number"],
-            "html_url": latest_run["html_url"],
-            "created_at": latest_run["created_at"],
-            "updated_at": latest_run["updated_at"]
-        }
-    except Exception as e:
-        print(f"❌ Error fetching workflow status: {str(e)}")
-        return {"status": "error", "message": str(e), "html_url": None}
-
-
-@router.get("/api/workflow-status", responses=_responses(400, 401, 500))
-async def get_workflow_status(request: Request, db: Annotated[Session, Depends(get_db)]):
-    """Get the latest workflow run status for workflows in selected repositories."""
-    try:
-        # Get query parameters
-        user = request.query_params.get("user")
-        repo_names = request.query_params.get("repo_names", "").split(",")
-        workflow_names = request.query_params.get("workflow_names", "").split(",")
-        project_name = request.query_params.get("project_name", "").strip()
-
-        if not user or not repo_names or not workflow_names or not project_name:
-            raise HTTPException(status_code=400, detail="Missing required parameters")
-
-        if user not in user_tokens:
-            raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
-
-        token = user_tokens[user]
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": ACCEPT_HEADER,
-            "X-GitHub-Api-Version": X_API_VERSION
-        }
-
-        # Get project code from database
-        project = db.query(Project).filter(Project.project_name.ilike(project_name)).first()
-        if not project:
-            return {"error": f"Project '{project_name}' not found in database", "status": 404}
-
-        project_code = project.project_code.upper()
-        use_prefix = project.use_prefix
-        workflow_statuses = {}
-
-        # Filter out empty repo names and workflow names
-        repo_names = [repo.strip() for repo in repo_names if repo.strip()]
-        workflow_names = [workflow.strip() for workflow in workflow_names if workflow.strip()]
-
-        async with httpx.AsyncClient() as client:
-            for repo_name in repo_names:
-                if "/" not in repo_name:
-                    continue
-                    
-                owner, repo = repo_name.split("/", 1)
-                
-                for workflow_name in workflow_names:
-                    formatted_workflow_name = format_workflow_name(workflow_name, project_code, use_prefix)
-                    workflow_key = f"{repo_name}/{workflow_name}"
-                    workflow_statuses[workflow_key] = await _fetch_single_workflow_status(
-                        client, owner, repo, formatted_workflow_name, headers
-                    )
-        
-        return {"workflow_statuses": workflow_statuses}
-        
-    except Exception as e:
-        print(f"❌ Error getting workflow status: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/api/workflow-templates/types", responses=_responses(500))
-def get_template_types(request: Request, db: Annotated[Session, Depends(get_db)]):
-    """Get available workflow template types."""
-    auth_module.resolve_authenticated_user(request, db)
-    try:
-        template_types = get_available_template_types()
-        return {
-            "message": "Available template types retrieved successfully",
-            "template_types": template_types
-        }
-    except Exception as e:
-        print(f"❌ Error getting template types: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error deleting workflow from database")
 
 
 @router.post("/api/workflow-templates/generate", responses=_responses(500))
@@ -11599,157 +11412,17 @@ def generate_workflow_templates(request: Request, body: WorkflowTemplateRequest,
 
     except Exception as e:
         print(f"❌ Error generating workflow templates: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error generating workflow templates")
 
 
-@router.post("/api/workflow-templates/standard", responses=_responses(500))
-def generate_standard_template(request: Request, body: WorkflowTemplateRequest, db: Annotated[Session, Depends(get_db)]):
-    """Generate just the standard workflow template."""
-    auth_module.resolve_authenticated_user(request, db)
-    try:
-        template = generate_standard_workflow_template(
-            user_org=body.user_org,
-            project_code=body.project_code,
-            build_type=body.build_type
-        )
-
-        return {
-            "message": "Standard workflow template generated successfully",
-            "template": {
-                "name": "standard-pipeline",
-                "content": template,
-                "description": f"Standard pipeline that calls reusable workflow for {body.build_type} projects"
-            }
-        }
-
-    except Exception as e:
-        print(f"❌ Error generating standard template: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/api/workflow-templates/reusable", responses=_responses(500))
-def generate_reusable_template(request: Request, body: WorkflowTemplateRequest, db: Annotated[Session, Depends(get_db)]):
-    """Generate just the reusable workflow template."""
-    auth_module.resolve_authenticated_user(request, db)
-    try:
-        template = generate_reusable_workflow_template(
-            build_type=body.build_type,
-            project_code=body.project_code
-        )
-
-        return {
-            "message": "Reusable workflow template generated successfully",
-            "template": {
-                "name": "main-workflow",
-                "content": template,
-                "description": f"Main reusable workflow for {body.build_type} projects"
-            }
-        }
-
-    except Exception as e:
-        print(f"❌ Error generating reusable template: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/api/sync-workflow")
-async def sync_workflow(request: Request, db: Annotated[Session, Depends(get_db)]):
-    """Syncs a workflow to all repositories that don't have it"""
-    try:
-        data = await request.json()
-        user = data.get("user")
-        repo_names = data.get("repo_names", [])
-        workflow_name = data.get("workflow_name", "").strip()
-
-        if user not in user_tokens:
-            return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
-
-        token = user_tokens[user]
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": ACCEPT_HEADER,
-            "X-GitHub-Api-Version": X_API_VERSION
-        }
-
-        async with httpx.AsyncClient() as client:
-            workflow_content, existing_workflows = await _fetch_existing_workflow_content(
-                client, repo_names, workflow_name, headers
-            )
-
-            if workflow_content is None:
-                return {"error": f"Workflow '{workflow_name}' not found in any repository", "status": 404}
-
-            results, created_count = await _create_missing_workflows(
-                client, repo_names, existing_workflows, workflow_name, workflow_content, headers
-            )
-
-        return {
-            "message": f"✅ Workflow '{workflow_name}' synced! Created in {created_count} repositories.",
-            "results": results
-        }
-
-    except Exception as e:
-        print(f"❌ Error syncing workflow: {str(e)}")
-        return {"error": str(e), "status": 500}
-
-
-async def _fetch_existing_workflow_content(client, repo_names, workflow_name, headers):
-    """Return (workflow_content, existing_workflows) discovered across ``repo_names``.
-
-    ``workflow_content`` is the decoded text from the first repo that already
-    contains the workflow, or ``None`` if no repo has it.
-    """
-    workflow_content = None
-    existing_workflows: dict = {}
-    workflow_path = f".github/workflows/{workflow_name}.yml"
-
-    for repo_name in repo_names:
-        owner, repo = repo_name.split("/")
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{workflow_path}"
-        response = await client.get(url, headers=headers)
-        if response.status_code != 200:
-            continue
-        content_data = response.json()
-        if workflow_content is None:
-            workflow_content = base64.b64decode(content_data["content"]).decode("utf-8")
-        existing_workflows[repo_name] = True
-
-    return workflow_content, existing_workflows
-
-
-async def _create_missing_workflows(
-    client, repo_names, existing_workflows, workflow_name, workflow_content, headers
+@router.get("/api/workflows-count", responses=_responses(409))
+async def get_workflows_count(
+    project_name: str,
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
-    """Create the workflow file in each repo of ``repo_names`` that lacks it."""
-    results: dict = {}
-    created_count = 0
-    workflow_path = f".github/workflows/{workflow_name}.yml"
-    content_base64 = base64.b64encode(workflow_content.encode()).decode()
-
-    for repo_name in repo_names:
-        if repo_name in existing_workflows:
-            results[repo_name] = "already exists"
-            continue
-
-        owner, repo = repo_name.split("/")
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{workflow_path}"
-        workflow_data = {
-            "message": f"Add {workflow_name} workflow via ActionsManager sync",
-            "content": content_base64,
-            "branch": "main"  # Default to main branch
-        }
-        response = await client.put(url, json=workflow_data, headers=headers)
-        if response.status_code in [200, 201]:
-            results[repo_name] = "created"
-            created_count += 1
-        else:
-            results[repo_name] = f"failed ({response.status_code})"
-
-    return results, created_count
-
-
-@router.get("/api/workflows-count")
-async def get_workflows_count(user: str, project_name: str, db: Annotated[Session, Depends(get_db)]):
     """Get the count of regular workflows for a project"""
+    user = account.github_user
     try:
         print(f"📌 Getting workflows count for user={user}, project={project_name}")
         
@@ -11767,34 +11440,13 @@ async def get_workflows_count(user: str, project_name: str, db: Annotated[Sessio
         print(f"✅ Found {workflow_count} regular workflows for project {project_name}")
         return {"count": workflow_count}
         
+    except HTTPException:
+        # Not a server error: the project lookup raises 409 for an ambiguous
+        # name (#2240), and the catch-all below would report it as a 500.
+        raise
     except Exception as e:
         print(f"❌ Error getting workflows count: {str(e)}")
-        return {"error": str(e), "status": 500}
-
-
-@router.get("/api/rxworkflows-count")
-async def get_rxworkflows_count(user: str, project_name: str, db: Annotated[Session, Depends(get_db)]):
-    """Get the count of reusable workflows for a project"""
-    try:
-        print(f"📌 Getting reusable workflows count for user={user}, project={project_name}")
-        
-        if user not in user_tokens:
-            return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
-        
-        project = _find_project_by_name(db, user, project_name)
-        
-        if not project:
-            return {"error": PROJECT_ERROR, "status": 404}
-        
-        # Count reusable workflows for this project
-        workflow_count = count_project_reusable_workflows(user, project_name)
-        
-        print(f"✅ Found {workflow_count} reusable workflows for project {project_name}")
-        return {"count": workflow_count}
-        
-    except Exception as e:
-        print(f"❌ Error getting reusable workflows count: {str(e)}")
-        return {"error": str(e), "status": 500}
+        return {"error": "Error getting workflows count", "status": 500}
 
 
 # ========== Workflow Version History API Endpoints ==========
@@ -11813,14 +11465,12 @@ class VersionHistoryResponse(BaseModel):
     total_versions: int
 
 class RestoreVersionRequest(BaseModel):
-    github_user: str
     project_name: str
     workflow_name: str
     version_id: int
 
 
 class RenameImpactRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
     workflow_name: str
     new_name: str
@@ -11839,12 +11489,17 @@ class RenameImpactTarget(BaseModel):
     not be asked — never ``False``. A failed listing is not the same fact as an
     empty directory, and reading it as one is what previously made every
     workflow in a repo look deleted (issue #1981).
+
+    ``old_path`` is the file the next campaign removes there: where the
+    delivery record says the workflow was delivered, unless that is the new
+    path. None where it removes none.
     """
     repo: str
     branch: str
     old_file_present: Optional[bool] = None
     new_file_present: Optional[bool] = None
     confirmed_present_at: Optional[str] = None
+    old_path: Optional[str] = None
 
 
 class RenameImpactConsumer(BaseModel):
@@ -11867,14 +11522,12 @@ class RenameImpactResponse(BaseModel):
 
 
 def _rename_blocker_open_pr(db: Session, project: Project, workflow: Workflow) -> Optional[str]:
-    """An open campaign referencing the workflow makes a rename unsafe.
+    """An open campaign carrying the workflow makes a rename unsafe.
 
-    ``project_pull_requests.workflow_names`` is a name snapshot, and it is the
-    lookup key for ``_has_open_pr_for_workflow`` and for the reusable
-    workflow's global lock. Renaming leaves those rows naming a workflow that
-    no longer exists, so the status restore at merge time stops matching and
-    the reusable lock silently releases — letting a second, conflicting
-    campaign open against the same file.
+    The campaign's branch holds the file under the old name, so merging it after
+    the rename delivers a file no workflow is called any more, and the status
+    restore at merge time no longer matches. For a reusable workflow the lock
+    is global; for a regular one, this project's own campaigns are what carry it.
     """
     if workflow.reusable_workflow:
         if _reusable_workflow_ids_locked_by_open_campaign(db, [workflow.workflow_id]):
@@ -11882,43 +11535,25 @@ def _rename_blocker_open_pr(db: Session, project: Project, workflow: Workflow) -
                     "Merge or close it before renaming.")
         return None
 
-    # One query, not one per repository. _has_open_pr_for_workflow re-resolves
-    # the project and its linked projects on every call, so looping it over a
-    # 30-repo project cost ~90 round trips to answer a single question.
-    repo_names = {
-        r.repo_name for r in
-        db.query(Repo).join(ProjectRepo).filter(ProjectRepo.project_id == project.project_id).all()
-    }
-    if not repo_names:
-        return None
-
-    open_prs = db.query(ProjectPullRequest).filter(
-        ProjectPullRequest.project_id == project.project_id,
-        ProjectPullRequest.repo_name.in_(repo_names),
-        ProjectPullRequest.pr_state == "open",
-    ).all()
-    for pr in open_prs:
-        if not pr.workflow_names:
-            continue
-        # Stored joined by ", "; strip each entry, as _has_open_pr_for_workflow does.
-        if workflow.workflow_name in {n.strip() for n in pr.workflow_names.split(",") if n.strip()}:
-            return ("An open pull request already carries this workflow. "
-                    "Merge or close it before renaming.")
+    if deliveries.pending_anywhere(db, deliveries.WORKFLOW, workflow.workflow_id,
+                                   pr_project_id=project.project_id):
+        return ("An open pull request already carries this workflow. "
+                "Merge or close it before renaming.")
     return None
 
 
 def _rename_blocker_name_collision(db: Session, project: Project, workflow: Workflow,
                                    new_name: str) -> Optional[str]:
-    """Another workflow of the same kind in this project already owns the new name.
+    """Another workflow in this project already owns the new name.
 
     Names are deliberately not globally unique, but two rows sharing a name
     inside one project make ``create_or_update_workflow``'s lookup ambiguous
     and would collide on the same delivered filename.
 
-    Scoped by ``reusable_workflow`` because the write path scopes every lookup
-    that way: a project may own a regular *and* a reusable "deploy", delivered
-    to different repositories, and refusing that rename would block something
-    ``create_or_update_workflow`` performs without complaint.
+    Either kind clashes. A regular and a reusable workflow this project owns
+    are both delivered to its own repositories (#2084), so they would be one
+    file; ``_assert_name_free`` refuses the same thing for a
+    new row (#2309).
 
     Tombstones are included, unlike the read paths. A ``pending_delete`` row
     still owns its name until its campaign lands, and the write path now
@@ -11929,7 +11564,6 @@ def _rename_blocker_name_collision(db: Session, project: Project, workflow: Work
         db.query(Workflow).join(ProjectWorkflow).filter(
             ProjectWorkflow.project_id == project.project_id,
             func.lower(Workflow.workflow_name) == new_name.lower(),
-            Workflow.reusable_workflow == workflow.reusable_workflow,
             Workflow.workflow_id != workflow.workflow_id,
         ).first()
     )
@@ -12073,8 +11707,8 @@ def _rename_impact_targets_for_repo(db: Session, project: Project, repo_row, own
     is not there" — see ``_rename_impact_targets``.
 
     Branches are resolved the same way delivery resolves them, never from the
-    repo's GitHub default branch. Resolved live rather than replayed from
-    ``workflow_drift_states``: those rows record the branches drift last saw, so
+    repo's GitHub default branch. Resolved live rather than replayed from the
+    last drift check: it records the branches drift last saw, so
     a branch added to the project since then would never be checked and a file
     the rename orphans there would be invisible.
     """
@@ -12090,18 +11724,33 @@ def _rename_impact_targets_for_repo(db: Session, project: Project, repo_row, own
         warnings.append(f"Could not resolve branches for {repo_name} ({type(exc).__name__})")
         return [], False
 
-    rows: List[RenameImpactTarget] = []
-    for branch in branches:
-        listing = _branch_listing(db, repo_name, owner, repo, branch, token, warnings)
-        stamped = confirmed.get((repo_row.repo_id, branch or ""))
-        rows.append(RenameImpactTarget(
-            repo=repo_name,
-            branch=branch,
-            old_file_present=None if listing is None else old_filename in listing,
-            new_file_present=None if listing is None else new_filename in listing,
-            confirmed_present_at=_utc_iso(stamped),
-        ))
+    rows = [
+        _rename_impact_target(repo_name, branch, _branch_listing(db, repo_name, owner, repo, branch, token, warnings),
+                              old_filename, new_filename, confirmed.get((repo_row.repo_id, branch or "")))
+        for branch in branches
+    ]
     return rows, True
+
+
+def _rename_impact_target(repo_name: str, branch: str, listing: Optional[dict], old_filename: str,
+                          new_filename: str, delivered: Optional[tuple]) -> RenameImpactTarget:
+    """One (repo, branch) of the report, from its listing and *delivered*, the record's (delivered_at, path) there.
+
+    The old file is the one the next campaign removes there
+    (``deliveries.left_behind``, the rule the campaign's own removal applies),
+    else the file under the current name.
+    """
+    stamped, delivered_path = delivered or (None, None)
+    old_path = deliveries.left_behind(delivered_path, _WORKFLOWS_DIR + new_filename)
+    old_name = old_path.rsplit("/", 1)[-1] if old_path else old_filename
+    return RenameImpactTarget(
+        repo=repo_name,
+        branch=branch,
+        old_file_present=None if listing is None else old_name in listing,
+        new_file_present=None if listing is None else new_filename in listing,
+        confirmed_present_at=_utc_iso(stamped),
+        old_path=old_path,
+    )
 
 
 def _reusable_impact_targets(db: Session, project: Project, workflow: Workflow,
@@ -12130,14 +11779,8 @@ def _reusable_impact_targets(db: Session, project: Project, workflow: Workflow,
 
     listing = _branch_listing(db, repo_name, owner, repo, branch, token, warnings)
     repo_row = db.query(Repo).filter(Repo.repo_name == repo_name).first()
-    stamped = confirmed.get((repo_row.repo_id, branch or "")) if repo_row else None
-    return [RenameImpactTarget(
-        repo=repo_name,
-        branch=branch,
-        old_file_present=None if listing is None else old_filename in listing,
-        new_file_present=None if listing is None else new_filename in listing,
-        confirmed_present_at=_utc_iso(stamped),
-    )], warnings, []
+    delivered = confirmed.get((repo_row.repo_id, branch or "")) if repo_row else None
+    return [_rename_impact_target(repo_name, branch, listing, old_filename, new_filename, delivered)], warnings, []
 
 
 def _rename_impact_targets(db: Session, project: Project, workflow: Workflow,
@@ -12155,12 +11798,7 @@ def _rename_impact_targets(db: Session, project: Project, workflow: Workflow,
         "Accept": ACCEPT_HEADER,
         "X-GitHub-Api-Version": X_API_VERSION,
     }
-    confirmed = {
-        (st.repo_id, st.branch): st.confirmed_present_at
-        for st in db.query(WorkflowDriftState).filter(
-            WorkflowDriftState.workflow_id == workflow.workflow_id
-        ).all()
-    }
+    confirmed = deliveries.delivered_at_by_target(db, deliveries.WORKFLOW, workflow.workflow_id)
 
     if workflow.reusable_workflow:
         # Reusable workflows are not delivered to the project's own repositories.
@@ -12221,11 +11859,11 @@ def _rename_impact_warnings(project: Project,
     return warnings
 
 
-@router.post("/api/workflows/rename-impact", responses=_responses(400, 401, 403, 404, 500))
+@router.post("/api/workflows/rename-impact", responses=_responses(400, 401, 403, 404, 409, 500))
 def workflow_rename_impact(
     payload: RenameImpactRequest,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """What renaming a workflow would do, without doing any of it.
 
@@ -12242,11 +11880,11 @@ def workflow_rename_impact(
     carries ``If-None-Match`` from the stored ETag, and an unchanged branch
     answers 304, which does not count against the rate limit. Presence is
     deliberately not replayed from ``workflow_tree_cache`` without
-    revalidating, and branches are deliberately not replayed from
-    ``workflow_drift_states``: both are snapshots of whenever drift last ran,
+    revalidating, and branches are deliberately not replayed from the last
+    drift check: both are snapshots of whenever drift last ran,
     and answering from them hides a file or a branch added since.
     """
-    github_user = _resolve_github_user(x_github_user, payload.github_user)
+    github_user = account.github_user
     token, project, project_code = _validate_user_and_get_project(
         db, github_user, payload.project_name
     )
@@ -12338,14 +11976,15 @@ def workflow_rename_impact(
     )
 
 
-@router.get("/api/workflows/{workflow_name}/versions", responses=_responses(401, 404, 500))
+@router.get("/api/workflows/{workflow_name}/versions", responses=_responses(401, 404, 409, 500))
 async def get_workflow_versions(
     workflow_name: str,
-    user: str,
     project_name: str,
-    db: Annotated[Session, Depends(get_db)]
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     """Get all version history for a specific workflow"""
+    user = account.github_user
     try:
         print(f"📌 Getting version history for workflow '{workflow_name}' in project '{project_name}'")
         
@@ -12395,84 +12034,31 @@ async def get_workflow_versions(
         raise
     except Exception as e:
         print(f"❌ Error getting workflow versions: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error getting workflow versions")
 
 
-@router.get("/api/workflows/{workflow_name}/versions/{version_id}", responses=_responses(401, 404, 500))
-async def get_workflow_version(
-    workflow_name: str,
-    version_id: int,
-    user: str,
-    project_name: str,
-    db: Annotated[Session, Depends(get_db)]
-):
-    """Get a specific version of a workflow"""
-    try:
-        print(f"📌 Getting version {version_id} for workflow '{workflow_name}'")
-        
-        if user not in user_tokens:
-            raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
-        
-        project = _find_project_by_name(db, user, project_name)
-        
-        if not project:
-            raise HTTPException(status_code=404, detail=PROJECT_ERROR)
-        
-        # Find workflow within this project
-        workflow = db.query(Workflow).join(ProjectWorkflow).filter(
-            ProjectWorkflow.project_id == project.project_id,
-            Workflow.workflow_name == workflow_name
-        ).first()
-        
-        if not workflow:
-            raise HTTPException(status_code=404, detail=f"Workflow '{workflow_name}' not found")
-        
-        # Get specific version
-        version = db.query(WorkflowVersion).filter(
-            WorkflowVersion.version_id == version_id,
-            WorkflowVersion.workflow_id == workflow.workflow_id
-        ).first()
-        
-        if not version:
-            raise HTTPException(status_code=404, detail=f"Version {version_id} not found")
-        
-        print(f"✅ Retrieved version {version.version_number} for workflow '{workflow_name}'")
-        
-        return WorkflowVersionResponse(
-            version_id=version.version_id,
-            version_number=version.version_number,
-            content=version.content,
-            metadata=version.version_metadata,
-            created_at=version.created_at.isoformat() if version.created_at else None
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error getting workflow version: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/api/workflows/restore-version", responses=_responses(401, 404, 500))
+@router.post("/api/workflows/restore-version", responses=_responses(401, 404, 409, 500))
 async def restore_workflow_version(
     payload: RestoreVersionRequest,
-    db: Annotated[Session, Depends(get_db)]
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     """Restore a workflow to a previous version"""
+    github_user = account.github_user
     try:
         print(f"📌 Restoring workflow '{payload.workflow_name}' to version {payload.version_id}")
         
-        if payload.github_user not in user_tokens:
+        if github_user not in user_tokens:
             raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
         
-        project = _find_project_by_name(db, payload.github_user, payload.project_name)
+        project = _find_project_by_name(db, github_user, payload.project_name)
         
         if not project:
             raise HTTPException(status_code=404, detail=PROJECT_ERROR)
 
-        # Restoring overwrites workflow_yaml with a stored version and zeroes
+        # Restoring overwrites workflow_yaml with a stored version and clears
         # the git hash, so it is a write like any other.
-        _require_project_editor(db, payload.github_user, project)
+        _require_project_editor(db, github_user, project)
 
         # Find workflow within this project
         workflow = db.query(Workflow).join(ProjectWorkflow).filter(
@@ -12494,8 +12080,9 @@ async def restore_workflow_version(
         
         # Restore the workflow content from this version
         workflow.workflow_yaml = version.content
-        workflow.workflow_git_hash = "0000000000000000000000000000000000000000"
+        workflow.workflow_git_hash = None
         db.commit()
+        resolve_drift_for_local_edit(db, project, deliveries.WORKFLOW, workflow.workflow_id, version.content)
         
         # Create a new version entry to track this restoration
         create_workflow_version(
@@ -12523,4 +12110,4 @@ async def restore_workflow_version(
     except Exception as e:
         print(f"❌ Error restoring workflow version: {str(e)}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error restoring workflow version")

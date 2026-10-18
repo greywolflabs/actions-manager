@@ -332,24 +332,6 @@ jobs:
     return templates.get(build_type, templates["generic"]).strip()
 
 
-def get_available_template_types() -> Dict[str, str]:
-    """
-    Get available template types and their descriptions.
-    
-    Returns:
-        Dictionary mapping template types to descriptions
-    """
-    return {
-        "maven": "Java Maven project workflow templates",
-        "gradle": "Java Gradle project workflow templates", 
-        "npm": "Node.js/npm project workflow templates",
-        "dotnet": ".NET project workflow templates",
-        "python": "Python project workflow templates",
-        "go": "Go project workflow templates",
-        "generic": "Generic workflow templates"
-    }
-
-
 def generate_template_set(
     user_org: str,
     build_type: str = "generic",

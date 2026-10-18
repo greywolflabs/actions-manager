@@ -29,7 +29,7 @@ from models import (
 )
 from main import app
 from workflows import get_db, create_or_update_workflow, _update_project_workflows_status
-from auth import user_tokens
+from auth import create_auth_session, user_tokens
 
 # ---------------------------------------------------------------------------
 # Shared in-memory DB
@@ -286,9 +286,12 @@ class TestMergeClosePRStatusTransitions:
         )
         db.add(pr)
         db.commit()
+        # The merge/close routes take the caller from the session (#2241).
+        token = create_auth_session("statususer", db)
         db.close()
 
         self.client = TestClient(app)
+        self.client.headers["Authorization"] = f"Bearer {token}"
         yield
 
         db2 = TestingSessionLocal()

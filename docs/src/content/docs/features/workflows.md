@@ -35,6 +35,26 @@ a workflow and read its YAML, but the save is rejected. Project owners and works
 admins always qualify. See [Permissions](permissions.html) for who
 gets editor access and how it is granted.
 
+#### Regular or reusable
+
+The trigger decides, as it does on GitHub: a workflow whose `on:` includes
+`workflow_call` is a reusable workflow. Add `workflow_call` to a regular workflow and
+save, and it moves to the reusable workflows straight away; remove it and it moves
+back. It stays the same workflow, with its history.
+
+- Only an edit changes the kind. Saving the project without touching a workflow
+  leaves it as it is.
+- YAML that does not parse, or has no `on:`, keeps the workflow's current kind.
+- A **Reusable Workflow Project**'s workflows always stay reusable, because caller
+  projects that link them call them through `workflow_call`.
+
+The save is refused when:
+
+| Refused when | What to do |
+|--------------|------------|
+| An open PR campaign carries the workflow | Merge or close that campaign, then change the trigger |
+| Another workflow in this project has the same name (a pair left from before names had to be unique across both kinds) | Rename one of them first |
+
 ### Renaming a Workflow
 
 Rename a workflow from the filename field at the top of the editor: select the edit
@@ -48,8 +68,9 @@ cannot be renamed here at all:
 
 - A **linked** reusable workflow is named by the Reusable Workflow Project that owns
   it. Rename it there.
-- A workflow **Under Review** is locked while its pull request is open. Unlock it from
-  the pull request, or merge or close it.
+- A workflow **Under Review** is locked while its pull request is open. Choose **Unlock
+  to Edit** in the editor first (see [Editing a File Under Review](#editing-a-file-under-review)),
+  or merge or close the pull request.
 
 Renaming changes the filename the workflow is *delivered* under, so ActionsManager
 shows what the rename would do before it takes the new name.
@@ -93,6 +114,14 @@ Both halves of the rename ride one campaign branch: the file is written at its n
 path and removed from the old one in the same pull request. The pull request reads as
 a rename, and merging it completes the change in one step.
 
+The old file is the one ActionsManager delivered to that repository and branch, whatever
+the workflow has been called since: renaming `ci` to `ci2` and then `ci3` before
+delivering removes `ci.yml`, and renaming back to `ci` removes nothing. Each repository
+and branch keeps its own old file until a campaign reaching it merges, so a campaign to
+some repositories leaves the rename still to be delivered to the others, and a closed
+campaign is carried by the next one. Until then, drift keeps checking the file at its
+delivered name, so a rename is never reported as a deletion.
+
 :::caution
 Earlier releases did not remove the old file — a rename left it behind and you were
 told to delete it yourself. Those orphans are still in your repositories under their
@@ -115,7 +144,7 @@ than failing, because raising there would abandon a multi-workflow save part-way
 | An open pull request already carries the workflow | Merge or close it, then rename |
 | A reusable workflow is locked by an open PR campaign | Merge or close that campaign, then rename |
 | It is a delivered reusable workflow and caller workflows reference it by filename | Update their `uses:` lines first — ActionsManager does not rewrite caller YAML |
-| Another workflow of the same kind in this project already has that name | Pick a different name. Names only need to be unique within a project and within the kind, so a project may hold both a regular and a reusable `deploy` |
+| Another workflow in this project already has that name | Pick a different name. Names must be unique within a project across both kinds: a regular and a reusable `deploy` would be delivered to the same file, so whichever went last would overwrite the other |
 | The new name belongs to a workflow queued for removal from GitHub | Merge or close that removal campaign before reusing the name |
 | The workflow itself is queued for removal from GitHub | Merge or close its removal campaign, then rename |
 | The change is only to capitalisation | Rename to something different first, then to the casing you want. This is the one row the save does not enforce: sent directly it keeps the old casing and reports success |
@@ -143,7 +172,14 @@ your repositories:
 | Option | What happens |
 |--------|--------------|
 | **Create a PR Campaign** | Opens a [PR Campaign](pr-campaigns.html) whose only change is removing the workflow, tracked and merged under PR Campaigns like any other delivery. The workflow stays listed until that campaign merges. |
-| **Commit directly to the target branch** | The file is deleted from every branch that holds it, immediately and with no review. |
+| **Commit directly to the target branch** | The file is deleted from every branch ActionsManager delivered it to, immediately and with no review. |
+
+Either way, the file is removed where ActionsManager delivered it: on every branch it
+was delivered to, including any the project no longer targets, and under the name it
+was delivered with — a workflow renamed since, whose rename has not been delivered
+yet, is removed under its old name. A workflow ActionsManager holds no delivery record
+for, such as one delivered by an earlier release, is removed under its current name
+from the branches the project targets now.
 
 **Create a PR Campaign** is preselected. It stays available even for a workflow
 ActionsManager has never delivered, because a workflow imported from a repository
@@ -159,15 +195,14 @@ Restore button; the pull request is the thing you close.
 Removing a workflow from your repositories requires **editor** access to the
 project. Viewing a project is not enough to delete files out of it.
 
-A reusable workflow that lives in a **Caller Workflow Project** cannot be deleted
-from GitHub here at all. It belongs to the Reusable Workflow Project's repository,
-which other projects link to, so the GitHub option is disabled with that reason —
-delete it from the project that owns it.
+A reusable workflow that a **Caller Workflow Project** owns lives in that project's
+own repositories, so it is removed from them exactly like a regular workflow, with
+the same choice between a PR Campaign and a direct commit. A reusable workflow in a
+**Reusable Workflow Project** offers the same choice too, in that project's repository.
 
-The same choice applies to reusable workflows and to
-[custom files](#removing-a-custom-file), which additionally choose between a PR
-Campaign and a direct commit. A linked reusable workflow offers **Unlink** instead —
-it is owned by its Reusable Workflow Project, so unlinking never touches GitHub.
+The same choice applies to [custom files](#removing-a-custom-file). A linked
+reusable workflow offers **Unlink** instead — it is owned by its Reusable Workflow
+Project, so unlinking never touches GitHub.
 
 ### Removing a Custom File
 
@@ -183,9 +218,12 @@ GitHub** then asks *how* the file should leave GitHub:
 file sitting in "pending delete" waiting for a campaign you have to remember to
 start.
 
-Target branches are the ones the project already delivers to, including any
-per-repository branch override, so a project targeting `release/*` removes the file
-from those branches rather than from `main`.
+The file is removed from every branch ActionsManager delivered it to, at the path it
+was delivered to: a file moved since, whose move has not been delivered yet, is
+removed from where it was. A file ActionsManager holds no delivery record for is
+removed from the branches the project delivers to now, including any per-repository
+branch override, so a project targeting `release/*` removes it from those branches
+rather than from `main`.
 
 A branch that does not have the file is skipped rather than given an empty pull
 request. If every branch is skipped, the ActionsManager record is simply removed. If
@@ -271,8 +309,8 @@ to the repositories you selected, because this project owns them. A **linked** r
 workflow behaves differently: it is delivered to the repository of the Reusable Workflow
 Project that owns it, not to this project's repositories.
 
-Such a workflow cannot be deleted from GitHub through the caller project — see
-[Removing a Workflow](#removing-a-workflow).
+Such a workflow cannot be deleted from GitHub through the caller project; unlink it
+instead — see [Removing a Workflow](#removing-a-workflow).
 
 ## Workflow Status
 
@@ -291,8 +329,19 @@ workflow imported from a repository but not yet re-delivered, and **Drift Detect
 GitHub has diverged.
 
 Status and drift answer different questions. Status is about *your* pending work; drift is about
-changes made in GitHub outside ActionsManager. A workflow that is Committed Locally or Under Review
-is never reported as drifted — see [What Counts as Drift](drift-detection.html#what-counts-as-drift).
+changes made in GitHub outside ActionsManager. A local edit doesn't hide drift: if someone changes
+the file in GitHub, it is reported while your Committed Locally edit waits to be delivered. A
+workflow Under Review isn't reported as drifted in the repositories and branches its open pull
+request carries — see [What Counts as Drift](drift-detection.html#what-counts-as-drift).
+
+### Editing a File Under Review
+
+A workflow, custom file or CODEOWNERS file that an open pull request carries is locked, and
+its editor shows **Commit Locally** greyed out. To change it before the pull request merges,
+choose **Unlock to Edit** and confirm. The button then reads **Commit and Update PR**: it saves
+your edit and adds it to that open pull request instead of opening a separate one, then locks
+the file again. If the push to the pull request fails, the edit stays saved as Committed
+Locally.
 
 ## Workflow Names Across Projects
 
@@ -365,11 +414,17 @@ Everything the toolbar offers for the current mode comes with you. In YAML mode 
 
 Switching the editor to **GUI** mode gives you a form-based view of the same workflow, kept in sync with the YAML as you edit.
 
+If a workflow uses something GUI mode can't edit without changing it, the editor stays in YAML and the message names the parts it can't represent, so keep editing that workflow in YAML. Opening such a workflow while you're already in GUI mode switches the editor back to YAML in the same way.
+
 **Triggers** are toggle buttons. Clicking one adds that trigger with sensible defaults; clicking it again removes it, along with any branches, paths, sub-types or cron schedule you set on it. A trigger can only be added once — GitHub Actions keys `on:` by event name, so a second copy could never survive being written out.
+
+A job that calls a reusable workflow shows which workflow it calls instead of a runner. Its runner, steps, timeout and environment variables can't be set, because GitHub doesn't allow them on such a job; edit its `with:` and `secrets:` in YAML.
+
+A **Schedule** trigger with several cron lines keeps all of them. The cron field edits the first one; the others, and any `timezone` set on an entry, are written back unchanged. Earlier versions of the GUI wrote the cron list nested under a second `schedule:` key, which GitHub rejects; GUI mode won't open a workflow saved that way, so fix it in YAML by moving the `- cron:` lines up to sit directly under `on.schedule`.
 
 **Steps** are listed as compact rows. Click a row to open that step in the detail panel, which stays open while you move between steps — it sits to the right of the job list, or below it on narrower screens, where selecting a step scrolls it into view. The panel is the only place a step is edited, so there's never a question of where to make a change. Renaming a step updates its row title immediately.
 
-Adding or duplicating a step opens it in the panel straight away, ready to edit.
+Adding or duplicating a step opens it in the panel straight away, ready to edit. A duplicated step doesn't copy the original's `id:`, because step ids must be unique within a job and any `steps.<id>` expression should keep pointing at the original.
 
 ### Inserting secrets and variables
 

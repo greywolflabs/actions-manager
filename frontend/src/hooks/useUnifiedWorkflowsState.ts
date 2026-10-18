@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from 'react';
 import { WorkflowGUI, DEFAULT_REUSABLE_WORKFLOW_GUI, DEFAULT_WORKFLOW_GUI } from '../utils/workflowGuiConversion';
-import { WorkflowStatusData, DetectedBuildResult, TemplatesByType } from '../types/workflow';
+import { DetectedBuildResult, TemplatesByType } from '../types/workflow';
 import {
   PROJECT_FILES_COLLAPSED_KEY,
   readStoredPreference,
@@ -62,12 +62,6 @@ export interface UseUnifiedWorkflowsStateReturn {
   workflowCreationType: 'regular' | 'reusable' | null;
   setWorkflowCreationType: (type: 'regular' | 'reusable' | null) => void;
   
-  // Status State
-  workflowStatuses: Record<string, WorkflowStatusData>;
-  setWorkflowStatuses: (statuses: Record<string, WorkflowStatusData>) => void;
-  loadingStatuses: boolean;
-  setLoadingStatuses: (loading: boolean) => void;
-  
   // Helper Functions
   markWorkflowAsModified: (index: number, type: 'regular' | 'reusable') => void;
   markWorkflowAsSaved: (index: number, type: 'regular' | 'reusable', workflowStatus?: string) => void;
@@ -118,10 +112,6 @@ export const useUnifiedWorkflowsState = (
   // Workflow Creation State
   const [showWorkflowCreationDialog, setShowWorkflowCreationDialog] = useState(false);
   const [workflowCreationType, setWorkflowCreationType] = useState<'regular' | 'reusable' | null>(null);
-  
-  // Status State
-  const [workflowStatuses, setWorkflowStatuses] = useState<Record<string, WorkflowStatusData>>({});
-  const [loadingStatuses, setLoadingStatuses] = useState(false);
   
   useEffect(() => {
     writeStoredPreference(PROJECT_FILES_COLLAPSED_KEY, String(isCollapsed));
@@ -241,12 +231,6 @@ export const useUnifiedWorkflowsState = (
     setShowWorkflowCreationDialog,
     workflowCreationType,
     setWorkflowCreationType,
-    
-    // Status State
-    workflowStatuses,
-    setWorkflowStatuses,
-    loadingStatuses,
-    setLoadingStatuses,
     
     // Helper Functions
     markWorkflowAsModified,

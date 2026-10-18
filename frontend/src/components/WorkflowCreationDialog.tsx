@@ -26,8 +26,7 @@ interface WorkflowCreationDialogProps {
   existingWorkflowNames?: string[];
   selectedRepos: string[];
   onAddCustomFile?: () => void;
-  codeownersRepos?: string[];
-  onSelectCodeowners?: (repo: string) => void;
+  onSelectCodeowners?: () => void;
   setShowWorkflowCreationDialog: (show: boolean) => void;
   selectWorkflowType: (type: 'regular' | 'reusable') => void;
   onLinkReusableWorkflow?: () => void;
@@ -52,7 +51,6 @@ const WorkflowCreationDialog: React.FC<WorkflowCreationDialogProps> = ({
   existingWorkflowNames = [],
   selectedRepos,
   onAddCustomFile,
-  codeownersRepos,
   onSelectCodeowners,
   setShowWorkflowCreationDialog,
   selectWorkflowType,
@@ -110,7 +108,7 @@ const WorkflowCreationDialog: React.FC<WorkflowCreationDialogProps> = ({
   const handleSelectCodeownersCard = () => {
     if (!onSelectCodeowners) return;
     setShowWorkflowCreationDialog(false);
-    onSelectCodeowners(codeownersRepos?.[0] ?? selectedRepos[0]);
+    onSelectCodeowners();
   };
 
   const renderWorkflowNameField = () => (
@@ -123,7 +121,7 @@ const WorkflowCreationDialog: React.FC<WorkflowCreationDialogProps> = ({
         type="text"
         value={workflowName}
         onChange={(event) => setWorkflowName(event.target.value)}
-        className={`w-full rounded-md border px-3 py-2 text-sm text-slate-900 shadow-sm focus:outline-none focus:ring-2 dark:bg-slate-900 dark:text-slate-100 ${
+        className={`w-full rounded-md border px-3 py-2 text-sm text-slate-900 shadow-sm focus:outline-hidden focus:ring-2 dark:bg-slate-900 dark:text-slate-100 ${
           workflowNameError
             ? 'border-red-500 focus:border-red-500 focus:ring-red-500/20'
             : 'border-slate-300 focus:border-blue-500 focus:ring-blue-500/20 dark:border-slate-700'
@@ -243,7 +241,7 @@ const WorkflowCreationDialog: React.FC<WorkflowCreationDialogProps> = ({
                 </button>
               )}
 
-              {codeownersRepos && codeownersRepos.length > 0 && onSelectCodeowners && (
+              {selectedRepos.length > 0 && onSelectCodeowners && (
                 <button
                   className="border-2 border-slate-200 rounded-lg p-4 hover:border-blue-500 transition-all text-left dark:border-slate-700 dark:hover:border-blue-400"
                   onClick={handleSelectCodeownersCard}
@@ -255,7 +253,7 @@ const WorkflowCreationDialog: React.FC<WorkflowCreationDialogProps> = ({
                         CODEOWNERS
                       </h4>
                       <p className="text-sm text-slate-600 dark:text-slate-400">
-                        Manage code ownership rules for this repository
+                        Manage the code ownership rules every repository in this project receives
                       </p>
                     </div>
                   </div>

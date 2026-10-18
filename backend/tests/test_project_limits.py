@@ -33,7 +33,7 @@ class TestProjectLimits:
     """Test class for project limit functionality."""
 
     @pytest.fixture(autouse=True)
-    def setup_database(self):
+    def setup_database(self, authenticate_client):
         """Set up the test database before each test."""
         # Set up database dependency override for this test
         app.dependency_overrides[get_db] = override_get_db
@@ -71,6 +71,8 @@ class TestProjectLimits:
             db.commit()
         finally:
             db.close()
+        self.client = TestClient(app)
+        authenticate_client(self.client, "freeuser", TestingSessionLocal)
         
         yield
         
@@ -79,10 +81,6 @@ class TestProjectLimits:
         # Clean up dependency override
         if get_db in app.dependency_overrides:
             del app.dependency_overrides[get_db]
-
-    def setup_method(self):
-        """Set up test client"""
-        self.client = TestClient(app)
 
     def test_free_user_can_create_projects_under_limit(self):
         """Test that free users can create projects when under the limit."""

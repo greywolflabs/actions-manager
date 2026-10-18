@@ -4,7 +4,7 @@
 Drives the reminder that a repository added to a project hasn't received the
 project's workflows yet. The rule it has to get right is the same one issue
 #1981 turned on: delivery is per (workflow, repo), so it is answered from
-`confirmed_present_at` and never from `workflow_status`, which is per-workflow
+the delivery record and never from `workflow_status`, which is per-workflow
 and would call a brand-new repo delivered the moment any other repo had the
 file.
 """
@@ -26,13 +26,15 @@ from models import (
     Project,
     Workflow,
     ProjectWorkflow,
+    ProjectPRCampaign,
     ProjectPullRequest,
     Repo,
     ProjectRepo,
-    WorkflowDriftState,
 )
+import workflows
 from main import app
 from projects import get_db as projects_get_db
+from tests.delivery_records import record_delivered, record_pr_carries
 from workflows import get_db as workflows_get_db
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test_pending_delivery_repos.db"
@@ -121,16 +123,7 @@ def _build(
         )
 
         if confirm_delivered_repo:
-            db.add(
-                WorkflowDriftState(
-                    project_id=project.project_id,
-                    workflow_id=wf.workflow_id,
-                    repo_id=repos[DELIVERED_REPO].repo_id,
-                    branch="main",
-                    has_drift=False,
-                    confirmed_present_at=datetime.now(timezone.utc),
-                )
-            )
+            record_delivered(db, wf, DELIVERED_REPO, "main")
         db.commit()
         return project.project_id, wf.workflow_id, repos
     finally:
@@ -169,22 +162,21 @@ def test_confirmed_delivery_clears_a_repo(client):
 
 def test_an_open_pull_request_pauses_the_reminder(client):
     """The user has already acted; nagging until merge would be wrong."""
-    project_id, _, _ = _build()
+    project_id, workflow_id, _ = _build()
     db = TestingSessionLocal()
     try:
-        db.add(
-            ProjectPullRequest(
-                project_id=project_id,
-                repo_name=NEW_REPO,
-                pr_number=1,
-                pr_url=f"https://github.com/{NEW_REPO}/pull/1",
-                pr_state="open",
-                branch_name="actions-manager/CALL/checkout-web/abc-main",
-                target_branch="main",
-                workflow_names="ci.yml",
-            )
+        pr = ProjectPullRequest(
+            project_id=project_id,
+            repo_name=NEW_REPO,
+            pr_number=1,
+            pr_url=f"https://github.com/{NEW_REPO}/pull/1",
+            pr_state="open",
+            branch_name="actions-manager/CALL/checkout-web/abc-main",
+            target_branch="main",
+            workflow_names="ci.yml",
         )
-        db.commit()
+        db.add(pr)
+        record_pr_carries(db, pr, db.get(Workflow, workflow_id))
     finally:
         db.close()
 
@@ -230,9 +222,21 @@ def test_a_project_never_drift_checked_claims_nothing(client):
     assert _pending(client) == []
 
 
-def test_a_project_with_no_regular_workflows_claims_nothing(client):
-    """There is nothing to deliver, so no repo can be waiting for it."""
+def test_a_callers_own_reusable_workflow_is_something_to_deliver(client):
+    """#2309: a standard project's own reusable workflow is delivered to its
+    repositories, so a repo that never received it is waiting for it."""
     _build(reusable_only=True, confirm_delivered_repo=False)
+    assert _pending(client) == sorted([DELIVERED_REPO, NEW_REPO])
+
+
+def test_a_callers_own_reusable_workflow_confirms_delivery(client):
+    _build(reusable_only=True)
+    assert _pending(client) == [NEW_REPO]
+
+
+def test_an_rwx_project_claims_nothing(client):
+    """Its workflows live in its one repository; there is no reminder to give."""
+    _build(reusable_only=True, confirm_delivered_repo=False, project_type="rwx")
     assert _pending(client) == []
 
 
@@ -365,3 +369,78 @@ def test_an_unchecked_project_says_it_could_not_tell(client):
     assert response.status_code == 200, response.text
     assert response.json()["pending_delivery_known"] is False
     assert response.json()["pending_delivery_repos"] == []
+
+
+def test_a_workflow_being_removed_is_not_something_to_deliver(client):
+    """A pending_delete row is on its way out of the repos. The load drops it, so
+    the save response must too, or the reminder flips on the next refresh."""
+    project_id, workflow_id, _ = _build()
+    db = TestingSessionLocal()
+    try:
+        db.query(Workflow).filter_by(workflow_id=workflow_id).update({"pending_delete": True})
+        db.commit()
+    finally:
+        db.close()
+
+    saved = client.put(
+        f"/api/projects/{project_id}/",
+        json={
+            "github_user": TEST_GITHUB_USER,
+            "project_name": TEST_PROJECT,
+            "selected_repos": [DELIVERED_REPO, NEW_REPO],
+            "workflows": [],
+            "rxworkflows": [],
+            "branch_regex": "",
+            "branch_option": "default",
+            "branch_max_age_days": 30,
+            "reusable_workflows_enabled": False,
+            "use_prefix": False,
+        },
+        headers={"X-GitHub-User": TEST_GITHUB_USER},
+    )
+    assert saved.status_code == 200, saved.text
+
+    assert saved.json()["pending_delivery_repos"] == []
+    assert _pending(client) == []
+
+
+def test_an_open_pr_to_one_branch_of_a_repo_pauses_its_reminder(client):
+    """As before the delivery record: the repo's workflow is on its way, to
+    whichever of its branches the campaign targets."""
+    project_id, workflow_id, _ = _build()
+    db = TestingSessionLocal()
+    try:
+        project = db.get(Project, project_id)
+        campaign = ProjectPRCampaign(project_id=project_id)
+        db.add(campaign)
+        db.commit()
+        workflows._persist_single_pr({
+            "status": "pr_created", "pr_number": 3, "pr_url": f"https://github.com/{NEW_REPO}/pull/3",
+            "branch_name": "actions-manager/call/checkout-web/abc-release-x", "workflows_committed": ["ci.yml"],
+            "deliveries": [{"kind": "workflow", "id": workflow_id, "path": ".github/workflows/ci.yml",
+                            "sha": "blob", "delete": False}],
+        }, f"{NEW_REPO} on release/x", project, campaign, db)
+    finally:
+        db.close()
+
+    assert _pending(client) == []
+
+
+def test_a_repo_that_only_received_a_direct_push_is_delivered(client):
+    """No PR and no drift check ever saw it: the push itself is the record."""
+    project_id, workflow_id, _ = _build()
+    db = TestingSessionLocal()
+    try:
+        project = db.get(Project, project_id)
+        workflow = db.get(Workflow, workflow_id)
+        with mock.patch("workflows._direct_push_workflow_to_branch",
+                        return_value={"status_code": 201, "sha": "pushed"}):
+            entry = workflows._direct_sync_to_branch(
+                db, project, workflow, NEW_REPO, "main", ".github/workflows/ci.yml",
+                workflow.workflow_yaml, "sync", {}, TEST_GITHUB_USER,
+            )
+        assert entry["status"] == "synced"
+    finally:
+        db.close()
+
+    assert _pending(client) == []

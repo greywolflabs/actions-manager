@@ -78,16 +78,6 @@ export const fetchRwxRepos = async (
   }
 };
 
-export const checkRepoStatus = async (user: string, repoName: string): Promise<boolean> => {
-  try {
-    const response = await apiClient.get(`/api/repos/status/${user}/${repoName}`);
-    return response.data.exists;
-  } catch (error) {
-    console.error("Error checking repo status:", error);
-    return false;
-  }
-};
-
 export const detectBuildTypes = async (
   user: string,
   owner: string,

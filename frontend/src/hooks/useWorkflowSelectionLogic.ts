@@ -1,6 +1,17 @@
 import { useCallback } from 'react';
-import { yamlToGuiResult, WorkflowGUI, DEFAULT_REUSABLE_WORKFLOW_GUI, DEFAULT_WORKFLOW_GUI } from '../utils/workflowGuiConversion';
+import {
+  yamlToGuiResult,
+  findGuiRoundTripLosses,
+  WorkflowGUI,
+  DEFAULT_REUSABLE_WORKFLOW_GUI,
+  DEFAULT_WORKFLOW_GUI
+} from '../utils/workflowGuiConversion';
 import { UnifiedWorkflowItem } from '../types/workflow';
+
+/** Why the loaded model must not be edited in GUI mode. */
+export type GuiRefusal =
+  | { reason: 'parse'; error: string }
+  | { reason: 'lossy'; paths: string[] };
 
 export interface UseWorkflowSelectionLogicProps {
   unifiedWorkflows: UnifiedWorkflowItem[];
@@ -27,33 +38,36 @@ export const useWorkflowSelectionLogic = ({
     }
   }, [setGuiWorkflow, setRegularGuiWorkflow]);
 
-  const applyParsedModel = useCallback((workflow: UnifiedWorkflowItem, gui: WorkflowGUI) => {
-    // Prefer workflow.name from the workflow object over parsed YAML name
-    // This ensures the name field stays synchronized with the workflow state
-    gui.name = workflow.name !== undefined && workflow.name !== null ? workflow.name : gui.name;
-
+  // gui.name is the YAML `name:` label, not workflow.name: that is the filename
+  // stem, and seeding the label from it rewrote `name:` on the first GUI edit.
+  // Returns the model as set. It is a copy when adjusted, never the parsed
+  // object, which can be the shared default template.
+  const applyParsedModel = useCallback((workflow: UnifiedWorkflowItem, gui: WorkflowGUI): WorkflowGUI => {
     if (!workflow.isReusable) {
       setRegularGuiWorkflow(gui);
-      return;
+      return gui;
     }
 
-    if (!gui.events.some(e => e.type === 'workflow_call')) {
-      gui.events = [{ type: 'workflow_call', inputs: {} }];
-    }
-    setGuiWorkflow(gui);
+    const model = gui.events.some(e => e.type === 'workflow_call')
+      ? gui
+      : { ...gui, events: [{ type: 'workflow_call' as const, inputs: {} }] };
+    setGuiWorkflow(model);
+    return model;
   }, [setGuiWorkflow, setRegularGuiWorkflow]);
 
   /**
    * Rebuilds the GUI model from a workflow's YAML.
    *
-   * Returns the conversion error, or `null` on success, so callers that would
-   * write the model back over the document (the YAML→GUI mode switch) can refuse
-   * rather than serialise a default template over the user's work. Selection
-   * ignores the return value and keeps its existing fall-back behaviour.
+   * Returns why GUI mode must not edit the result, or `null` when it may. The
+   * first GUI edit writes the model back over the whole document, so a caller
+   * entering GUI mode refuses on a conversion error (the model is a default
+   * template) and on a lossy round trip (the model can't represent part of the
+   * YAML). The check runs on the model exactly as set, after the reusable
+   * workflow_call adjustment.
    */
-  const initializeWorkflowGUI = useCallback((workflow: UnifiedWorkflowItem): string | null => {
+  const initializeWorkflowGUI = useCallback((workflow: UnifiedWorkflowItem): GuiRefusal | null => {
     // New workflow with nothing in it yet.
-    if (!workflow.content) {
+    if (!workflow.content?.trim()) {
       applyDefaultModel(workflow);
       return null;
     }
@@ -61,28 +75,30 @@ export const useWorkflowSelectionLogic = ({
     try {
       const { gui, error } = yamlToGuiResult(workflow.content);
       if (error) {
-        // Fall back to a default model, as before, but tell the caller.
         applyDefaultModel(workflow);
-        return error;
+        return { reason: 'parse', error };
       }
-      applyParsedModel(workflow, gui);
-      return null;
+      const model = applyParsedModel(workflow, gui);
+      const paths = findGuiRoundTripLosses(workflow.content, model);
+      return paths.length > 0 ? { reason: 'lossy', paths } : null;
     } catch (error) {
       console.warn('Failed to convert YAML to GUI:', error);
       applyDefaultModel(workflow);
-      return error instanceof Error ? error.message : 'Failed to convert YAML to GUI.';
+      return {
+        reason: 'parse',
+        error: error instanceof Error ? error.message : 'Failed to convert YAML to GUI.'
+      };
     }
   }, [applyDefaultModel, applyParsedModel]);
 
-  const handleSelectWorkflow = useCallback((workflowId: string) => {
+  const handleSelectWorkflow = useCallback((workflowId: string): GuiRefusal | null => {
     setSelectedWorkflowId(workflowId);
     const workflow = unifiedWorkflows.find(w => w.id === workflowId);
-    
     if (workflow) {
-      initializeWorkflowGUI(workflow);
-    } else {
-      setRegularGuiWorkflow(DEFAULT_WORKFLOW_GUI);
+      return initializeWorkflowGUI(workflow);
     }
+    setRegularGuiWorkflow(DEFAULT_WORKFLOW_GUI);
+    return null;
   }, [unifiedWorkflows, setSelectedWorkflowId, initializeWorkflowGUI, setRegularGuiWorkflow]);
 
   return { handleSelectWorkflow, initializeWorkflowGUI };

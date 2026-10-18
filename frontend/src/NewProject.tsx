@@ -249,6 +249,8 @@ const NewProject: React.FC<NewProjectProps> = ({ user, tourStep = null }) => {
       if (errorResponse.response?.status === 403) {
         const errorMessage = errorResponse.response?.data?.detail || "Project limit reached";
         toast.error(errorMessage);
+      } else if (errorResponse.response?.status === 409) {
+        toast.error(errorResponse.response?.data?.detail || "You already have a project with that name.");
       } else {
         toast.error("Error creating project. Please try again.");
       }

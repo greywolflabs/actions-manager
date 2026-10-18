@@ -108,8 +108,18 @@ def _make_projects(db, owner, names):
     return made
 
 
+def _signed_in(github_user):
+    """Headers for a real server-side session as ``github_user`` (#2241)."""
+    db = TestingSessionLocal()
+    try:
+        token = create_auth_session(github_user, db)
+    finally:
+        db.close()
+    return {"X-GitHub-User": github_user, "Authorization": f"Bearer {token}"}
+
+
 def _list_order(client, github_user=ADMIN):
-    resp = client.get(f"/api/projects/?github_user={github_user}", headers={"X-GitHub-User": github_user})
+    resp = client.get(f"/api/projects/?github_user={github_user}", headers=_signed_in(github_user))
     assert resp.status_code == 200, resp.text
     return [p["project_name"] for p in resp.json()]
 
@@ -117,8 +127,8 @@ def _list_order(client, github_user=ADMIN):
 def _put_order(client, project_ids, github_user=ADMIN):
     return client.put(
         "/api/projects/order",
-        json={"github_user": github_user, "project_ids": project_ids},
-        headers={"X-GitHub-User": github_user},
+        json={"project_ids": project_ids},
+        headers=_signed_in(github_user),
     )
 
 
@@ -375,7 +385,7 @@ class TestNewAndDeletedProjects:
         _put_order(client, [beta.project_id, alpha.project_id])
 
         resp = client.delete(
-            f"/api/projects/beta?github_user={ADMIN}", headers={"X-GitHub-User": ADMIN}
+            f"/api/projects/beta?github_user={ADMIN}", headers=_signed_in(ADMIN)
         )
         assert resp.status_code == 200, resp.text
 
@@ -430,13 +440,13 @@ class TestSessionIdentity:
         assert resp.status_code == 200, resp.text
         assert [p["project_name"] for p in resp.json()] == ["gamma", "alpha", "beta"]
 
-    def test_without_any_identity_the_list_still_returns_projects(self, client):
+    def test_naming_a_user_without_a_session_is_refused(self, client):
         db = TestingSessionLocal()
         admin = _make_user(db, ADMIN)
         _make_projects(db, admin, ["alpha", "beta"])
         db.close()
 
-        # No header, no session: must not 500 or 401, just fall back.
+        # A name is not an identity (#2241): the list used to fall back to it
+        # and return that user's projects to anyone who asked.
         resp = client.get(f"/api/projects/?github_user={ADMIN}")
-        assert resp.status_code == 200
-        assert len(resp.json()) == 2
+        assert resp.status_code == 401

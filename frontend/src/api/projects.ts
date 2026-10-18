@@ -2,6 +2,7 @@ import { AxiosResponse, AxiosError } from "axios";
 import apiClient from "./apiClient";
 import config from "../config";
 import type { ProjectColorKey } from "../utils/projectColors";
+import type { WorkflowKindChange } from "../utils/workflowKindChanges";
 import type { CustomFile } from "./customFiles";
 
 const BACKEND_URL = config.BACKEND_URL;
@@ -52,7 +53,7 @@ export interface Project {
   branch_max_age_days?: number;
   reusable_workflows_enabled?: boolean;
   use_prefix?: boolean;
-  pr_state?: "new" | "draft" | "open" | "synced";
+  pr_state?: "new" | "draft" | "open" | "synced" | "deleting";
   project_type?: "standard" | "rwx";
   /** Saved backend repository visibility scope ("public" | "private"). */
   repository_visibility_scope?: "public" | "private";
@@ -105,6 +106,8 @@ export interface SaveProjectResponse {
   /** False when the project has never been drift-checked, where the empty list
    * above means "cannot tell yet" rather than "nothing is waiting". */
   pending_delivery_known?: boolean;
+  /** Workflows this save gave the other kind, by their trigger (#2318). */
+  kind_changes?: WorkflowKindChange[];
 }
 
 export interface UpdateProjectColorResponse {
@@ -174,9 +177,13 @@ export interface LoadProjectResponse extends Project {
   linked_standard_projects?: LinkedStandardProject[];
   caller_project_role?: string;
   custom_files?: CustomFile[];
-  /** Workflow names with persisted drift from the last drift check (issue #1793's WorkflowDriftState),
+  /** Workflow names with persisted drift from the last drift check (stored on the delivery record),
    * used to seed the drift badge on initial render before the live check resolves. */
   drifted_workflow_names?: string[];
+  /** Whether the last drift check found the project's CODEOWNERS changed on GitHub. */
+  codeowners_drifted?: boolean;
+  /** Ids of the custom files the last drift check found changed on GitHub. */
+  drifted_custom_file_ids?: number[];
   /** Repositories in the project that have never received any of its workflows,
    * so the UI can remind the user to deliver them. Empty while a project has
    * never been drift-checked — see `_pending_delivery_repo_names`. */
@@ -194,9 +201,8 @@ export const fetchProjects = async (user: string | undefined): Promise<Project[]
     }
 
 
-    const response: AxiosResponse<Project[]> = await apiClient.get(`/api/projects/`, {
-      params: { github_user: user },
-    });
+    // The caller comes from the session (#2241); naming anyone else is refused.
+    const response: AxiosResponse<Project[]> = await apiClient.get(`/api/projects/`);
 
     return response.data;
   } catch (error) {
@@ -225,7 +231,8 @@ export const updateProjectOrder = async (
   return response.data.project_ids;
 };
 
-// Load a specific project by name
+// Load a specific project by name. A 404 is thrown rather than returned as
+// null: the page has to know the project is gone, not just that loading failed.
 export const loadProject = async (user: string, projectName: string): Promise<LoadProjectResponse | null> => {
   try {
     const response: AxiosResponse<LoadProjectResponse> = await apiClient.get(`/api/projects/${encodeURIComponent(projectName)}`, {
@@ -235,6 +242,7 @@ export const loadProject = async (user: string, projectName: string): Promise<Lo
   } catch (error) {
     const axiosError = error as AxiosError;
     console.error("❌ Error loading project:", axiosError.response?.data || axiosError);
+    if (axiosError.response?.status === 404) throw error;
     return null;
   }
 };
@@ -402,40 +410,34 @@ export interface RepoBranchConfigUpdate {
 
 /** Fetch all selected repos in a project plus their effective branch config. */
 export const fetchProjectRepoBranchConfigs = async (
-  user: string,
   projectId: number | string
 ): Promise<ProjectRepoBranchConfigsResponse> => {
   const response: AxiosResponse<ProjectRepoBranchConfigsResponse> = await apiClient.get(
-    `/api/projects/${projectId}/repo-branch-configs`,
-    { params: { github_user: user } }
+    `/api/projects/${projectId}/repo-branch-configs`
   );
   return response.data;
 };
 
 /** Update branch override config for a single repo within a project. */
 export const updateProjectRepoBranchConfig = async (
-  user: string,
   projectId: number | string,
   repoId: number,
   payload: RepoBranchConfigUpdate
 ): Promise<RepoBranchConfig> => {
   const response: AxiosResponse<RepoBranchConfig> = await apiClient.patch(
     `/api/projects/${projectId}/repos/${repoId}/branch-config`,
-    payload,
-    { params: { github_user: user } }
+    payload
   );
   return response.data;
 };
 
 /** Reset a repo back to the project's default branch configuration. */
 export const resetProjectRepoBranchConfig = async (
-  user: string,
   projectId: number | string,
   repoId: number
 ): Promise<RepoBranchConfig> => {
   const response: AxiosResponse<RepoBranchConfig> = await apiClient.delete(
-    `/api/projects/${projectId}/repos/${repoId}/branch-config`,
-    { params: { github_user: user } }
+    `/api/projects/${projectId}/repos/${repoId}/branch-config`
   );
   return response.data;
 };
@@ -444,11 +446,11 @@ export const resetProjectRepoBranchConfig = async (
 // ===== Linked Reusable Workflows API Functions =====
 
 // Fetch all available RWX workflows that can be linked
-export const getAvailableRwxWorkflows = async (user: string, projectName?: string): Promise<RwxWorkflow[]> => {
+export const getAvailableRwxWorkflows = async (projectName?: string): Promise<RwxWorkflow[]> => {
   try {
     const response: AxiosResponse<RwxWorkflow[]> = await apiClient.get(
       `${BACKEND_URL}/api/rwx-workflows`,
-      { params: { github_user: user, standard_project_name: projectName } }
+      { params: { standard_project_name: projectName } }
     );
     return response.data;
   } catch (error) {

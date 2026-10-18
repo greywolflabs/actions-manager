@@ -5,7 +5,7 @@ Two failure modes drive most of these tests:
 
   * **Cost.** Metrics are aggregated from stored runs, so opening the panel must
     cost zero GitHub calls, and a refresh must cost one call per *repository* —
-    not one per workflow, which is what the older /api/workflow-status path does.
+    not one per workflow, which is what the removed /api/workflow-status path did.
   * **Meaning.** A cancelled build is not a failed build, and "no data" is not
     "everything failed". Both are counted separately and asserted here, because
     a success rate that quietly includes cancellations is wrong in a way nobody
@@ -679,6 +679,15 @@ class TestAuthorization:
         """Authenticated as alice, asking as mallory: 403, not another user's data."""
         resp = _get(state["project_id"], github_user="mallory")
         assert resp.status_code == 403
+
+    def test_naming_nobody_acts_as_the_session_user(self, state):
+        """The caller comes from the session (#2241); the parameter is optional."""
+        resp = client.get(f"/api/projects/{state['project_id']}/build-metrics")
+        assert resp.status_code == 200
+        assert resp.json()["project_id"] == state["project_id"]
+
+    def test_naming_yourself_in_another_case_is_accepted(self, state):
+        assert _get(state["project_id"], github_user=" ALICE ").status_code == 200
 
     def test_unknown_project_is_404(self, state):
         assert _get(999999).status_code == 404

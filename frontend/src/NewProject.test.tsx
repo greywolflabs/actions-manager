@@ -337,6 +337,26 @@ describe('NewProject', () => {
       expect(mockNavigate).toHaveBeenCalledWith('/project/testuser');
     });
 
+    it('shows why when the name is already taken, and stays on the wizard (#2338)', async () => {
+      (fetchRepos as Mock).mockResolvedValue([
+        { id: 1, name: 'repo1', full_name: 'user/repo1', private: false, default_branch: 'main' },
+      ]);
+      const detail = "You already have a project named 'Test Project'. Choose another name.";
+      (saveProject as Mock).mockRejectedValue({ response: { status: 409, data: { detail } } });
+
+      render(<NewProject user="testuser" />);
+      await waitFor(() => expect(fetchRepos).toHaveBeenCalled());
+      await continueFromStep1(user);
+      await selectRepoCheckbox(user, 'user/repo1');
+      await continueFromStep2(user);
+      await user.click(screen.getByRole('radio', { name: /^Prefix Mode - Recommended/i }));
+      await user.click(screen.getByText('🚀 Create Project'));
+
+      await waitFor(() => expect(toast.error).toHaveBeenCalledWith(detail));
+      expect(toast.success).not.toHaveBeenCalled();
+      expect(mockNavigate).not.toHaveBeenCalled();
+    });
+
     it('sends use_prefix=false when No Prefix Mode option is selected', async () => {
       const mockRepos = [
         { id: 1, name: 'repo1', full_name: 'user/repo1', private: false, default_branch: 'main' },

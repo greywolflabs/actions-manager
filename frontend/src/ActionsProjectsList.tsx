@@ -129,7 +129,7 @@ export default function ActionsProjectsList({ user }: ActionsProjectsListProps):
                   data-testid="actions-group-filter"
                   value={groupFilter}
                   onChange={(e) => setGroupFilter(e.target.value)}
-                  className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-none focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 [color-scheme:light_dark]"
+                  className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-hidden focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100 scheme-light-dark"
                 >
                   <option value={ALL_GROUPS}>All Groups</option>
                   {actionGroups.map((group) => (

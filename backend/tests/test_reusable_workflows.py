@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from models import Base, Account, Project, Workflow, ProjectWorkflow
 from main import app
 from projects import get_db
+from auth import create_auth_session
 
 # Create in-memory SQLite database for testing
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test_reusable_workflows.db"
@@ -53,6 +54,7 @@ class TestReusableWorkflows:
             db.commit()
             db.refresh(test_user)
             self.user_id = test_user.user_id
+            self.auth_headers = {"Authorization": f"Bearer {create_auth_session('testuser', db)}"}
         finally:
             db.close()
         
@@ -88,7 +90,7 @@ class TestReusableWorkflows:
         }
         
         # Save the project
-        response = client.post("/api/projects/", json=project_data)
+        response = client.post("/api/projects/", json=project_data, headers=self.auth_headers)
         assert response.status_code == 200
         
         # Verify project was created
@@ -151,7 +153,7 @@ class TestReusableWorkflows:
         }
         
         # Save the project
-        response = client.post("/api/projects/", json=project_data)
+        response = client.post("/api/projects/", json=project_data, headers=self.auth_headers)
         assert response.status_code == 200
         
         # Verify project was created
@@ -215,7 +217,7 @@ class TestReusableWorkflows:
         }
         
         # Save the project
-        response = client.post("/api/projects/", json=project_data)
+        response = client.post("/api/projects/", json=project_data, headers=self.auth_headers)
         assert response.status_code == 200
         
         # Check database state
@@ -265,7 +267,7 @@ class TestReusableWorkflows:
             "branch_option": "default",
         }
 
-        created = client.post("/api/projects/", json={
+        created = client.post("/api/projects/", headers=self.auth_headers, json={
             **base,
             "rxworkflows": [{"name": "shared", "content": "name: Shared\non:\n  workflow_call:\n"}],
             "reusable_workflows_enabled": True,
@@ -273,8 +275,8 @@ class TestReusableWorkflows:
         assert created.status_code == 200
         project_id = created.json()["project_id"]
 
-        # Same project, feature now off, reusable workflow edited.
-        edited = client.post("/api/projects/", json={
+        # Same project saved (PUT), feature now off, reusable workflow edited.
+        edited = client.put(f"/api/projects/{project_id}/", headers=self.auth_headers, json={
             **base,
             "rxworkflows": [
                 {"name": "shared", "content": "name: Shared\non:\n  workflow_call:\njobs:\n  b:\n    runs-on: ubuntu-latest\n"},

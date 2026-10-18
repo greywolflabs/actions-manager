@@ -33,7 +33,7 @@ class TestUsePrefixField:
     """Test class for use_prefix field handling."""
 
     @pytest.fixture(autouse=True)
-    def setup_database(self):
+    def setup_database(self, authenticate_client):
         """Set up the test database before each test."""
         # Set up database dependency override for this test
         app.dependency_overrides[get_db] = override_get_db
@@ -53,6 +53,8 @@ class TestUsePrefixField:
             db.commit()
         finally:
             db.close()
+        self.client = TestClient(app)
+        authenticate_client(self.client, "testuser", TestingSessionLocal)
 
         yield
 
@@ -61,10 +63,6 @@ class TestUsePrefixField:
         # Clean up dependency override
         if get_db in app.dependency_overrides:
             del app.dependency_overrides[get_db]
-
-    def setup_method(self):
-        """Set up test client"""
-        self.client = TestClient(app)
 
     def test_create_project_with_use_prefix_true(self):
         """Test creating a project with use_prefix=true (Secure Mode enabled)."""
@@ -156,8 +154,13 @@ class TestUsePrefixField:
         finally:
             db.close()
 
-    def test_update_project_use_prefix_from_true_to_false(self):
-        """Test updating an existing project's use_prefix from true to false."""
+    def test_use_prefix_true_stays_as_created(self):
+        """use_prefix is chosen when the project is created (#2338).
+
+        Re-posting the project used to update it in place, which was the only
+        way to change use_prefix afterwards; that create is now refused, and
+        the project save (PUT) has never written use_prefix.
+        """
         # Create project with use_prefix=true
         project_data = {
             "github_user": "testuser",
@@ -184,21 +187,19 @@ class TestUsePrefixField:
         finally:
             db.close()
 
-        # Update to use_prefix=false
         project_data["use_prefix"] = False
-        update_response = self.client.post("/api/projects/", json=project_data)
-        assert update_response.status_code == 200
+        assert self.client.post("/api/projects/", json=project_data).status_code == 409
+        assert self.client.put(f"/api/projects/{project_id}/", json=project_data).status_code == 200
 
-        # Verify updated state
         db = TestingSessionLocal()
         try:
             project = db.query(Project).filter(Project.project_id == project_id).first()
-            assert project.use_prefix is False
+            assert project.use_prefix is True
         finally:
             db.close()
 
-    def test_update_project_use_prefix_from_false_to_true(self):
-        """Test updating an existing project's use_prefix from false to true."""
+    def test_use_prefix_false_stays_as_created(self):
+        """The same as above from the other side (#2338)."""
         # Create project with use_prefix=false
         project_data = {
             "github_user": "testuser",
@@ -225,16 +226,14 @@ class TestUsePrefixField:
         finally:
             db.close()
 
-        # Update to use_prefix=true
         project_data["use_prefix"] = True
-        update_response = self.client.post("/api/projects/", json=project_data)
-        assert update_response.status_code == 200
+        assert self.client.post("/api/projects/", json=project_data).status_code == 409
+        assert self.client.put(f"/api/projects/{project_id}/", json=project_data).status_code == 200
 
-        # Verify updated state
         db = TestingSessionLocal()
         try:
             project = db.query(Project).filter(Project.project_id == project_id).first()
-            assert project.use_prefix is True
+            assert project.use_prefix is False
         finally:
             db.close()
 

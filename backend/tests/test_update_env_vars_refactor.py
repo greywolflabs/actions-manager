@@ -26,15 +26,14 @@ class TestEnvVarsRefactor:
         """Test request data validation"""
         data = {
             "user": "testuser",
-            "repo_names": ["repo1", "repo2"],
+            "repo_names": ["owner/repo1", "owner/repo2"],
             "env": [{"key": "VAR1", "value": "value1"}],
             "project_name": "  TEST_PROJECT  "
         }
         
-        user, repo_names, env_vars, project_name = _validate_request_data(data)
+        repo_names, env_vars, project_name = _validate_request_data(data)
         
-        assert user == "testuser"
-        assert repo_names == ["repo1", "repo2"]
+        assert repo_names == ["owner/repo1", "owner/repo2"]
         assert len(env_vars) == 1
         assert env_vars[0]["key"] == "VAR1"
         assert project_name == "TEST_PROJECT"
@@ -43,11 +42,11 @@ class TestEnvVarsRefactor:
         """Test request data validation with missing env"""
         data = {
             "user": "testuser",
-            "repo_names": ["repo1"],
+            "repo_names": ["owner/repo1"],
             "project_name": "TEST"
         }
         
-        user, repo_names, env_vars, project_name = _validate_request_data(data)
+        repo_names, env_vars, project_name = _validate_request_data(data)
         assert env_vars == []
     
     @patch('github_env_vars.user_tokens', {'testuser': 'fake_token'})

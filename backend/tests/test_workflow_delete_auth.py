@@ -21,7 +21,8 @@ call that should not have happened rather than a live request.
 """
 import os
 import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -33,6 +34,7 @@ from models import (
     Account, Project, ProjectMembership, ProjectRepo, Repo, WorkspaceMember,
 )
 from tests.conftest import TestingSessionLocal
+from tests.delivery_records import record_delivered
 
 OWNER = "wfdel-owner"
 VIEWER = "wfdel-viewer"
@@ -93,14 +95,42 @@ def world():
 ALL_TOKENS = {OWNER: "t", VIEWER: "t", EDITOR: "t", STRANGER: "t"}
 
 
+def _missing():
+    response = MagicMock(status_code=404, text="")
+    response.json.return_value = {}
+    return response
+
+
+class _GitHub:
+    """Every GitHub call a workflow deletion makes, patched; GitHub holds nothing."""
+
+    def __init__(self):
+        self.get = MagicMock(return_value=_missing())
+        self.delete = MagicMock(return_value=_missing())
+        self.branches = MagicMock(return_value=["main"])
+
+    def assert_not_called(self):
+        self.get.assert_not_called()
+        self.delete.assert_not_called()
+        self.branches.assert_not_called()
+
+
+@contextmanager
+def _github():
+    gh = _GitHub()
+    with patch("workflows.github_get", gh.get), \
+         patch("workflows.requests.delete", gh.delete), \
+         patch("workflows._resolve_branches_for_repo", gh.branches):
+        yield gh
+
+
 def _delete_workflow(as_user, project_name, repo_names, authenticate_client):
     """Call DELETE /api/delete-workflow with every GitHub client patched."""
     authenticate_client(client, as_user, TestingSessionLocal)
     with patch("workflows.user_tokens", ALL_TOKENS), \
-         patch("auth.user_tokens", ALL_TOKENS), \
-         patch("workflows.httpx.AsyncClient") as http, \
-         patch("workflows.clear_workflow_drift"):
-        http.return_value.__aenter__.return_value = AsyncMock()
+         patch.dict("auth.user_tokens", ALL_TOKENS), \
+         _github() as http, \
+         patch("workflows.clear_drift"):
         resp = client.request(
             "DELETE", "/api/delete-workflow",
             headers={"X-GitHub-User": as_user},
@@ -165,9 +195,8 @@ class TestDeleteWorkflowAuthorization:
 def _delete_reusable(as_user, project_name, authenticate_client):
     authenticate_client(client, as_user, TestingSessionLocal)
     with patch("workflows.user_tokens", ALL_TOKENS), \
-         patch("auth.user_tokens", ALL_TOKENS), \
-         patch("workflows.httpx.AsyncClient") as http:
-        http.return_value.__aenter__.return_value = AsyncMock()
+         patch.dict("auth.user_tokens", ALL_TOKENS), \
+         _github() as http:
         resp = client.request(
             "DELETE", "/api/delete-reusable-workflow",
             headers={"X-GitHub-User": as_user},
@@ -203,6 +232,7 @@ class TestDeleteReusableWorkflowAuthorization:
 
     def test_an_rwx_project_owner_reaches_github(self, world, authenticate_client):
         """The RWX project owns its repository, so deleting there is its own file."""
+        from models import ProjectWorkflow, Workflow
         db = TestingSessionLocal()
         try:
             owner = db.query(Account).filter_by(github_user=OWNER).first()
@@ -218,24 +248,24 @@ class TestDeleteReusableWorkflowAuthorization:
             db.commit()
             db.refresh(repo)
             db.add(ProjectRepo(project_id=rwx.project_id, repo_id=repo.repo_id))
+            workflow = Workflow(workflow_name="shared-deploy", workflow_yaml="on: workflow_call",
+                                reusable_workflow=True, workflow_status="synced_with_github")
+            db.add(workflow)
             db.commit()
+            db.add(ProjectWorkflow(project_id=rwx.project_id, workflow_id=workflow.workflow_id))
+            db.commit()
+            record_delivered(db, workflow, "acme/shared-workflows", "main", sha="b" * 40,
+                             path=".github/workflows/AM_RWX_shared-deploy.yml")
             rwx_name = rwx.project_name
         finally:
             db.close()
 
-        branches = MagicMock()
-        branches.status_code = 200
-        branches.json.return_value = [{"name": "main"}]
-        missing = MagicMock()
-        missing.status_code = 404
-
+        deleted = MagicMock(status_code=200, text="")
         authenticate_client(client, OWNER, TestingSessionLocal)
         with patch("workflows.user_tokens", ALL_TOKENS), \
-             patch("auth.user_tokens", ALL_TOKENS), \
-             patch("workflows.httpx.AsyncClient") as http:
-            gh = AsyncMock()
-            gh.get.side_effect = [branches, missing]
-            http.return_value.__aenter__.return_value = gh
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
+             _github() as http:
+            http.delete.return_value = deleted
             resp = client.request(
                 "DELETE", "/api/delete-reusable-workflow",
                 headers={"X-GitHub-User": OWNER},
@@ -244,6 +274,10 @@ class TestDeleteReusableWorkflowAuthorization:
             )
 
         assert resp.status_code == 200
+        assert resp.json()["results"] == {"acme/shared-workflows": {"deleted": ["main"], "failed": {}}}
+        [call] = http.delete.call_args_list
+        assert "/repos/acme/shared-workflows/contents/.github/workflows/AM_RWX_shared-deploy.yml" in call.args[0]
+        assert call.kwargs["json"]["sha"] == "b" * 40
 
 
 class TestDeleteWorkflowDelivery:
@@ -254,14 +288,14 @@ class TestDeleteWorkflowDelivery:
     the way custom-file deletion already works.
     """
 
-    def _seed_workflow(self, project_name="wfdel_project"):
+    def _seed_workflow(self, project_name="wfdel_project", reusable=False):
         from models import ProjectWorkflow, Workflow
         db = TestingSessionLocal()
         try:
             project = db.query(Project).filter_by(project_name=project_name).first()
             wf = Workflow(
                 workflow_name="ci", workflow_yaml="name: CI\non: push",
-                reusable_workflow=False, workflow_status="synced_with_github",
+                reusable_workflow=reusable, workflow_status="synced_with_github",
             )
             db.add(wf)
             db.commit()
@@ -284,9 +318,8 @@ class TestDeleteWorkflowDelivery:
         self._seed_workflow()
         authenticate_client(client, OWNER, TestingSessionLocal)
         with patch("workflows.user_tokens", ALL_TOKENS), \
-             patch("auth.user_tokens", ALL_TOKENS), \
-             patch("workflows.httpx.AsyncClient") as http:
-            http.return_value.__aenter__.return_value = AsyncMock()
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
+             _github() as http:
             resp = client.request(
                 "DELETE", "/api/delete-workflow",
                 headers={"X-GitHub-User": OWNER},
@@ -298,17 +331,21 @@ class TestDeleteWorkflowDelivery:
         assert resp.status_code == 400
         http.assert_not_called()
 
+    @pytest.mark.parametrize("reusable", [False, True], ids=["regular", "caller-owned-reusable"])
     def test_campaign_delivery_opens_a_campaign_and_keeps_the_row(
-        self, world, authenticate_client
+        self, world, authenticate_client, reusable
     ):
+        """A caller project's own reusable workflow lives in its repos (#2309),
+        so the removal campaign has to select it; naming it in
+        selected_workflows alone matched nothing and answered 502."""
         from models import Workflow
-        workflow_id = self._seed_workflow()
+        workflow_id = self._seed_workflow(reusable=reusable)
         pr = {"number": 11, "html_url": "https://github.com/acme/in-project/pull/11",
               "title": "t", "user": {"login": OWNER}, "body": "b"}
 
         authenticate_client(client, OWNER, TestingSessionLocal)
         with patch("workflows.user_tokens", ALL_TOKENS), \
-             patch("auth.user_tokens", ALL_TOKENS), \
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
              patch("workflows._resolve_branches_for_repo", return_value=["main"]), \
              patch("workflows._create_or_get_am_branch",
                    return_value=("actions-manager/wfd/in-project/ab12-main", True, None)), \
@@ -343,6 +380,55 @@ class TestDeleteWorkflowDelivery:
         finally:
             db.close()
 
+    def test_an_rwx_projects_reusable_workflow_is_removed_by_campaign(
+        self, world, authenticate_client
+    ):
+        """A removal campaign removes; it no longer delivers the workflow's
+        content, so it no longer needs refusing for a Reusable Workflow Project.
+        With no delivery on the record it removes the file where an RWX campaign
+        delivers it: its repository's default branch."""
+        from models import Workflow
+        db = TestingSessionLocal()
+        try:
+            db.query(Project).filter_by(project_name="wfdel_project").update({"project_type": "rwx"})
+            db.commit()
+        finally:
+            db.close()
+        workflow_id = self._seed_workflow(reusable=True)
+        pr = {"number": 12, "html_url": "https://github.com/acme/in-project/pull/12",
+              "title": "t", "user": {"login": OWNER}, "body": "b"}
+
+        authenticate_client(client, OWNER, TestingSessionLocal)
+        with patch("workflows.user_tokens", ALL_TOKENS), \
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
+             patch("workflows.get_default_branch", return_value="trunk"), \
+             patch("workflows._create_or_get_am_branch",
+                   return_value=("actions-manager/wfd/in-project/ab12-trunk", True, None)) as cut, \
+             patch("workflows._fetch_branch_protection", return_value={"status": "none"}), \
+             patch("workflows.github_get", return_value=self._resp(200, {"sha": "abc"})), \
+             patch("workflows.requests.delete", return_value=self._resp(200)) as gh_delete, \
+             patch("workflows._check_existing_pr", return_value=None), \
+             patch("workflows._create_pull_request", return_value=(pr, None)):
+            resp = client.request(
+                "DELETE", "/api/delete-workflow",
+                headers={"X-GitHub-User": OWNER},
+                json={"user": OWNER, "repo_names": ["acme/in-project"],
+                      "workflow_name": "ci", "project_name": "wfdel_project",
+                      "delivery": "campaign"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["prs_created"] == 1
+        assert cut.call_args.args[:3] == ("acme", "in-project", "trunk")
+        assert gh_delete.call_args.kwargs["json"]["branch"] == "actions-manager/wfd/in-project/ab12-trunk"
+        db = TestingSessionLocal()
+        try:
+            wf = db.query(Workflow).filter_by(workflow_id=workflow_id).first()
+            assert wf.pending_delete is True
+            assert wf.workflow_status == "under_review"
+        finally:
+            db.close()
+
     def test_a_campaign_that_opens_nothing_unmarks_the_workflow(
         self, world, authenticate_client
     ):
@@ -351,7 +437,7 @@ class TestDeleteWorkflowDelivery:
 
         authenticate_client(client, OWNER, TestingSessionLocal)
         with patch("workflows.user_tokens", ALL_TOKENS), \
-             patch("auth.user_tokens", ALL_TOKENS), \
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
              patch("workflows._resolve_branches_for_repo", return_value=["main"]), \
              patch("workflows._create_or_get_am_branch",
                    return_value=(None, False, "branch is protected")), \
@@ -483,7 +569,7 @@ class TestDeleteWorkflowRepoScoping:
     def test_a_campaign_only_targets_the_repositories_asked_for(
         self, world, authenticate_client
     ):
-        """Without selected_repos the campaign sweeps in every project repo."""
+        """The record holds the workflow in both repositories; only the one asked for is a target."""
         from models import ProjectWorkflow, Workflow
 
         db = TestingSessionLocal()
@@ -503,14 +589,15 @@ class TestDeleteWorkflowRepoScoping:
             db.refresh(wf)
             db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=wf.workflow_id))
             db.commit()
+            for repo_name in ("acme/in-project", "acme/second-in-project"):
+                record_delivered(db, wf, repo_name, "main", sha="a" * 40)
         finally:
             db.close()
 
         authenticate_client(client, OWNER, TestingSessionLocal)
         with patch("workflows.user_tokens", ALL_TOKENS), \
-             patch("auth.user_tokens", ALL_TOKENS), \
-             patch("workflows._process_regular_workflows_update") as process:
-            process.return_value = {}
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
+             patch("workflows._open_removal_prs", return_value={}) as removal:
             client.request(
                 "DELETE", "/api/delete-workflow",
                 headers={"X-GitHub-User": OWNER},
@@ -519,9 +606,9 @@ class TestDeleteWorkflowRepoScoping:
                       "delivery": "campaign"},
             )
 
-        process.assert_called_once()
-        targeted = process.call_args.args[0] if process.call_args.args else process.call_args.kwargs["repo_names"]
-        assert targeted == ["acme/in-project"], targeted
+        removal.assert_called_once()
+        targets = removal.call_args.args[2]
+        assert [(t.repo_name, t.branch) for t in targets] == [("acme/in-project", "main")]
 
 
 class TestPendingDeleteLifecycle:
@@ -600,9 +687,8 @@ class TestDeleteWorkflowNameHandling:
     def test_a_path_traversing_name_is_refused(self, world, authenticate_client):
         authenticate_client(client, OWNER, TestingSessionLocal)
         with patch("workflows.user_tokens", ALL_TOKENS), \
-             patch("auth.user_tokens", ALL_TOKENS), \
-             patch("workflows.httpx.AsyncClient") as http:
-            http.return_value.__aenter__.return_value = AsyncMock()
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
+             _github() as http:
             resp = client.request(
                 "DELETE", "/api/delete-workflow",
                 headers={"X-GitHub-User": OWNER},
@@ -618,9 +704,8 @@ class TestDeleteWorkflowNameHandling:
         """Unquoted, "?" would truncate the contents path and drop the ref."""
         authenticate_client(client, OWNER, TestingSessionLocal)
         with patch("workflows.user_tokens", ALL_TOKENS), \
-             patch("auth.user_tokens", ALL_TOKENS), \
-             patch("workflows.httpx.AsyncClient") as http:
-            http.return_value.__aenter__.return_value = AsyncMock()
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
+             _github() as http:
             resp = client.request(
                 "DELETE", "/api/delete-workflow",
                 headers={"X-GitHub-User": OWNER},
@@ -658,7 +743,7 @@ class TestDeleteWorkflowNameHandling:
 
         authenticate_client(client, OWNER, TestingSessionLocal)
         with patch("workflows.user_tokens", ALL_TOKENS), \
-             patch("auth.user_tokens", ALL_TOKENS), \
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
              patch("workflows.drop_workflow_drift"):
             resp = client.request(
                 "DELETE", "/api/delete-db-workflow",
@@ -687,6 +772,7 @@ class TestCampaignWithNothingToRemove:
     """
 
     def _seed(self):
+        """A workflow the record holds delivered to acme/in-project, so the campaign has a target."""
         from models import ProjectWorkflow, Workflow
         db = TestingSessionLocal()
         try:
@@ -700,6 +786,7 @@ class TestCampaignWithNothingToRemove:
             db.refresh(wf)
             db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=wf.workflow_id))
             db.commit()
+            record_delivered(db, wf, "acme/in-project", "main", sha="a" * 40)
             return wf.workflow_id
         finally:
             db.close()
@@ -707,8 +794,8 @@ class TestCampaignWithNothingToRemove:
     def _delete(self, authenticate_client, results):
         authenticate_client(client, OWNER, TestingSessionLocal)
         with patch("workflows.user_tokens", ALL_TOKENS), \
-             patch("auth.user_tokens", ALL_TOKENS), \
-             patch("workflows._process_regular_workflows_update", return_value=results), \
+             patch.dict("auth.user_tokens", ALL_TOKENS), \
+             patch("workflows._open_removal_prs", return_value=results), \
              patch("workflows.drop_workflow_drift"):
             return client.request(
                 "DELETE", "/api/delete-workflow",

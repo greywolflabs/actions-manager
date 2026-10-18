@@ -84,7 +84,7 @@ const SaveResultsModal: React.FC<SaveResultsModalProps> = ({
         <div className="space-y-6">
           <div className="bg-green-50 border border-green-500 rounded-lg p-4 space-y-2 dark:bg-green-950 dark:border-green-700">
             <div className="flex items-center gap-3">
-              <span className="text-xl flex-shrink-0">📁</span>
+              <span className="text-xl shrink-0">📁</span>
               <span className="text-sm text-green-800 font-medium dark:text-green-200">
                 Project "{projectName}" has been saved to the database
               </span>
@@ -92,7 +92,7 @@ const SaveResultsModal: React.FC<SaveResultsModalProps> = ({
             
             {githubUpdatePerformed && (
               <div className="flex items-center gap-3">
-                <span className="text-xl flex-shrink-0">🔀</span>
+                <span className="text-xl shrink-0">🔀</span>
                 <span className="text-sm text-green-800 font-medium dark:text-green-200">
                   Pull requests have been created/updated for workflow changes
                 </span>

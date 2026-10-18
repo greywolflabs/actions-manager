@@ -7,8 +7,8 @@ from typing import Annotated
 from database import get_db
 import auth as auth_module
 from auth import user_tokens
-from workflows import require_project_write_access
-from models import Project, Account, ProjectSecret  # ✅ Import ProjectSecret for storing secret names
+from workflows import _find_project_by_name, require_project_write_access
+from models import Account, ProjectSecret  # ✅ Import ProjectSecret for storing secret names
 
 router = APIRouter()
 
@@ -75,12 +75,13 @@ async def _validate_account_limits(user: str, project_name: str, secrets: list, 
     
     if not user_obj:
         return {"error": "User not found", "status": 404}
-    
-    # Get project code to check current secret count
-    project = db.query(Project).filter(Project.project_name.ilike(project_name)).first()
+
+    # The same lookup the write check used, so the count is of the project
+    # being written to.
+    project = _find_project_by_name(db, user, project_name)
     if not project:
         return {"error": f"Project '{project_name}' not found", "status": 404}
-    
+
     project_code = project.project_code.upper()
     use_prefix = project.use_prefix
     current_count = await count_project_secrets(user, project_code, repo_names, use_prefix, project.project_id, db)
@@ -163,23 +164,24 @@ async def _process_repository_secrets(repo_name: str, secrets: list, project_cod
     return repo_results
 
 
-@router.post("/api/create-secrets")
-async def create_secrets(request: Request, db: Annotated[Session, Depends(get_db)]):
+@router.post("/api/create-secrets", responses={409: {"description": "More than one project has this name"}})
+async def create_secrets(
+    request: Request, db: Annotated[Session, Depends(get_db)], account: auth_module.CurrentAccount,
+):
     """Creates multiple GitHub Actions secrets across multiple repositories."""
     try:
         data = await request.json()
-        user = data.get("user")
+        # The caller selects whose GitHub token is used, so it comes from the
+        # session (#2241); a "user" the body still carries is ignored.
+        user = account.github_user
         repo_names = data.get("repo_names", [])  
         secrets = data.get("secrets", [])  
         project_name = data.get("project_name", "").strip()
 
         if user not in user_tokens:
             return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
-        # The caller's name arrives in the request body and selects whose GitHub
-        # token is used, so it is proven here rather than trusted, and the
-        # project is checked for write access: this route changes the project's
-        # secrets in GitHub.
-        require_project_write_access(db, request, user, project_name)
+        # This route changes the project's secrets in GitHub.
+        project = require_project_write_access(db, request, user, project_name)
 
 
         # Validate account limits for free accounts
@@ -193,15 +195,6 @@ async def create_secrets(request: Request, db: Annotated[Session, Depends(get_db
             "Accept": ACCEPT_HEADER,
             "X-GitHub-Api-Version": X_API_VERSION
         }
-
-        # Get project code — verify ownership before accessing
-        account = db.query(Account).filter(Account.github_user == user).first()
-        project = db.query(Project).filter(
-            Project.project_name.ilike(project_name),
-            Project.user_id == (account.user_id if account else -1),
-        ).first()
-        if not project:
-            return {"error": f"Project '{project_name}' not found", "status": 404}
 
         project_code = project.project_code.upper()
         use_prefix = project.use_prefix  # Get prefix setting from project
@@ -239,7 +232,7 @@ async def create_secrets(request: Request, db: Annotated[Session, Depends(get_db
         raise
     except Exception as e:
         print(f"❌ Exception: {str(e)}")
-        return {"error": str(e)}
+        return {"error": "Error creating secrets"}
 
 
 def _store_unprefixed_secret_names(db: Session, project, secrets: list):
@@ -277,13 +270,18 @@ def _store_unprefixed_secret_names(db: Session, project, secrets: list):
 
 
 
-@router.get("/api/get-secrets")
-async def get_secrets(user: str, repo_name: str, project_name: str, db: Annotated[Session, Depends(get_db)], request: Request = None):
+@router.get("/api/get-secrets", responses={409: {"description": "More than one project has this name"}})
+async def get_secrets(
+    repo_name: str, project_name: str, db: Annotated[Session, Depends(get_db)], account: auth_module.CurrentAccount,
+):
     """Fetches GitHub secrets for a project.
     - If use_prefix=True: Filters GitHub secrets matching 'AM_<PROJECT_CODE>_*' format
     - If use_prefix=False: Retrieves secret names from ProjectSecret table and verifies they exist in GitHub
     """
     try:
+        # The session's caller, whose token reads the repository (#2241). A
+        # read, so no write access is needed.
+        user = account.github_user
         print(f"📌 Incoming API Call: user={user}, repo={repo_name}, project={project_name}")
 
         if not project_name or project_name.strip() == "":
@@ -291,11 +289,6 @@ async def get_secrets(user: str, repo_name: str, project_name: str, db: Annotate
 
         if user not in user_tokens:
             return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
-        # A read: the caller's name still has to be proven, because it selects
-        # whose GitHub token is used, but reading does not require write access.
-        if request is not None:
-            auth_module.assert_session_owns_user(user, request, db)
-
 
         token = user_tokens[user]
         headers = {
@@ -305,7 +298,7 @@ async def get_secrets(user: str, repo_name: str, project_name: str, db: Annotate
         }
 
         # ✅ Fetch project and check use_prefix flag
-        project = db.query(Project).filter(Project.project_name.ilike(project_name.strip())).first()
+        project = _find_project_by_name(db, user, project_name)
 
         if not project:
             print(f"❌ Project '{project_name}' not found in DB")
@@ -359,27 +352,27 @@ async def get_secrets(user: str, repo_name: str, project_name: str, db: Annotate
         raise
     except Exception as e:
         print(f"❌ Error in /api/get-secrets: {str(e)}")
-        return {"error": str(e)}
+        return {"error": "Error getting secrets"}
 
 
 
-@router.delete("/api/delete-secrets")
-async def delete_secrets(request: Request, db: Annotated[Session, Depends(get_db)]):
+@router.delete("/api/delete-secrets", responses={409: {"description": "More than one project has this name"}})
+async def delete_secrets(
+    request: Request, db: Annotated[Session, Depends(get_db)], account: auth_module.CurrentAccount,
+):
     """Deletes GitHub repository secrets."""
     try:
         data = await request.json()
-        user = data.get("user")
+        # As for create: the session's caller, never a name from the body.
+        user = account.github_user
         project_name = data.get("project_name", "").strip()
         repo_names = data.get("repo_names", [])
         secret_name = data.get("secret_name", "").strip()
 
         if user not in user_tokens:
             return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
-        # The caller's name arrives in the request body and selects whose GitHub
-        # token is used, so it is proven here rather than trusted, and the
-        # project is checked for write access: this route changes the project's
-        # secrets in GitHub.
-        require_project_write_access(db, request, user, project_name)
+        # This route changes the project's secrets in GitHub.
+        project = require_project_write_access(db, request, user, project_name)
 
 
         # ✅ Free accounts can delete secrets (within their limits)
@@ -391,15 +384,6 @@ async def delete_secrets(request: Request, db: Annotated[Session, Depends(get_db
             "Accept": ACCEPT_HEADER,
             "X-GitHub-Api-Version": X_API_VERSION
         }
-
-        # Fetch project — verify ownership before allowing deletion
-        account = db.query(Account).filter(Account.github_user == user).first()
-        project = db.query(Project).filter(
-            Project.project_name.ilike(project_name),
-            Project.user_id == (account.user_id if account else -1),
-        ).first()
-        if not project:
-            return {"error": f"Project '{project_name}' not found", "status": 404}
 
         project_code = project.project_code.upper()
 
@@ -431,65 +415,21 @@ async def delete_secrets(request: Request, db: Annotated[Session, Depends(get_db
         raise
     except Exception as e:
         print(f"❌ Exception: {str(e)}")
-        return {"error": str(e), "status": 500}
+        return {"error": "Error deleting secrets", "status": 500}
 
 
-@router.post("/api/sync-secret")
-async def sync_secret(request: Request, db: Annotated[Session, Depends(get_db)]):
-    """Syncs a specific secret to all repositories that don't have it"""
-    try:
-        data = await request.json()
-        user = data.get("user")
-        project_name = data.get("project_name", "").strip()
-        secret_key = data.get("secret_key", "").strip()
-
-        if user not in user_tokens:
-            return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
-        # The caller's name arrives in the request body and selects whose GitHub
-        # token is used, so it is proven here rather than trusted, and the
-        # project is checked for write access: this route changes the project's
-        # secrets in GitHub.
-        require_project_write_access(db, request, user, project_name)
-
-
-        # Check account type - allow sync for free accounts since they're not creating new secrets
-        # Note: We allow sync for free accounts since they're managing existing secrets, not creating new ones
-
-        # Get project code
-        project = db.query(Project).filter(Project.project_name.ilike(project_name)).first()
-        if not project:
-            return {"error": f"Project '{project_name}' not found", "status": 404}
-
-        print(f"📌 Syncing secret '{secret_key}' to missing repos")
-
-        # Note: GitHub API doesn't allow reading secret values, so we can't actually sync the value
-        # Instead, we'll return an error asking the user to recreate the secret
-        return {"error": "Cannot sync secrets because GitHub API doesn't allow reading secret values. Please delete and recreate the secret to add it to all repositories.", "status": 400}
-
-    except HTTPException:
-        # A deliberate status - the authorization refusal above, or a 404 -
-        # must reach the client as that status. The handler below turns
-        # anything it catches into a 200 carrying an error body, which is a
-        # refused write reported as success.
-        raise
-    except Exception as e:
-        print(f"❌ Error syncing secret: {str(e)}")
-        return {"error": str(e), "status": 500}
-
-
-@router.get("/api/secrets-count")
-async def get_secrets_count(user: str, project_name: str, repo_names: str, db: Annotated[Session, Depends(get_db)], request: Request = None):
+@router.get("/api/secrets-count", responses={409: {"description": "More than one project has this name"}})
+async def get_secrets_count(
+    project_name: str, repo_names: str, db: Annotated[Session, Depends(get_db)], account: auth_module.CurrentAccount,
+):
     """Get the count of secrets for a project"""
     try:
+        # As for get-secrets: the session's caller, and a read.
+        user = account.github_user
         print(f"📌 Getting secrets count for user={user}, project={project_name}, repos={repo_names}")
         
         if user not in user_tokens:
             return {"error": NOT_AUTHENTICATED_DETAIL, "status": 401}
-        # A read: the caller's name still has to be proven, because it selects
-        # whose GitHub token is used, but reading does not require write access.
-        if request is not None:
-            auth_module.assert_session_owns_user(user, request, db)
-
         
         # Parse repo names
         repo_list = [repo.strip() for repo in repo_names.split(",") if repo.strip()]
@@ -497,7 +437,7 @@ async def get_secrets_count(user: str, project_name: str, repo_names: str, db: A
             return {"error": "No valid repository names provided", "status": 400}
         
         # Get project code
-        project = db.query(Project).filter(Project.project_name.ilike(project_name.strip())).first()
+        project = _find_project_by_name(db, user, project_name)
         if not project:
             return {"error": f"Project '{project_name}' not found", "status": 404}
         
@@ -515,4 +455,4 @@ async def get_secrets_count(user: str, project_name: str, repo_names: str, db: A
         raise
     except Exception as e:
         print(f"❌ Error getting secrets count: {str(e)}")
-        return {"error": str(e), "status": 500}
+        return {"error": "Error getting secrets count", "status": 500}

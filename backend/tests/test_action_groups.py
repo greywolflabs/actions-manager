@@ -22,7 +22,7 @@ os.environ.setdefault("ENVIRONMENT", "development")
 from main import app  # noqa: E402
 from action_groups import get_db as ag_get_db  # noqa: E402
 from auth import user_tokens, create_auth_session  # noqa: E402
-from models import Base, Account, ActionsProject  # noqa: E402
+from models import Base, Account, ActionGroup, ActionsProject  # noqa: E402
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
 engine = create_engine(
@@ -70,8 +70,7 @@ def _setup_action(db, user_id, name="Checkout"):
 
 
 def _session_headers(db, github_user="testuser") -> dict:
-    """A real session for github_user, since routes now verify the caller's
-    session actually belongs to the github_user they claim in the request."""
+    """A real session for github_user: the routes take the caller from it (#2241)."""
     return {"Authorization": f"Bearer {create_auth_session(github_user, db)}"}
 
 
@@ -99,7 +98,7 @@ class TestCrud:
 
         create_resp = client.post(
             "/api/action-groups/",
-            json={"github_user": "testuser", "name": "Deployment", "description": "Deploy actions"},
+            json={"name": "Deployment", "description": "Deploy actions"},
             headers=headers,
         )
         assert create_resp.status_code == 201
@@ -107,13 +106,12 @@ class TestCrud:
         assert created["name"] == "Deployment"
         assert created["actions_project_ids"] == []
 
-        list_resp = client.get("/api/action-groups/", params={"github_user": "testuser"}, headers=headers)
+        list_resp = client.get("/api/action-groups/", headers=headers)
         assert list_resp.status_code == 200
         assert len(list_resp.json()) == 1
 
         get_resp = client.get(
             f"/api/action-groups/{created['action_group_id']}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert get_resp.status_code == 200
@@ -126,12 +124,12 @@ class TestCrud:
         db.close()
 
         created = client.post(
-            "/api/action-groups/", json={"github_user": "testuser", "name": "Deployment"}, headers=headers
+            "/api/action-groups/", json={"name": "Deployment"}, headers=headers
         ).json()
 
         update_resp = client.put(
             f"/api/action-groups/{created['action_group_id']}",
-            json={"github_user": "testuser", "name": "Deploy", "description": "Renamed"},
+            json={"name": "Deploy", "description": "Renamed"},
             headers=headers,
         )
         assert update_resp.status_code == 200
@@ -145,19 +143,17 @@ class TestCrud:
         db.close()
 
         created = client.post(
-            "/api/action-groups/", json={"github_user": "testuser", "name": "Deployment"}, headers=headers
+            "/api/action-groups/", json={"name": "Deployment"}, headers=headers
         ).json()
 
         delete_resp = client.delete(
             f"/api/action-groups/{created['action_group_id']}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert delete_resp.status_code == 204
 
         get_resp = client.get(
             f"/api/action-groups/{created['action_group_id']}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert get_resp.status_code == 404
@@ -168,7 +164,7 @@ class TestCrud:
         headers = _session_headers(db)
         db.close()
 
-        resp = client.get("/api/action-groups/9999", params={"github_user": "testuser"}, headers=headers)
+        resp = client.get("/api/action-groups/9999", headers=headers)
         assert resp.status_code == 404
 
     def test_create_unauthenticated(self):
@@ -178,8 +174,9 @@ class TestCrud:
     def test_cannot_impersonate_another_user_by_claiming_their_username(self):
         """A real session for testuser must not be able to act as otheruser
         just by putting otheruser's name in github_user - github_user is
-        client-controlled and GitHub usernames are public, so this is the
-        exact impersonation this endpoint must reject."""
+        client-controlled and GitHub usernames are public. The caller comes
+        from the session (#2241), so the name is ignored and the group is
+        recorded as testuser's."""
         db = TestingSessionLocal()
         _setup_account(db, "testuser")
         _setup_account(db, "otheruser")
@@ -193,9 +190,30 @@ class TestCrud:
                 json={"github_user": "otheruser", "name": "Deployment"},
                 headers=headers,
             )
-            assert resp.status_code == 403
+            assert resp.status_code == 201, resp.text
+            db = TestingSessionLocal()
+            group = db.query(ActionGroup).filter_by(action_group_id=resp.json()["action_group_id"]).one()
+            assert group.last_modified_by == "testuser"
+            db.close()
         finally:
             user_tokens.pop("otheruser", None)
+
+    def test_naming_someone_else_in_the_query_is_refused(self):
+        """auth.current_account owns the legacy github_user query parameter (#2241)."""
+        db = TestingSessionLocal()
+        _setup_account(db, "testuser")
+        _setup_account(db, "otheruser")
+        headers = _session_headers(db, "testuser")
+        db.close()
+
+        # The body names the caller, as the frontend still sends it.
+        resp = client.post(
+            "/api/action-groups/",
+            params={"github_user": "otheruser"},
+            json={"github_user": "testuser", "name": "Deployment"},
+            headers=headers,
+        )
+        assert resp.status_code == 403, resp.text
 
     def test_shared_across_users(self):
         """Groups are shared/workspace-wide, matching the Actions catalog itself."""
@@ -209,17 +227,17 @@ class TestCrud:
 
         try:
             created = client.post(
-                "/api/action-groups/", json={"github_user": "testuser", "name": "Deployment"}, headers=headers
+                "/api/action-groups/", json={"name": "Deployment"}, headers=headers
             ).json()
 
             other_list = client.get(
-                "/api/action-groups/", params={"github_user": "otheruser"}, headers=other_headers
+                "/api/action-groups/", headers=other_headers
             )
             assert len(other_list.json()) == 1
 
             other_update = client.put(
                 f"/api/action-groups/{created['action_group_id']}",
-                json={"github_user": "otheruser", "name": "Renamed by other user"},
+                json={"name": "Renamed by other user"},
                 headers=other_headers,
             )
             assert other_update.status_code == 200
@@ -236,12 +254,11 @@ class TestMembership:
         db.close()
 
         group = client.post(
-            "/api/action-groups/", json={"github_user": "testuser", "name": "Deployment"}, headers=headers
+            "/api/action-groups/", json={"name": "Deployment"}, headers=headers
         ).json()
 
         add_resp = client.post(
             f"/api/action-groups/{group['action_group_id']}/actions/{action_id}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert add_resp.status_code == 200
@@ -249,7 +266,6 @@ class TestMembership:
 
         remove_resp = client.delete(
             f"/api/action-groups/{group['action_group_id']}/actions/{action_id}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert remove_resp.status_code == 200
@@ -263,17 +279,15 @@ class TestMembership:
         db.close()
 
         group = client.post(
-            "/api/action-groups/", json={"github_user": "testuser", "name": "Deployment"}, headers=headers
+            "/api/action-groups/", json={"name": "Deployment"}, headers=headers
         ).json()
 
         first = client.post(
             f"/api/action-groups/{group['action_group_id']}/actions/{action_id}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         second = client.post(
             f"/api/action-groups/{group['action_group_id']}/actions/{action_id}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert first.status_code == 200
@@ -290,25 +304,23 @@ class TestMembership:
         db.close()
 
         group_a = client.post(
-            "/api/action-groups/", json={"github_user": "testuser", "name": "GroupA"}, headers=headers
+            "/api/action-groups/", json={"name": "GroupA"}, headers=headers
         ).json()
         group_b = client.post(
-            "/api/action-groups/", json={"github_user": "testuser", "name": "GroupB"}, headers=headers
+            "/api/action-groups/", json={"name": "GroupB"}, headers=headers
         ).json()
 
         client.post(
             f"/api/action-groups/{group_a['action_group_id']}/actions/{action_id}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         client.post(
             f"/api/action-groups/{group_b['action_group_id']}/actions/{action_id}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
 
         list_resp = client.get(
-            "/api/action-groups/", params={"github_user": "testuser"}, headers=headers
+            "/api/action-groups/", headers=headers
         ).json()
         by_name = {g["name"]: g["actions_project_ids"] for g in list_resp}
         assert by_name["GroupA"] == [action_id]
@@ -323,7 +335,6 @@ class TestMembership:
 
         resp = client.post(
             f"/api/action-groups/9999/actions/{action_id}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert resp.status_code == 404
@@ -335,12 +346,11 @@ class TestMembership:
         db.close()
 
         group = client.post(
-            "/api/action-groups/", json={"github_user": "testuser", "name": "Deployment"}, headers=headers
+            "/api/action-groups/", json={"name": "Deployment"}, headers=headers
         ).json()
 
         resp = client.post(
             f"/api/action-groups/{group['action_group_id']}/actions/9999",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert resp.status_code == 404
@@ -355,17 +365,15 @@ class TestCascadeDelete:
         db.close()
 
         group = client.post(
-            "/api/action-groups/", json={"github_user": "testuser", "name": "Deployment"}, headers=headers
+            "/api/action-groups/", json={"name": "Deployment"}, headers=headers
         ).json()
         client.post(
             f"/api/action-groups/{group['action_group_id']}/actions/{action_id}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
 
         delete_resp = client.delete(
             f"/api/action-groups/{group['action_group_id']}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert delete_resp.status_code == 204
@@ -373,6 +381,6 @@ class TestCascadeDelete:
         # Recreate a group with the same name; the deleted group's membership
         # row must be gone, not silently resurrected via a stale join.
         new_group = client.post(
-            "/api/action-groups/", json={"github_user": "testuser", "name": "Deployment"}, headers=headers
+            "/api/action-groups/", json={"name": "Deployment"}, headers=headers
         ).json()
         assert new_group["actions_project_ids"] == []

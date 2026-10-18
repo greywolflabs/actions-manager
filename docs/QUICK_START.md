@@ -229,13 +229,10 @@ Once installation completes:
 3. **Choose a template** (or start from scratch)
    - Examples: Node.js CI, Python CI, Docker Build
 4. **Edit the workflow YAML** if needed
-5. **Save and choose delivery method:**
-   - Click **"Commit Locally"** to save the workflow draft in Actions Manager
-   - **Option A - Direct Commit:** Click **"Direct commit"** to push directly to GitHub
-   - **Option B - PR-Based (Recommended):** Click **"Create Pull Requests"** for review workflow
-6. **Workflow draft saved locally!** Use **Direct commit** or **Create Pull Requests** when you're ready to push to GitHub
+5. **Save:** Click **"Commit Locally"** to save the workflow draft in Actions Manager
+6. **Workflow draft saved locally!** Use **Create Pull Requests** when you're ready to push to GitHub
 
-> 💡 **Tip:** For production environments, use **PR-Based delivery** to enable code review. For development, **Direct Commit** is faster. [Learn more about delivery modes →](guides/WORKFLOW_DELIVERY_MODES.md)
+> 💡 **Tip:** ActionsManager delivers workflows through pull requests, so every change is reviewed before it lands. [Learn more about PR campaigns →](https://actionsmanager.io/features/pr-campaigns.html)
 
 🎉 **You're done!** Your first workflow draft is saved locally. When ready, use **Create Pull Requests** to push it to GitHub.
 

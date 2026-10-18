@@ -35,6 +35,27 @@ def _sqlite_enable_foreign_keys(dbapi_connection, connection_record):
     if isinstance(dbapi_connection, sqlite3.Connection):
         dbapi_connection.execute("PRAGMA foreign_keys=ON")
 
+
+def _postgresql_session_in_utc(dbapi_connection, connection_record):
+    """Run a PostgreSQL session in UTC (issue #2350).
+
+    The models' DateTime columns are TIMESTAMP WITHOUT TIME ZONE, and the app writes
+    timezone-aware UTC values and now(). PostgreSQL converts both to the
+    session's TimeZone before storing them, and a session inherits the
+    server's or database's setting. On a server that isn't on UTC, stored
+    times were local wall-clock time, while everything that reads them treats
+    them as UTC. Drift check times, session expiry and rate-limit resets were
+    all off by the server's offset.
+
+    A SET rather than a startup option, because PgBouncer re-applies a
+    session's TimeZone but rejects the options parameter. Committed, so a
+    later rollback cannot undo it.
+    """
+    with dbapi_connection.cursor() as cursor:
+        cursor.execute("SET TIME ZONE 'UTC'")
+    dbapi_connection.commit()
+
+
 # Load PostgreSQL connection details
 POSTGRES_USER = os.getenv("POSTGRES_USER", "").strip()
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "").strip()
@@ -147,6 +168,9 @@ else:
         pool_pre_ping=True,
         echo=False,
     )
+
+if engine.dialect.name == "postgresql":
+    event.listen(engine, "connect", _postgresql_session_in_utc)
 
 # Setup session maker
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)

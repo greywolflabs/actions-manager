@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from models import (
     Base,
     Account,
+    Codeowners,
     Project,
     ProjectMembership,
     ProjectRepo,
@@ -136,18 +137,6 @@ def test_viewer_cannot_delete_the_project(mock_tokens, viewer, seeded):
 
 
 @mock.patch("workflows.user_tokens", new_callable=dict)
-def test_viewer_cannot_toggle_reusable_workflows(mock_tokens, viewer, seeded):
-    mock_tokens[MEMBER] = "fake_token"
-
-    response = viewer.post(
-        f"/api/projects/{PROJECT}/toggle-reusable-workflows",
-        json={"github_user": OWNER, "project_name": PROJECT, "enabled": True},
-    )
-
-    assert response.status_code == 403, response.text
-
-
-@mock.patch("workflows.user_tokens", new_callable=dict)
 def test_viewer_cannot_unlink_a_reusable_workflow(mock_tokens, viewer, seeded):
     mock_tokens[MEMBER] = "fake_token"
 
@@ -157,28 +146,6 @@ def test_viewer_cannot_unlink_a_reusable_workflow(mock_tokens, viewer, seeded):
     )
 
     assert response.status_code == 403, response.text
-
-
-@mock.patch("workflows._update_workflow_to_github")
-@mock.patch("workflows.user_tokens", new_callable=dict)
-def test_viewer_cannot_resolve_drift(mock_tokens, mock_push, viewer, seeded):
-    """use_github writes caller-supplied content straight into workflow_yaml."""
-    mock_tokens[MEMBER] = "fake_token"
-
-    response = viewer.post("/api/resolve-drift", json={
-        "github_user": MEMBER, "project_name": PROJECT, "workflow_name": "ci",
-        "resolution": "use_github", "github_content": "on: pwned",
-    })
-
-    assert response.status_code == 403, response.text
-    mock_push.assert_not_called()
-
-    db = TestingSessionLocal()
-    try:
-        wf = db.query(Workflow).filter(Workflow.workflow_name == "ci").first()
-        assert wf.workflow_yaml == "on: push", "a viewer rewrote the workflow"
-    finally:
-        db.close()
 
 
 @mock.patch("workflows.user_tokens", new_callable=dict)
@@ -193,31 +160,17 @@ def test_viewer_cannot_restore_a_workflow_version(mock_tokens, viewer, seeded):
     assert response.status_code == 403, response.text
 
 
-@mock.patch("codeowners.user_tokens", new_callable=dict)
-def test_viewer_cannot_save_a_codeowners_draft(mock_tokens, viewer, seeded):
-    mock_tokens[MEMBER] = "fake_token"
-
-    response = viewer.post(f"/api/repos/{REPO}/codeowners", json={
-        "github_user": MEMBER, "project_name": PROJECT,
+def test_viewer_cannot_save_the_codeowners_file(viewer, seeded):
+    response = viewer.put(f"/api/projects/{seeded['project_id']}/codeowners", json={
         "content": "* @someone", "file_path": ".github/CODEOWNERS",
     })
 
     assert response.status_code == 403, response.text
-
-
-@mock.patch("codeowners._create_branch")
-@mock.patch("codeowners.user_tokens", new_callable=dict)
-def test_viewer_cannot_deploy_codeowners(mock_tokens, mock_branch, viewer, seeded):
-    """Deploy commits to the project's repositories."""
-    mock_tokens[MEMBER] = "fake_token"
-
-    response = viewer.post(f"/api/repos/{REPO}/codeowners/deploy", json={
-        "github_user": MEMBER, "project_name": PROJECT,
-        "content": "* @someone", "mode": "direct",
-    })
-
-    assert response.status_code == 403, response.text
-    mock_branch.assert_not_called()
+    db = TestingSessionLocal()
+    try:
+        assert db.query(Codeowners).count() == 0, "a viewer saved the project's CODEOWNERS"
+    finally:
+        db.close()
 
 
 @mock.patch("workflows.user_tokens", new_callable=dict)

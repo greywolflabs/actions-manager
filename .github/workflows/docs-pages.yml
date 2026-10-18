@@ -12,6 +12,14 @@ name: Publish Public Documentation Site
 # "Deploy Docs Preview" (docs-preview.yml) publishes a dev preview from the
 # private repository at its github.io address; the names must stay distinct.
 #
+# The deploy job runs in the github-pages environment. GitHub creates it when
+# Pages is set to "GitHub Actions" and lets only the default branch deploy, but
+# the release trigger runs on refs/tags/<version>, so its deploy is rejected:
+# "Tag ... is not allowed to deploy to github-pages due to environment
+# protection rules". In the public repository's Settings > Environments >
+# github-pages, add a Tag rule `*.*.*` next to the main rule, which the push and
+# workflow_dispatch triggers still need.
+#
 # "main" below is the PUBLIC repository's branch, which is what this workflow
 # runs against. .github/scripts/check_no_main_refs.py only scans
 # .github/workflows/*.yml, so this file is correctly outside its glob - do not
@@ -85,21 +93,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The base path is resolved here, at build time, never committed.
-          # configure-pages reports what Pages is actually serving:
-          # "/actions-manager" for a project site, and "" once a custom domain
-          # is set. So moving the docs to a domain needs no change to this
-          # workflow or to docs/astro.config.mjs - only the Pages setting
-          # itself, then a re-run of this workflow: changing the domain does
-          # not rebuild, and the old build's /actions-manager/ paths 404.
+          # The site address is resolved here, at build time, never committed:
+          # configure-pages reports what Pages is actually serving, so a new
+          # domain needs no change to this workflow or docs/astro.config.mjs.
           #
-          # The site origin is overridden as well as the base: canonicals and
-          # the sitemap are absolute URLs, and on a project site the defaults
-          # would advertise https://actionsmanager.io/actions-manager/...,
-          # which resolves nowhere.
-          PAGES_BASE_URL="${PAGES_BASE_URL%/}"
-          export DOCS_SITE="${PAGES_BASE_URL%"$PAGES_BASE_PATH"}"
-          export DOCS_BASE="${PAGES_BASE_PATH:-/}"
+          # Production is a custom domain at the root, so the base path must
+          # be "". A sub-path ("/actions-manager") means Pages was still
+          # serving the github.io project site when this ran - the domain was
+          # just set, or its DNS check or HTTPS was still pending. Every asset
+          # in that build 404s once the domain is live, leaving an unstyled
+          # site, so refuse it rather than replace a working one. Changing the
+          # domain does not rebuild: re-run this once Pages shows it live.
+          if [ -n "$PAGES_BASE_PATH" ]; then
+            echo "::error::GitHub Pages is serving $PAGES_BASE_URL, not a custom domain at the root. Wait until Settings > Pages says the site is live at the custom domain, then re-run this workflow."
+            exit 1
+          fi
+
+          # The site origin is overridden too: canonicals and the sitemap are
+          # absolute URLs.
+          export DOCS_SITE="${PAGES_BASE_URL%/}"
+          export DOCS_BASE=/
           echo "Building with site=$DOCS_SITE base=$DOCS_BASE"
 
           npm run build

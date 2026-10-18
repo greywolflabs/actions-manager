@@ -908,6 +908,46 @@ test.describe("docs screenshots", () => {
     });
   });
 
+  test("drift detection — CODEOWNERS changed on GitHub", async ({ page }) => {
+    const repo = "acme-corp/payments-service";
+    const synced = "* @acme-corp/payments-team\n/infra/ @acme-corp/platform\n";
+    const project = makeProject({
+      ...DOCS_SYNCED_PROJECT,
+      workflows: [
+        makeWorkflow({ name: "build-and-test.yml", lastModifiedBy: DOCS_USER, workflowStatus: "synced_with_github" }),
+      ],
+    });
+    await installApiMocks(page, createMockState({ projects: [project] }));
+    await seedDocsUserProfile(page);
+    await mockDriftResponse(page, { lastChecked: DOCS_LAST_CHECKED, driftedCodeowners: [{ repo }] });
+    await page.route(
+      (url) => /^\/api\/projects\/\d+\/codeowners$/.test(url.pathname),
+      (route) => route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: corsHeaders(route),
+        body: JSON.stringify({
+          codeowners: {
+            id: 1, project_id: 1, content: synced, file_path: ".github/CODEOWNERS",
+            git_hash: "a".repeat(40), status: "synced_with_github", last_modified_by: DOCS_USER,
+            created_at: DOCS_LAST_CHECKED, updated_at: DOCS_LAST_CHECKED,
+          },
+        }),
+      }),
+    );
+
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    const codeownersRow = page.getByRole("button", { name: /^\.github\/CODEOWNERS, Synced, Drift detected/ });
+    await codeownersRow.waitFor({ timeout: 15000 });
+    await codeownersRow.click();
+    await page.getByRole("button", { name: "Load GitHub version" }).waitFor({ timeout: 10000 });
+    await page.waitForTimeout(300);
+
+    await page.screenshot({
+      path: "../docs/src/content/docs/assets/screenshots/drift-detection/codeowners-drift.png",
+    });
+  });
+
   test("projects — one project across several repositories", async ({ page }) => {
     // More than DOCS_REPOS: the point of this image is one project spanning
     // many repositories, with a couple left available so the picker still

@@ -239,7 +239,7 @@ describe('RepoBranchOverridesPanel', () => {
     fireEvent.click(screen.getByTestId('save-btn'));
 
     await waitFor(() => expect(mockUpdate).toHaveBeenCalledTimes(1));
-    expect(mockUpdate).toHaveBeenCalledWith('alice', 42, 1, expect.objectContaining({
+    expect(mockUpdate).toHaveBeenCalledWith(42, 1, expect.objectContaining({
       branch_config_mode: 'override',
       branch_option: 'pattern',
       branch_regex: 'main',
@@ -291,7 +291,7 @@ describe('RepoBranchOverridesPanel', () => {
     fireEvent.click(configureButtons[1]); // Click Configure for repo 2
     fireEvent.click(screen.getByTestId('reset-btn'));
 
-    await waitFor(() => expect(mockReset).toHaveBeenCalledWith('alice', 42, 2));
+    await waitFor(() => expect(mockReset).toHaveBeenCalledWith(42, 2));
   });
 
   test('removing the active repo closes the editor', async () => {

@@ -57,7 +57,7 @@ def _run_owner_scoped_rwx_search(user, db, items):
     with patch('repos.httpx.AsyncClient', return_value=client), \
          patch('repos.github_get', side_effect=[owner_type, membership]), \
          patch('repos.user_tokens', {user: "fake_token"}):
-        return asyncio.run(get_rwx_repos(user, Mock(), db, "my-org"))
+        return asyncio.run(get_rwx_repos(db, Mock(github_user=user), "my-org"))
 
 
 _OWNER_SCOPED_RWX_ITEMS = [
@@ -95,13 +95,10 @@ class TestGetReposFiltering:
     def setup_method(self):
         setup_test_db()
         self.db = next(get_test_db())
-        self._auth_patch = patch('repos._assert_session_owns_user')
-        self._auth_patch.start()
         import license
         license.reset_cache()
 
     def teardown_method(self):
-        self._auth_patch.stop()
         self.db.close()
         teardown_test_db()
 
@@ -143,7 +140,7 @@ class TestGetReposFiltering:
         self.db.add(account)
         self.db.commit()
 
-        result = get_repos("paginated_user", Mock(), self.db)
+        result = get_repos(self.db, Mock(github_user="paginated_user"))
 
         assert len(result) == 201
         # Ensure github_get was called 3 times (one per page)
@@ -159,7 +156,6 @@ class TestSelfHostedPrivateRepos:
         setup_test_db()
         self.db = next(get_test_db())
         self._patches = [
-            patch('repos._assert_session_owns_user'),
             patch.dict('os.environ', {'LICENSE_KEY': ''}),
         ]
         for p in self._patches:
@@ -197,7 +193,7 @@ class TestSelfHostedPrivateRepos:
         ]
         mock_github_get.return_value = mock_response
 
-        result = get_repos("sh_user", Mock(), self.db)
+        result = get_repos(self.db, Mock(github_user="sh_user"))
 
         assert [r["name"] for r in result] == ["public-repo", "private-repo"]
 
@@ -216,7 +212,7 @@ class TestSelfHostedPrivateRepos:
         ]
         mock_github_get.return_value = mock_response
 
-        result = asyncio.run(get_rwx_repos("sh_user", Mock(), self.db, None))
+        result = asyncio.run(get_rwx_repos(self.db, Mock(github_user="sh_user"), None))
 
         assert [r["full_name"] for r in result] == ["sh_user/shared-workflows"]
 

@@ -133,17 +133,14 @@ const GUIWorkflowEditor: React.FC<GUIWorkflowEditorProps> = ({
       {/* Workflow Name */}
       <div className="form-section">
         <label className="form-label">
-          {isReusable ? 'Reusable Workflow Name *' : 'Workflow Name *'}
-          {getFieldError('name') && (
-            <span className="field-error">{getFieldError('name')!.message}</span>
-          )}
+          {isReusable ? 'Reusable Workflow Name (optional)' : 'Workflow Name (optional)'}
         </label>
         <input
           type="text"
           value={workflow.name}
           onChange={handleNameChange}
           placeholder={isReusable ? 'Enter reusable workflow name...' : 'Enter workflow name...'}
-          className={`form-input ${getFieldError('name') ? 'error' : ''}`}
+          className="form-input"
         />
       </div>
 

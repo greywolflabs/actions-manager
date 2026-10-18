@@ -128,6 +128,25 @@ describe("handleSaveProject", () => {
     );
   });
 
+  it("reports the server's reason when the save is refused", async () => {
+    const detail = "You already have a project named 'My Project'. Choose another name.";
+    mockedSaveProject.mockRejectedValueOnce(
+      Object.assign(new Error("Request failed with status code 409"), { response: { status: 409, data: { detail } } })
+    );
+
+    const result = await callWith();
+
+    expect(result).toEqual({ success: false, error: detail });
+  });
+
+  it("falls back to the error's own message when the server gives no reason", async () => {
+    mockedSaveProject.mockRejectedValueOnce(new Error("Network Error"));
+
+    const result = await callWith();
+
+    expect(result).toEqual({ success: false, error: "Network Error" });
+  });
+
   it("filters out workflows when selectedItems.workflows is false", async () => {
     mockedSaveProject.mockResolvedValueOnce({ project_code: "PRJ1", project_id: "1" });
 
@@ -183,13 +202,9 @@ describe("handleUpdateGitHub", () => {
     });
 
     expect(mockedUpdateWorkflows).toHaveBeenCalledWith(
-      "testuser",
+      "My Project",
       ["org/repo1"],
-      [expect.objectContaining({ name: "ci.yml" })],
-      [],
-      "",
-      "default",
-      "My Project"
+      { workflows: [expect.objectContaining({ name: "ci.yml" })], rxworkflows: [] }
     );
     expect(result.success).toBe(true);
   });
@@ -300,6 +315,32 @@ describe("handleSaveProjectWithModal", () => {
 
     expect(mockedUpdateWorkflows).toHaveBeenCalled();
     expect(result.success).toBe(true);
+  });
+
+  it("pushes a workflow the save re-kinded as its new kind, still modified (#2318)", async () => {
+    mockedSaveProject.mockResolvedValueOnce({
+      project_code: "PRJ1", project_id: "42",
+      kind_changes: [{ name: "deploy", is_reusable: true, workflow_status: "committed_locally" }],
+    });
+    mockedUpdateWorkflows.mockResolvedValueOnce({ results: { "org/repo1": 200 } });
+
+    const result = await handleSaveProjectWithModal({
+      ...base,
+      updateGitHub: true,
+      workflows: [
+        { name: "build", content: "on: push", isModified: true },
+        { name: "deploy", content: "on: workflow_call", isModified: true },
+      ],
+    });
+
+    const [, , { workflows: pushedRegular, rxworkflows: pushedReusable }] = mockedUpdateWorkflows.mock.calls[0];
+    expect(pushedRegular?.map((w: { name: string }) => w.name)).toEqual(["build"]);
+    expect(pushedReusable).toEqual([
+      expect.objectContaining({ name: "deploy", isReusable: true, isModified: true }),
+    ]);
+    expect(result.kindChanges).toEqual([
+      { name: "deploy", is_reusable: true, workflow_status: "committed_locally" },
+    ]);
   });
 
   it("calls onProgress callback at key stages", async () => {

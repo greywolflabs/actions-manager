@@ -28,7 +28,7 @@ from typing import Annotated, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -47,6 +47,7 @@ from workflows import (
     X_API_VERSION,
     format_workflow_name,
 )
+from error_detail import failure_kind
 
 router = APIRouter()
 
@@ -385,7 +386,8 @@ def _sync_project_runs(db: Session, github_user: str, project: Project,
         db.rollback()
         # The cursor is deliberately not advanced: claiming a sync happened when
         # it failed would hide stale data behind a fresh-looking timestamp.
-        return f"Could not refresh runs from GitHub: {exc}"
+        print(f"❌ Could not refresh runs for project {project.project_id}: {exc}")
+        return f"Could not refresh runs from GitHub: {failure_kind(exc, (RuntimeError,))}"
 
     project.last_run_sync_at = datetime.now(timezone.utc).replace(tzinfo=None)
     db.commit()
@@ -580,8 +582,7 @@ def _window_days(retention_days: Optional[int], requested: Optional[int]) -> int
 )
 def get_project_build_metrics(
     project_id: int,
-    github_user: str,
-    request: Request,
+    caller: auth_module.CurrentAccount,
     db: Annotated[Session, Depends(get_db)],
     days: Optional[int] = None,
     refresh: bool = False,
@@ -605,14 +606,14 @@ def get_project_build_metrics(
     the UI switches with, and scoping it would strand the user on whichever
     workflow they picked.
     """
-    auth_module.assert_session_owns_user(github_user, request, db)
+    github_user = caller.github_user
     if github_user not in user_tokens:
         raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
 
     # Resolved by id, not by name: project names are not unique, and the
     # name-based lookup resolves a caller's own project first, so a member of
     # someone else's same-named project would be refused access they have.
-    project = _require_project_access(db, project_id, github_user, None)
+    project = _require_project_access(db, project_id, caller)
 
     account = db.query(Account).filter_by(user_id=project.user_id).first()
     retention_days = _retention_days(account)

@@ -30,12 +30,12 @@ from sqlalchemy.pool import StaticPool
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from main import app  # noqa: E402
-from workflows import get_db as real_get_db  # noqa: E402
+from workflows import DriftCheckUnavailable, get_db as real_get_db  # noqa: E402
 from projects import get_db as projects_get_db  # noqa: E402
 from models import (  # noqa: E402
     Base, Account, Project, Repo, ProjectRepo, Workflow, ProjectWorkflow,
 )
-from auth import user_tokens  # noqa: E402
+from auth import create_auth_session, user_tokens  # noqa: E402
 
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -153,10 +153,19 @@ def db_state():
 
 
 def _bulk_resolve(project_id, items, resolution, delivery_mode=None, github_user="alice"):
-    body = {"github_user": github_user, "items": items, "resolution": resolution}
+    """POST as *github_user*, signed in with a real session (#2241)."""
+    body = {"items": items, "resolution": resolution}
     if delivery_mode is not None:
         body["delivery_mode"] = delivery_mode
-    return client.post(f"/api/projects/{project_id}/drift/bulk-resolve", json=body)
+    db = TestingSessionLocal()
+    try:
+        token = create_auth_session(github_user, db)
+    finally:
+        db.close()
+    return client.post(
+        f"/api/projects/{project_id}/drift/bulk-resolve", json=body,
+        headers={"Authorization": f"Bearer {token}"},
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -237,15 +246,25 @@ def test_bulk_use_github_partial_failure_reports_per_item(db_state):
         db.close()
 
 
-def test_bulk_use_github_one_item_exception_does_not_abort_the_batch(db_state):
-    """Regression: an unexpected exception fetching one item (e.g. a GitHub
-    API error) must be isolated to that item's result, not propagate out and
-    500 the whole request - discarding results already collected for other
-    items would contradict the endpoint's own partial-failure guarantee."""
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        # What get_workflow_from_github raises for a non-404 error, e.g. rate-limited.
+        (DriftCheckUnavailable("GitHub API error: 403", status_code=403),
+         "Failed to adopt GitHub version: GitHub API error: 403"),
+        (RuntimeError("secret-marker-2297"), "Failed to adopt GitHub version: unexpected error"),
+    ],
+    ids=["github-answer", "unexpected"],
+)
+def test_bulk_use_github_one_item_exception_does_not_abort_the_batch(db_state, error, expected):
+    """Regression: an exception fetching one item (a GitHub API error, or
+    anything unexpected) must be isolated to that item's result, not propagate
+    out and 500 the whole request - discarding results already collected for
+    other items would contradict the endpoint's own partial-failure guarantee."""
     def fake_github_fetch(owner, repo, filename, token, default_branch=None):
         if "ci" in filename:
             return {"content": "name: AM_P001_ci\non: pull_request", "sha": "new-sha-ci"}
-        raise Exception("GitHub API error: 403")  # e.g. rate-limited
+        raise error
 
     with patch("workflows.get_workflow_from_github", side_effect=fake_github_fetch), \
          patch("workflows.get_default_branch", return_value="main"):
@@ -264,7 +283,7 @@ def test_bulk_use_github_one_item_exception_does_not_abort_the_batch(db_state):
     results_by_id = {r["workflow_id"]: r for r in body["results"]}
     assert results_by_id[db_state["ci_id"]]["success"] is True
     assert results_by_id[db_state["deploy_id"]]["success"] is False
-    assert "403" in results_by_id[db_state["deploy_id"]]["message"]
+    assert results_by_id[db_state["deploy_id"]]["message"] == expected
 
 
 def test_bulk_use_github_adopts_from_the_branch_the_item_names(db_state):
@@ -297,27 +316,30 @@ def test_bulk_use_github_adopts_from_the_branch_the_item_names(db_state):
     assert mock_default_branch.call_count == 0
 
 
-def test_bulk_use_github_caches_default_branch_per_repo(db_state):
-    """Regression: items arriving without a branch fall back to the repo's
-    default, resolved once for the repo rather than once per item."""
+def test_bulk_use_github_fails_an_item_without_a_branch(db_state):
+    """An item without a branch fails rather than adopting the repo default,
+    which would import a different file than the one the user was shown."""
     def fake_github_fetch(owner, repo, filename, token, default_branch=None):
-        assert default_branch == "main"  # the cached value was actually forwarded
         return {"content": f"name: {filename}\non: pull_request", "sha": f"sha-{filename}"}
 
-    with patch("workflows.get_workflow_from_github", side_effect=fake_github_fetch), \
-         patch("workflows.get_default_branch", return_value="main") as mock_default_branch:
+    with patch("workflows.get_workflow_from_github", side_effect=fake_github_fetch) as fetch, \
+         patch("workflows.get_default_branch") as mock_default_branch:
         resp = _bulk_resolve(
             db_state["project_id"],
             [
-                {"workflow_id": db_state["ci_id"], "repo": "alice/repo1", "branch": ""},
-                {"workflow_id": db_state["deploy_id"], "repo": "alice/repo1", "branch": ""},
+                {"workflow_id": db_state["ci_id"], "repo": "alice/repo1", "branch": "main"},
+                {"workflow_id": db_state["deploy_id"], "repo": "alice/repo1", "branch": " "},
             ],
             resolution="use_github",
         )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["success"] is True
-    assert mock_default_branch.call_count == 1
+    results = {r["workflow_id"]: r for r in resp.json()["results"]}
+    assert results[db_state["ci_id"]]["success"] is True
+    assert results[db_state["deploy_id"]]["success"] is False
+    assert results[db_state["deploy_id"]]["message"] == "branch is required to adopt the GitHub version"
+    assert fetch.call_count == 1
+    assert mock_default_branch.call_count == 0
 
 
 # ----------------------------------------------------------------------------
@@ -449,6 +471,49 @@ def test_bulk_restore_pr_same_repo_creates_single_pr(mock_regular, _mock_reusabl
     assert mock_regular.call_args.kwargs["repo_names"] == ["alice/repo1"]
     workflow_names = {w["name"] for w in mock_regular.call_args.kwargs["workflows"]}
     assert workflow_names == {"ci", "deploy"}
+
+
+@patch('workflows._process_reusable_workflows_update', return_value={})
+@patch('workflows._process_regular_workflows_update')
+def test_bulk_restore_pr_includes_an_owned_reusable_workflow(mock_regular, mock_reusable, db_state):
+    """#2085: a standard project's own reusable workflow is restored in the same
+    PR as the regular ones, not silently dropped while reported as success."""
+    db = TestingSessionLocal()
+    try:
+        shared = Workflow(
+            workflow_name="shared", workflow_yaml="on:\n  workflow_call:\n",
+            workflow_git_hash="sha-old-shared", reusable_workflow=True,
+            workflow_status="synced_with_github",
+        )
+        db.add(shared); db.commit(); db.refresh(shared)
+        db.add(ProjectWorkflow(project_id=db_state["project_id"], workflow_id=shared.workflow_id))
+        db.commit()
+        shared_id = shared.workflow_id
+    finally:
+        db.close()
+    mock_regular.return_value = {"alice/repo1 on main": {
+        "status": "pr_created", "pr_number": 44,
+        "pr_url": "https://github.com/alice/repo1/pull/44",
+        "branch_name": "actions-manager/p001/alice-repo1/ghi-main",
+        "workflows_committed": ["AM_P001_ci.yml", "AM_P001_shared.yml"],
+    }}
+
+    resp = _bulk_resolve(
+        db_state["project_id"],
+        [
+            {"workflow_id": db_state["ci_id"], "repo": "alice/repo1", "branch": "main"},
+            {"workflow_id": shared_id, "repo": "alice/repo1", "branch": "main"},
+        ],
+        resolution="restore_actionsmanager",
+        delivery_mode="pr",
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert all(r["success"] for r in resp.json()["results"])
+    assert mock_regular.call_count == 1
+    delivered = {w["name"]: w["is_reusable"] for w in mock_regular.call_args.kwargs["workflows"]}
+    assert delivered == {"ci": False, "shared": True}
+    assert not mock_reusable.called
 
 
 @patch('workflows._process_reusable_workflows_update', return_value={})
@@ -608,6 +673,10 @@ def test_bulk_resolve_item_from_other_project_returns_403(db_state):
 
 
 def test_bulk_resolve_wrong_user_returns_403(db_state):
+    db = TestingSessionLocal()
+    db.add(Account(github_user="mallory", github_email="m@example.com", account_type="free"))
+    db.commit()
+    db.close()
     user_tokens["mallory"] = "mallory-token"
     try:
         resp = _bulk_resolve(

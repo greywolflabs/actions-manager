@@ -2,6 +2,8 @@ import {
   yamlToGui,
   yamlToGuiResult,
   guiToYaml,
+  findGuiRoundTripLosses,
+  validateWorkflow,
   WorkflowGUI,
   DEFAULT_WORKFLOW_GUI,
   DEFAULT_REUSABLE_WORKFLOW_GUI
@@ -138,9 +140,7 @@ jobs:
 
       expect(result.events).toHaveLength(1);
       expect(result.events[0].type).toBe('schedule');
-      // Note: The current parser doesn't extract cron from schedule events
-      // as the logic checks for eventConfig.schedule when eventType is 'schedule'
-      // This is a limitation of the current implementation
+      expect(result.events[0].cron).toBe('0 0 * * *');
     });
 
     test('should handle jobs with environment variables', () => {
@@ -799,6 +799,137 @@ jobs:
     });
   });
 
+  describe('on.schedule (#2017)', () => {
+    const BUILD = 'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm ci\n';
+    const NIGHTLY = `name: Nightly\non:\n  schedule:\n    - cron: 0 0 * * *\n${BUILD}`;
+    const TWO_SCHEDULES =
+      'name: Twice\non:\n  schedule:\n' +
+      '    - cron: 0 9 * * 1-5\n      timezone: America/New_York\n' +
+      `    - cron: 0 0 * * 0\n${BUILD}`;
+
+    test('round-trips a single cron byte-identically', () => {
+      expect(guiToYaml(yamlToGui(NIGHTLY))).toBe(NIGHTLY);
+    });
+
+    test('keeps every entry and its timezone byte-identically', () => {
+      expect(guiToYaml(yamlToGui(TWO_SCHEDULES))).toBe(TWO_SCHEDULES);
+    });
+
+    test('a GUI cron edit changes only the first entry', () => {
+      const gui = yamlToGui(TWO_SCHEDULES);
+      gui.events[0].cron = '30 6 * * 1-5';
+
+      expect(guiToYaml(gui)).toBe(TWO_SCHEDULES.replace('0 9 * * 1-5', '30 6 * * 1-5'));
+    });
+
+    // The old GUI's nested form is invalid on GitHub; GUI mode would rewrite it.
+    test('reads the old nested schedule form and refuses to rewrite it', () => {
+      const nested = `name: Nightly\non:\n  schedule:\n    schedule:\n      - cron: 0 0 * * *\n${BUILD}`;
+      const gui = yamlToGui(nested);
+
+      expect(gui.events[0].cron).toBe('0 0 * * *');
+      expect(findGuiRoundTripLosses(nested, gui)).toEqual(['on.schedule']);
+    });
+
+    test('writes a schedule added in the GUI as an on.schedule list', () => {
+      const gui = yamlToGui(`name: CI\non: push\n${BUILD}`);
+      gui.events = [...gui.events, { type: 'schedule', cron: '0 0 * * *' }];
+
+      expect(guiToYaml(gui)).toBe(`name: CI\non:\n  push: null\n  schedule:\n    - cron: 0 0 * * *\n${BUILD}`);
+    });
+
+    test('writes a schedule that is the only trigger as an on.schedule list', () => {
+      const gui = yamlToGui(`name: CI\non: push\n${BUILD}`);
+      gui.events = [{ type: 'schedule', cron: '0 0 * * *' }];
+
+      expect(guiToYaml(gui)).toBe(`name: CI\non:\n  schedule:\n    - cron: 0 0 * * *\n${BUILD}`);
+    });
+
+    test('writes what the cron box holds, even once it is cleared', () => {
+      const gui = yamlToGui(NIGHTLY);
+      gui.events[0].cron = '';
+
+      expect(guiToYaml(gui)).toBe(NIGHTLY.replace('- cron: 0 0 * * *', "- cron: ''"));
+    });
+  });
+
+  describe('step ids', () => {
+    const STEP_IDS =
+      'name: Ids\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n' +
+      '      - name: Read version\n        id: meta\n        run: echo "version=1" >> "$GITHUB_OUTPUT"\n' +
+      '      - run: echo ${{ steps.meta.outputs.version }}\n';
+
+    test('round-trips a step id and the reference to it byte-identically', () => {
+      expect(guiToYaml(yamlToGui(STEP_IDS))).toBe(STEP_IDS);
+    });
+
+    test('writes no id for a step that had none', () => {
+      const gui = yamlToGui(STEP_IDS);
+
+      expect(gui.jobs[0].steps[1].id).toBe('step-2');
+      expect(gui.jobs[0].steps[1].yamlId).toBeUndefined();
+    });
+
+    test('writes no id for a step added in the GUI', () => {
+      const gui = yamlToGui(STEP_IDS);
+      gui.jobs[0].steps.push({ id: 'step-3', name: 'Step 3', run: 'make' });
+
+      expect(guiToYaml(gui)).toBe(`${STEP_IDS}      - name: Step 3\n        run: make\n`);
+    });
+  });
+
+  describe('jobs that call a reusable workflow', () => {
+    const CALLER =
+      'name: Deploy\non: push\njobs:\n' +
+      '  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n' +
+      '  deploy:\n    name: Deploy to staging\n    needs:\n      - build\n' +
+      '    uses: org/repo/.github/workflows/deploy.yml@main\n' +
+      '    with:\n      environment: staging\n    secrets: inherit\n';
+
+    test('round-trips a caller job byte-identically', () => {
+      expect(guiToYaml(yamlToGui(CALLER))).toBe(CALLER);
+    });
+
+    test('models uses and keeps with and secrets as written', () => {
+      const deploy = yamlToGui(CALLER).jobs[1];
+
+      expect(deploy.uses).toBe('org/repo/.github/workflows/deploy.yml@main');
+      expect(deploy.unsupportedFields).toEqual({ with: { environment: 'staging' }, secrets: 'inherit' });
+    });
+
+    test('writes no runs-on or steps for a caller job after a GUI edit', () => {
+      const gui = yamlToGui(CALLER);
+      gui.jobs[1].name = 'Deploy to production';
+
+      expect(guiToYaml(gui)).toBe(CALLER.replace('Deploy to staging', 'Deploy to production'));
+    });
+
+    test('does not warn that a caller job has no steps', () => {
+      const errors = validateWorkflow(yamlToGui(CALLER));
+
+      expect(errors.filter(error => error.field.startsWith('jobs[1]'))).toEqual([]);
+    });
+  });
+
+  // Kept as read, so GUI mode must cope with the other shapes GitHub allows.
+  describe('job fields kept as written', () => {
+    test('round-trips a single needs: string', () => {
+      const content = `name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n  test:\n    runs-on: ubuntu-latest\n    needs: build\n    steps:\n      - run: make test\n`;
+      const gui = yamlToGui(content);
+
+      expect(gui.jobs[1].needs).toBe('build');
+      expect(findGuiRoundTripLosses(content, gui)).toEqual([]);
+    });
+
+    test('validates a runs-on label list without throwing', () => {
+      const content = `name: CI\non: push\njobs:\n  build:\n    runs-on:\n      - self-hosted\n      - linux\n    steps:\n      - run: make\n`;
+      const gui = yamlToGui(content);
+
+      expect(findGuiRoundTripLosses(content, gui)).toEqual([]);
+      expect(validateWorkflow(gui).filter(error => error.field === 'jobs[0].runsOn')).toEqual([]);
+    });
+  });
+
   describe('yamlToGuiResult', () => {
     test('reports no error and a populated model for valid YAML', () => {
       const { gui, error } = yamlToGuiResult('name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm ci\n');
@@ -839,6 +970,184 @@ jobs:
       const content = 'name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm ci\n';
       expect(yamlToGui(content)).toEqual(yamlToGuiResult(content).gui);
     });
+  });
+
+  describe('findGuiRoundTripLosses', () => {
+    const doc = (...lines: string[]) => `${lines.join('\n')}\n`;
+    const losses = (content: string) => findGuiRoundTripLosses(content, yamlToGuiResult(content).gui);
+
+    const BUILD_JOB = ['jobs:', '  build:', '    runs-on: ubuntu-latest', '    steps:', '      - run: make'];
+
+    test.each([
+      ['push/pull_request with branch, path and tag filters and types', doc(
+        'name: CI',
+        'on:',
+        '  push:',
+        "    branches: [main, 'release/**']",
+        "    paths: ['src/**']",
+        "    tags: ['v*']",
+        '  pull_request:',
+        '    types: [opened, synchronize]',
+        '    branches: [main]',
+        "    paths-ignore: ['docs/**']",
+        ...BUILD_JOB
+      )],
+      ['a job with matrix, needs, if, services, container, environment and outputs', doc(
+        'name: Matrix',
+        'on: push',
+        'jobs:',
+        '  setup:',
+        '    runs-on: ubuntu-latest',
+        '    outputs:',
+        '      sha: ${{ github.sha }}',
+        '    steps:',
+        '      - run: echo setup',
+        '  test:',
+        '    needs: [setup]',
+        "    if: github.event_name == 'push'",
+        '    runs-on: ${{ matrix.os }}',
+        '    environment: staging',
+        '    container: node:20',
+        '    services:',
+        '      redis:',
+        '        image: redis',
+        "        ports: ['6379:6379']",
+        '    strategy:',
+        '      fail-fast: false',
+        '      matrix:',
+        '        os: [ubuntu-latest, windows-latest]',
+        '        node: [18, 20]',
+        '    timeout-minutes: 30',
+        '    env:',
+        '      CI: true',
+        '    steps:',
+        '      - uses: actions/setup-node@v4',
+        '        with:',
+        '          node-version: ${{ matrix.node }}',
+        '      - name: Test',
+        '        run: npm test',
+        '        shell: bash',
+        '        working-directory: app',
+        '        continue-on-error: false',
+        '        timeout-minutes: 10',
+        '        if: always()',
+        '        env:',
+        '          NODE: ${{ matrix.node }}'
+      )],
+      ['top-level permissions, concurrency, defaults and env', doc(
+        'name: Release',
+        'on: workflow_dispatch',
+        'permissions:',
+        '  contents: read',
+        '  id-token: write',
+        'concurrency:',
+        '  group: release-${{ github.ref }}',
+        '  cancel-in-progress: true',
+        'defaults:',
+        '  run:',
+        '    shell: bash',
+        'env:',
+        '  NODE_ENV: production',
+        ...BUILD_JOB
+      )],
+      ['workflow_call with inputs, secrets and outputs', doc(
+        'name: Reusable build',
+        'on:',
+        '  workflow_call:',
+        '    inputs:',
+        '      environment:',
+        '        description: Target environment',
+        '        required: true',
+        '        type: string',
+        '      debug:',
+        '        type: boolean',
+        '        default: false',
+        '    secrets:',
+        '      token:',
+        '        required: true',
+        '    outputs:',
+        '      artifact:',
+        '        value: ${{ jobs.build.outputs.artifact }}',
+        'jobs:',
+        '  build:',
+        '    runs-on: ubuntu-latest',
+        '    outputs:',
+        '      artifact: dist.zip',
+        '    steps:',
+        '      - run: make'
+      )],
+      ['workflow_dispatch inputs that omit required and type', doc(
+        'name: Manual',
+        'on:',
+        '  workflow_dispatch:',
+        '    inputs:',
+        '      level:',
+        '        type: choice',
+        '        options: [info, debug]',
+        '        default: info',
+        '      note:',
+        '        description: Free text',
+        ...BUILD_JOB
+      )],
+      ['`on` as a string', doc('name: CI', 'on: push', ...BUILD_JOB)],
+      ['`on` as a list', doc('name: CI', 'on: [push, pull_request]', ...BUILD_JOB)],
+      ['`on` as a map with empty events', doc('name: CI', 'on:', '  push:', '  workflow_dispatch:', ...BUILD_JOB)],
+      ['no name: label', doc('on: push', ...BUILD_JOB)],
+      ['step ids and references to them', doc(
+        'name: Ids',
+        'on: push',
+        'jobs:',
+        '  build:',
+        '    runs-on: ubuntu-latest',
+        '    steps:',
+        '      - id: meta',
+        '        run: echo "x=1" >> "$GITHUB_OUTPUT"',
+        '      - run: echo ${{ steps.meta.outputs.x }}'
+      )],
+      ['a job that calls a reusable workflow', doc(
+        'name: Caller',
+        'on: push',
+        'jobs:',
+        '  call:',
+        '    uses: org/repo/.github/workflows/ci.yml@main',
+        '    secrets: inherit'
+      )],
+      ['schedule entries with a timezone (#2017)', doc(
+        'name: Nightly',
+        'on:',
+        '  schedule:',
+        "    - cron: '0 3 * * *'",
+        '      timezone: Europe/London',
+        "    - cron: '0 4 * * 0'",
+        ...BUILD_JOB
+      )],
+    ])('finds no losses for %s', (_label, content) => {
+      expect(losses(content)).toEqual([]);
+    });
+
+    test('still reports a change the normalisation does not cover', () => {
+      const content = doc(
+        'name: Manual',
+        'on:',
+        '  workflow_dispatch:',
+        '    inputs:',
+        '      note:',
+        '        required: true',
+        ...BUILD_JOB
+      );
+      const gui = yamlToGuiResult(content).gui;
+      gui.events[0].inputs!.note.required = false;
+
+      expect(findGuiRoundTripLosses(content, gui)).toEqual(['on.workflow_dispatch.inputs.note.required']);
+    });
+
+    test('fails closed when the check itself throws', () => {
+      const content = doc('name: CI', 'on: push', ...BUILD_JOB);
+      const broken = { ...yamlToGuiResult(content).gui, jobs: null } as unknown as WorkflowGUI;
+
+      expect(findGuiRoundTripLosses(content, broken)).toEqual(['entire workflow']);
+    });
+
   });
 
   describe('default templates', () => {

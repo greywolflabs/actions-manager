@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from models import Base, Account, Project, Workflow, ProjectWorkflow, LinkedReusableWorkflow
 from main import app
 from workflows import get_db
-from auth import user_tokens
+from auth import create_auth_session, user_tokens
 
 # Create in-memory SQLite database for testing
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test_workflows_api.db"
@@ -87,9 +87,20 @@ class TestWorkflowAPIEndpoints:
         if "testuser" in user_tokens:
             del user_tokens["testuser"]
 
+    def _signed_in_client(self, user="testuser"):
+        """A client with a real session for *user*; the drift routes take the caller from it (#2241)."""
+        db = TestingSessionLocal()
+        try:
+            token = create_auth_session(user, db)
+        finally:
+            db.close()
+        client = TestClient(app)
+        client.headers["Authorization"] = f"Bearer {token}"
+        return client
+
     def test_save_workflows_success(self):
         """Test successful workflow save with regular workflows."""
-        client = TestClient(app)
+        client = self._signed_in_client()
         
         payload = {
             "github_user": "testuser",
@@ -115,7 +126,7 @@ class TestWorkflowAPIEndpoints:
 
     def test_save_workflows_with_reusable(self):
         """Test successful workflow save with reusable workflows."""
-        client = TestClient(app)
+        client = self._signed_in_client()
         
         payload = {
             "github_user": "testuser",
@@ -145,8 +156,8 @@ class TestWorkflowAPIEndpoints:
             db.close()
 
     def test_save_workflows_account_not_found(self):
-        """Test workflow save with non-existent account."""
-        client = TestClient(app)
+        """A session whose user has no account is refused before any save (#2241)."""
+        client = self._signed_in_client("nonexistent")
         
         payload = {
             "github_user": "nonexistent",
@@ -158,12 +169,11 @@ class TestWorkflowAPIEndpoints:
         }
         
         response = client.post("/api/save-workflows", json=payload)
-        assert response.status_code == 404
-        assert "not found" in response.json()["detail"].lower()
+        assert response.status_code == 401
 
     def test_save_workflows_project_not_found(self):
         """Test workflow save with non-existent project."""
-        client = TestClient(app)
+        client = self._signed_in_client()
         
         payload = {
             "github_user": "testuser",
@@ -180,7 +190,7 @@ class TestWorkflowAPIEndpoints:
 
     def test_save_workflows_update_existing(self):
         """Test updating an existing workflow."""
-        client = TestClient(app)
+        client = self._signed_in_client()
         
         # First save
         payload = {
@@ -211,7 +221,7 @@ class TestWorkflowAPIEndpoints:
 
     def test_save_workflows_trims_workflow_name(self):
         """Workflow names are trimmed before storage."""
-        client = TestClient(app)
+        client = self._signed_in_client()
 
         payload = {
             "github_user": "testuser",
@@ -234,7 +244,7 @@ class TestWorkflowAPIEndpoints:
 
     def test_save_workflows_rejects_unsafe_workflow_name(self):
         """Unsafe workflow path names are rejected server-side."""
-        client = TestClient(app)
+        client = self._signed_in_client()
 
         payload = {
             "github_user": "testuser",
@@ -251,7 +261,7 @@ class TestWorkflowAPIEndpoints:
 
     def test_save_workflows_rename_replaces_old(self):
         """Renaming a workflow must update the existing record and not leave the old one behind."""
-        client = TestClient(app)
+        client = self._signed_in_client()
 
         # Create original workflow
         payload = {
@@ -296,7 +306,7 @@ class TestWorkflowAPIEndpoints:
 
     def test_save_reusable_workflows_rename_replaces_old(self):
         """Renaming a reusable workflow must update the existing record and not create a duplicate."""
-        client = TestClient(app)
+        client = self._signed_in_client()
 
         payload = {
             "github_user": "testuser",
@@ -346,7 +356,7 @@ class TestWorkflowAPIEndpoints:
         user's and is not recoverable. The rename is refused instead, so the
         user resolves the collision deliberately.
         """
-        client = TestClient(app)
+        client = self._signed_in_client()
 
         # Simulate the broken state: both old and new names exist
         db = TestingSessionLocal()
@@ -457,7 +467,7 @@ class TestWorkflowAPIEndpoints:
             ],
             "rxworkflows": [],
         }
-        response = TestClient(app).post("/api/save-workflows", json=rename_payload)
+        response = self._signed_in_client().post("/api/save-workflows", json=rename_payload)
         assert response.status_code == 409, response.text
 
         db = TestingSessionLocal()
@@ -548,7 +558,7 @@ class TestWorkflowAPIEndpoints:
                 }
             ],
         }
-        response = TestClient(app).post("/api/save-workflows", json=rename_payload)
+        response = self._signed_in_client().post("/api/save-workflows", json=rename_payload)
         assert response.status_code == 409, response.text
 
         db = TestingSessionLocal()
@@ -579,7 +589,7 @@ class TestWorkflowAPIEndpoints:
     @patch('workflows.user_tokens', {'testuser': 'test_token'})
     def test_detect_drift_endpoint_success(self):
         """Test drift detection endpoint."""
-        client = TestClient(app)
+        client = self._signed_in_client()
         
         # Create a workflow first
         db = TestingSessionLocal()
@@ -607,7 +617,6 @@ class TestWorkflowAPIEndpoints:
             mock_get.return_value = None  # No drift - workflow not in GitHub
             
             payload = {
-                "github_user": "testuser",
                 "project_name": "test_project",
                 "repo_names": ["owner/repo"],
                 "check_deployment_vars": False
@@ -618,11 +627,10 @@ class TestWorkflowAPIEndpoints:
             assert "drift_results" in response.json()
 
     def test_detect_drift_endpoint_unauthenticated(self):
-        """Test drift detection with unauthenticated user."""
-        client = TestClient(app)
+        """Test drift detection for a signed-in caller with no GitHub token stored."""
+        client = self._signed_in_client()
         
         payload = {
-            "github_user": "unauthenticated",
             "project_name": "test_project",
             "repo_names": ["owner/repo"],
             "check_deployment_vars": False
@@ -631,140 +639,6 @@ class TestWorkflowAPIEndpoints:
         response = client.post("/api/detect-drift", json=payload)
         assert response.status_code == 401
         assert "User not authenticated" in response.json()["detail"]
-
-    @patch('workflows.user_tokens', {'testuser': 'test_token'})
-    def test_resolve_drift_use_github(self):
-        """Test resolving drift by using GitHub version."""
-        client = TestClient(app)
-
-        # Create a workflow and associate it with the test project
-        db = TestingSessionLocal()
-        try:
-            workflow = Workflow(
-                workflow_name="test.yml",
-                workflow_yaml="name: Test Local\non: push",
-                reusable_workflow=False
-            )
-            db.add(workflow)
-            db.commit()
-            db.refresh(workflow)
-            db.add(ProjectWorkflow(project_id=self.project_id, workflow_id=workflow.workflow_id))
-            db.commit()
-        finally:
-            db.close()
-        
-        payload = {
-            "github_user": "testuser",
-            "project_name": "test_project",
-            "workflow_name": "test.yml",
-            "resolution": "use_github",
-            "github_content": "name: Test GitHub\non: pull_request",
-            "github_sha": "abc123"
-        }
-        
-        response = client.post("/api/resolve-drift", json=payload)
-        assert response.status_code == 200
-        assert "database_updated" in response.json()["action"]
-        
-        # Verify workflow was updated
-        db = TestingSessionLocal()
-        try:
-            workflow = db.query(Workflow).filter_by(workflow_name="test.yml").first()
-            assert "GitHub" in workflow.workflow_yaml
-            assert workflow.workflow_git_hash == "abc123"
-        finally:
-            db.close()
-
-    @patch('workflows.user_tokens', {'testuser': 'test_token'})
-    def test_resolve_drift_use_local(self):
-        """Test resolving drift by using local version."""
-        client = TestClient(app)
-
-        # Create a workflow and associate it with the test project
-        db = TestingSessionLocal()
-        try:
-            workflow = Workflow(
-                workflow_name="test.yml",
-                workflow_yaml="name: Test Local\non: push",
-                reusable_workflow=False
-            )
-            db.add(workflow)
-            db.commit()
-            db.refresh(workflow)
-            db.add(ProjectWorkflow(project_id=self.project_id, workflow_id=workflow.workflow_id))
-            db.commit()
-        finally:
-            db.close()
-        
-        payload = {
-            "github_user": "testuser",
-            "project_name": "test_project",
-            "workflow_name": "test.yml",
-            "resolution": "use_local"
-        }
-        
-        response = client.post("/api/resolve-drift", json=payload)
-        assert response.status_code == 200
-        assert "use_update_github" in response.json()["action"]
-
-    @patch('workflows.user_tokens', {'testuser': 'test_token'})
-    def test_resolve_drift_workflow_not_found(self):
-        """Test resolving drift with non-existent workflow."""
-        client = TestClient(app)
-        
-        payload = {
-            "github_user": "testuser",
-            "project_name": "test_project",
-            "workflow_name": "nonexistent.yml",
-            "resolution": "use_github",
-            "github_content": "name: Test"
-        }
-        
-        response = client.post("/api/resolve-drift", json=payload)
-        assert response.status_code == 404
-        assert "Workflow not found" in response.json()["detail"]
-
-    @patch('workflows.user_tokens', {'testuser': 'test_token'})
-    def test_resolve_drift_invalid_resolution(self):
-        """Test resolving drift with invalid resolution."""
-        client = TestClient(app)
-
-        # Create a workflow and associate it with the test project
-        db = TestingSessionLocal()
-        try:
-            workflow = Workflow(
-                workflow_name="test.yml",
-                workflow_yaml="name: Test\non: push",
-                reusable_workflow=False
-            )
-            db.add(workflow)
-            db.commit()
-            db.refresh(workflow)
-            db.add(ProjectWorkflow(project_id=self.project_id, workflow_id=workflow.workflow_id))
-            db.commit()
-        finally:
-            db.close()
-        
-        payload = {
-            "github_user": "testuser",
-            "project_name": "test_project",
-            "workflow_name": "test.yml",
-            "resolution": "invalid_option"
-        }
-        
-        response = client.post("/api/resolve-drift", json=payload)
-        assert response.status_code == 400
-        assert "Invalid resolution" in response.json()["detail"]
-
-    @patch("auth.resolve_authenticated_user")
-    def test_get_template_types(self, mock_auth):
-        """Test getting available template types."""
-        mock_auth.return_value = MagicMock()
-        client = TestClient(app)
-
-        response = client.get("/api/workflow-templates/types")
-        assert response.status_code == 200
-        assert "template_types" in response.json()
 
     @patch("auth.resolve_authenticated_user")
     def test_generate_workflow_templates(self, mock_auth):
@@ -782,68 +656,21 @@ class TestWorkflowAPIEndpoints:
         assert response.status_code == 200
         assert "templates" in response.json()
 
-    @patch("auth.resolve_authenticated_user")
-    def test_generate_standard_template(self, mock_auth):
-        """Test generating a standard workflow template."""
-        mock_auth.return_value = MagicMock()
-        client = TestClient(app)
-
-        payload = {
-            "user_org": "testuser",
-            "build_type": "nodejs",
-            "project_code": "TEST"
-        }
-
-        response = client.post("/api/workflow-templates/standard", json=payload)
-        assert response.status_code == 200
-        assert "template" in response.json()
-
-    @patch("auth.resolve_authenticated_user")
-    def test_generate_reusable_template(self, mock_auth):
-        """Test generating a reusable workflow template."""
-        mock_auth.return_value = MagicMock()
-        client = TestClient(app)
-
-        payload = {
-            "user_org": "testuser",
-            "build_type": "docker",
-            "project_code": "TEST"
-        }
-
-        response = client.post("/api/workflow-templates/reusable", json=payload)
-        assert response.status_code == 200
-        assert "template" in response.json()
-
     @patch('workflows.user_tokens', {'testuser': 'test_token'})
     @patch('workflows.count_project_workflows', return_value=3)
     @pytest.mark.asyncio
     async def test_get_workflows_count(self, mock_count):
         """Test getting workflow count."""
-        client = TestClient(app)
+        client = self._signed_in_client()
         
-        response = client.get("/api/workflows-count?user=testuser&project_name=test_project")
+        response = client.get("/api/workflows-count?project_name=test_project")
         assert response.status_code == 200
         assert response.json()["count"] == 3
-        mock_count.assert_called_once_with("testuser", "test_project")
-
-    @patch('workflows.user_tokens', {'testuser': 'test_token'})
-    @patch('workflows.count_project_reusable_workflows', return_value=2)
-    @pytest.mark.asyncio
-    async def test_get_rxworkflows_count(self, mock_count):
-        """Test getting reusable workflow count."""
-        client = TestClient(app)
-        
-        response = client.get("/api/rxworkflows-count?user=testuser&project_name=test_project")
-        assert response.status_code == 200
-        assert response.json()["count"] == 2
         mock_count.assert_called_once_with("testuser", "test_project")
 
     def test_get_workflows_count_unauthenticated(self):
         """Test getting workflow count without authentication."""
         client = TestClient(app)
         
-        response = client.get("/api/workflows-count?user=unknown&project_name=test_project")
-        assert response.status_code == 200
-        # The endpoint returns error dict instead of count
-        assert "error" in response.json()
-        assert response.json()["status"] == 401
+        response = client.get("/api/workflows-count?project_name=test_project")
+        assert response.status_code == 401

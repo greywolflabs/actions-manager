@@ -50,10 +50,10 @@ MIGRATION_SCRIPTS = [
     "migrate_add_action_branding.py",              # Adds branding_icon/branding_color columns to actions_projects
     "migrate_add_action_groups.py",                # Adds action_groups and action_group_memberships tables
     "migrate_add_notifications_schema.py",         # Adds notification_events/deliveries/subscriptions/settings tables (issue #1790)
-    "migrate_add_workflow_drift_states.py",        # Adds workflow_drift_states table for drift transition detection (issue #1793)
     "migrate_add_campaign_last_known_status.py",   # Adds last_known_status column to project_pr_campaigns (issue #1794)
     "migrate_add_project_display_order.py",        # Adds project_display_order table for per-user grid ordering (issue #1804)
-    # After the drift-states table exists, since it rebuilds that table.
+    # The drift-state migrations below only reshape an existing database's old
+    # tables, for migrate_move_drift_state_to_file_deliveries to copy and drop.
     "migrate_add_drift_state_branch.py",           # Keys drift state by branch as well as repo (drift hardening PR 5)
     "migrate_add_workflow_tree_cache.py",          # Caches tree listings + ETags so unchanged branches cost no rate limit
     "migrate_add_drift_state_display_fields.py",   # Lets the drift panel render from stored state without calling GitHub
@@ -64,18 +64,38 @@ MIGRATION_SCRIPTS = [
     "migrate_add_drift_check_failure_count.py",    # Adds a consecutive-failure counter to projects, for sweep backoff
     "migrate_add_workflow_runs.py",                # Stores GitHub Actions runs for build metrics (issue #689)
     "migrate_add_drift_configuration.py",          # Moves drift sweep config out of env vars: global settings + per-project interval
+    "migrate_add_next_drift_check_at.py",          # Stores each project's next drift check time; after the interval/streak columns it is derived from (issue #2343)
     # After the seed account exists, so it repairs the same boot that creates it.
     "migrate_revoke_seed_workspace_membership.py", # Takes workspace admin off the seed account and restores it to the installer
     "migrate_add_campaign_snapshot.py",            # Adds target_repos/base_commits/policy_version snapshot columns to project_pr_campaigns
     "migrate_add_campaign_rollback.py",            # Adds rollback_of_campaign_id/rollback_am_action to project_pr_campaigns
     "migrate_add_onboarding_state.py",             # Adds onboarding_completed_at/onboarding_step to accounts (first-login welcome + tour)
     "migrate_add_workflow_pending_delete.py",      # Adds pending_delete to workflows so a deletion can ride a PR Campaign
-    "migrate_add_workflow_renamed_from.py",        # Adds renamed_from to workflows so a rename can be delivered as a rename
+    # After the codeowners table and the PR file_names column exist.
+    "migrate_codeowners_per_project.py",           # One CODEOWNERS file per project
+    # After the drift states it backfills from: confirmed_present_at, both drift
+    # tables, the PR history fields and file_names.
+    "migrate_add_file_deliveries.py",              # One delivery record per (file, repo, branch); backfilled once into an empty table
+    # After the record exists, onto which it copies both drift state tables.
+    "migrate_move_drift_state_to_file_deliveries.py",  # Moves each (file, repo, branch)'s last drift check onto its delivery record, then drops the old tables
+    # After the record and its backfill, whose missing paths it fills.
+    "migrate_pin_delivered_paths.py",              # Records where each backfilled delivery is, so a rename removes the old copy there; then drops workflows.renamed_from
+    "migrate_add_projects_user_id_index.py",       # Indexes projects by owner and next drift check, for every per-owner lookup (issue #2346); after next_drift_check_at exists
     # Must stay last: purges rows orphaned while SQLite foreign keys were
     # disabled, so every table it cleans has to exist by the time it runs.
     "migrate_add_project_workflow_unique.py",      # Enforces one project per workflow (drift hardening PR 4)
     "migrate_purge_orphaned_rows.py",              # Removes pre-existing orphaned rows (issue #1811)
 ]
+
+# Migrations taken out of the list above. A backup lists the migrations of the
+# release that made it, so one made before a removal still names it: without
+# this a backup_engine restore would read it as a newer schema and refuse it.
+RETIRED_MIGRATIONS = (
+    "migrate_add_codeowners_branch_states.py",     # CODEOWNERS became one file per project
+    "migrate_add_pr_codeowners_sha.py",            # CODEOWNERS became one file per project
+    "migrate_add_workflow_drift_states.py",        # Drift state moved onto file_deliveries
+    "migrate_add_workflow_renamed_from.py",        # A rename removes the file where the record says it was delivered
+)
 
 
 def run_migration_script(script_path):

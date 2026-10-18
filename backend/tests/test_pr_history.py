@@ -1,18 +1,5 @@
 """
-Tests for the GET /api/project-pr-history endpoint.
-
-Verifies:
-- Returns only merged/closed PRs (open PRs are excluded)
-- state_filter param works for "merged", "closed", and "all"
-- repo_filter narrows results to the specified repo
-- workflow_filter narrows results to rows containing the substring
-- Correct counts (total, merged_count, closed_count) in the response
-- Unauthenticated requests are rejected with 401
-- Requests for non-existent projects are rejected with 404
-- Empty history returns an empty list with an appropriate message in the payload
-- Cross-project visibility: Standard project shows PRs from linked RWX project
-- Cross-project visibility: RWX project shows PRs from linked Standard project
-- source_project_name is set for cross-linked PRs and None for direct PRs
+Tests for the PR History view, served by GET /api/project-pr-campaigns.
 """
 
 import sys
@@ -121,250 +108,6 @@ def _add_workflow(db, project_id, *, name="campaign.yml", status="under_review")
 
 
 # ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-class TestPRHistory:
-
-    @pytest.fixture(autouse=True)
-    def setup_db(self, authenticate_client):
-        # Apply the test DB override for this class's tests only, then clean up.
-        app.dependency_overrides[get_db] = override_get_db
-        Base.metadata.create_all(bind=engine)
-        self.db = TestingSessionLocal()
-        authenticate_client(client, TEST_USER, TestingSessionLocal)
-        yield
-        self.db.close()
-        Base.metadata.drop_all(bind=engine)
-        app.dependency_overrides.pop(get_db, None)
-
-    # ------------------------------------------------------------------
-    # Authentication / authorisation
-    # ------------------------------------------------------------------
-
-    def test_unauthenticated_request_rejected(self):
-        """Requests without a valid session token return 401."""
-        saved = client.headers.pop("Authorization", None)
-        try:
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": "x"},
-            )
-            assert response.status_code == 401
-        finally:
-            if saved is not None:
-                client.headers["Authorization"] = saved
-
-    def test_caller_cannot_claim_another_user(self):
-        """A valid session does not let the caller read as someone else."""
-        _create_account_and_project(self.db)
-        response = client.get(
-            "/api/project-pr-history",
-            params={"github_user": "nobody", "project_name": "x"},
-        )
-        assert response.status_code == 403
-
-    def test_unknown_project_returns_404(self):
-        _, _ = _create_account_and_project(self.db)
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": "nonexistent"},
-            )
-        assert response.status_code == 404
-
-    # ------------------------------------------------------------------
-    # Basic filtering: open PRs are excluded
-    # ------------------------------------------------------------------
-
-    def test_open_prs_excluded(self):
-        _, project = _create_account_and_project(self.db)
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=1, pr_state="open")
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=2, pr_state="merged",
-                merged_at=datetime.now(timezone.utc))
-
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": TEST_PROJECT},
-            )
-        assert response.status_code == 200
-        data = response.json()
-        # Only the merged PR should appear
-        assert data["total"] == 1
-        assert data["pull_requests"][0]["pr_number"] == 2
-        assert data["pull_requests"][0]["pr_state"] == "merged"
-
-    # ------------------------------------------------------------------
-    # Empty history
-    # ------------------------------------------------------------------
-
-    def test_empty_history(self):
-        _, _ = _create_account_and_project(self.db)
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": TEST_PROJECT},
-            )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total"] == 0
-        assert data["merged_count"] == 0
-        assert data["closed_count"] == 0
-        assert data["pull_requests"] == []
-
-    # ------------------------------------------------------------------
-    # Counts
-    # ------------------------------------------------------------------
-
-    def test_counts_are_correct(self):
-        _, project = _create_account_and_project(self.db)
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=1, pr_state="merged",
-                merged_at=datetime.now(timezone.utc))
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=2, pr_state="merged",
-                merged_at=datetime.now(timezone.utc))
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=3, pr_state="closed",
-                closed_at=datetime.now(timezone.utc))
-
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": TEST_PROJECT},
-            )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total"] == 3
-        assert data["merged_count"] == 2
-        assert data["closed_count"] == 1
-
-    # ------------------------------------------------------------------
-    # state_filter
-    # ------------------------------------------------------------------
-
-    def test_state_filter_merged(self):
-        _, project = _create_account_and_project(self.db)
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=1, pr_state="merged",
-                merged_at=datetime.now(timezone.utc))
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=2, pr_state="closed",
-                closed_at=datetime.now(timezone.utc))
-
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": TEST_PROJECT, "state_filter": "merged"},
-            )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total"] == 1
-        assert data["pull_requests"][0]["pr_state"] == "merged"
-
-    def test_state_filter_closed(self):
-        _, project = _create_account_and_project(self.db)
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=1, pr_state="merged",
-                merged_at=datetime.now(timezone.utc))
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=2, pr_state="closed",
-                closed_at=datetime.now(timezone.utc))
-
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": TEST_PROJECT, "state_filter": "closed"},
-            )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total"] == 1
-        assert data["pull_requests"][0]["pr_state"] == "closed"
-
-    def test_state_filter_all(self):
-        _, project = _create_account_and_project(self.db)
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=1, pr_state="merged",
-                merged_at=datetime.now(timezone.utc))
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=2, pr_state="closed",
-                closed_at=datetime.now(timezone.utc))
-
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": TEST_PROJECT, "state_filter": "all"},
-            )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total"] == 2
-
-    # ------------------------------------------------------------------
-    # repo_filter
-    # ------------------------------------------------------------------
-
-    def test_repo_filter(self):
-        _, project = _create_account_and_project(self.db)
-        _add_pr(self.db, project.project_id, repo_name="org/repo-a", pr_number=1, pr_state="merged",
-                merged_at=datetime.now(timezone.utc))
-        _add_pr(self.db, project.project_id, repo_name="org/repo-b", pr_number=2, pr_state="merged",
-                merged_at=datetime.now(timezone.utc))
-
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": TEST_PROJECT, "repo_filter": "org/repo-a"},
-            )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total"] == 1
-        assert data["pull_requests"][0]["repo_name"] == "org/repo-a"
-
-    # ------------------------------------------------------------------
-    # workflow_filter
-    # ------------------------------------------------------------------
-
-    def test_workflow_filter(self):
-        _, project = _create_account_and_project(self.db)
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=1, pr_state="merged",
-                workflow_names="ci.yml, deploy.yml", merged_at=datetime.now(timezone.utc))
-        _add_pr(self.db, project.project_id, repo_name="org/repo", pr_number=2, pr_state="merged",
-                workflow_names="release.yml", merged_at=datetime.now(timezone.utc))
-
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": TEST_PROJECT, "workflow_filter": "ci.yml"},
-            )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total"] == 1
-        assert "ci.yml" in data["pull_requests"][0]["workflow_names"]
-
-    # ------------------------------------------------------------------
-    # Response fields
-    # ------------------------------------------------------------------
-
-    def test_response_includes_extended_fields(self):
-        _, project = _create_account_and_project(self.db)
-        merged_ts = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        _add_pr(
-            self.db, project.project_id,
-            repo_name="org/repo", pr_number=10, pr_state="merged",
-            title="[Actions Manager] Update HPS workflows",
-            author="octokitten",
-            workflow_names="ci.yml",
-            merged_at=merged_ts,
-        )
-
-        with patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": TEST_USER, "project_name": TEST_PROJECT},
-            )
-        assert response.status_code == 200
-        pr = response.json()["pull_requests"][0]
-        assert pr["title"] == "[Actions Manager] Update HPS workflows"
-        assert pr["author"] == "octokitten"
-        assert pr["workflow_names"] == "ci.yml"
-        assert pr["merged_at"] is not None
-        assert pr["closed_at"] is None
-        assert pr["pr_url"].startswith("https://github.com/")
-
-
-# ---------------------------------------------------------------------------
 # Cross-project PR history helpers
 # ---------------------------------------------------------------------------
 
@@ -413,8 +156,7 @@ def _create_cross_project_setup(db):
     db.commit()
     db.refresh(rwx_proj)
 
-    # Create a stub workflow belonging to the RWX project so the link row has a
-    # valid workflow_id foreign key.
+    # A workflow owned by the RWX project, so the link row has a valid workflow_id.
     wf = Workflow(
         workflow_name="reusable.yml",
         workflow_yaml="name: reusable",
@@ -427,13 +169,11 @@ def _create_cross_project_setup(db):
     db.add(ProjectWorkflow(project_id=rwx_proj.project_id, workflow_id=wf.workflow_id))
     db.commit()
 
-    # Link the Standard project to the RWX project via the shared workflow.
-    link = LinkedReusableWorkflow(
+    db.add(LinkedReusableWorkflow(
         standard_project_id=std_proj.project_id,
         rwx_project_id=rwx_proj.project_id,
         workflow_id=wf.workflow_id,
-    )
-    db.add(link)
+    ))
     db.commit()
 
     return account, std_proj, rwx_proj
@@ -464,8 +204,8 @@ def _add_pr_for_project(db, project_id, pr_number):
 
 class TestCrossProjectPRHistory:
     """
-    Verify that PR history is shared bidirectionally across linked Standard ↔
-    RWX project pairs.
+    PR History is shared both ways across a linked Standard ↔ RWX project pair,
+    through the visibility map /api/project-pr-campaigns builds.
     """
 
     @pytest.fixture(autouse=True)
@@ -479,115 +219,52 @@ class TestCrossProjectPRHistory:
         Base.metadata.drop_all(bind=engine)
         app.dependency_overrides.pop(get_db, None)
 
-    # ------------------------------------------------------------------
-    # Standard Project sees RWX Project PRs
-    # ------------------------------------------------------------------
+    def _history(self, project_name):
+        with patch("workflows.user_tokens", {CROSS_USER: "fake-token"}):
+            response = client.get("/api/project-pr-campaigns", params={"project_name": project_name})
+        assert response.status_code == 200, response.text
+        return response.json()["pull_requests"]
 
     def test_standard_project_includes_rwx_prs(self):
-        """Standard project history includes merged PRs from its linked RWX project."""
         _, std_proj, rwx_proj = _create_cross_project_setup(self.db)
-
-        # One PR on each side
         _add_pr_for_project(self.db, std_proj.project_id, pr_number=1)
         _add_pr_for_project(self.db, rwx_proj.project_id, pr_number=2)
 
-        with patch("workflows.user_tokens", {CROSS_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": CROSS_USER, "project_name": STD_PROJECT},
-            )
-
-        assert response.status_code == 200
-        data = response.json()
-        # Both PRs must appear when querying the Standard project
-        assert data["total"] == 2
-        pr_numbers = {pr["pr_number"] for pr in data["pull_requests"]}
-        assert pr_numbers == {1, 2}
+        assert {pr["pr_number"] for pr in self._history(STD_PROJECT)} == {1, 2}
 
     def test_rwx_pr_carries_source_project_name_in_standard_query(self):
-        """PRs from the RWX project carry source_project_name when queried via the Standard project."""
-        _, std_proj, rwx_proj = _create_cross_project_setup(self.db)
-
+        _, _, rwx_proj = _create_cross_project_setup(self.db)
         _add_pr_for_project(self.db, rwx_proj.project_id, pr_number=10)
 
-        with patch("workflows.user_tokens", {CROSS_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": CROSS_USER, "project_name": STD_PROJECT},
-            )
-
-        assert response.status_code == 200
-        prs = response.json()["pull_requests"]
+        prs = self._history(STD_PROJECT)
         assert len(prs) == 1
-        # The PR originates from the RWX project, not the Standard project
         assert prs[0]["source_project_name"] == RWX_PROJECT
 
     def test_own_prs_have_no_source_project_name(self):
-        """PRs that belong to the queried project have source_project_name=None."""
         _, std_proj, _ = _create_cross_project_setup(self.db)
-
         _add_pr_for_project(self.db, std_proj.project_id, pr_number=5)
 
-        with patch("workflows.user_tokens", {CROSS_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": CROSS_USER, "project_name": STD_PROJECT},
-            )
-
-        assert response.status_code == 200
-        prs = response.json()["pull_requests"]
+        prs = self._history(STD_PROJECT)
         assert len(prs) == 1
         assert prs[0]["source_project_name"] is None
 
-    # ------------------------------------------------------------------
-    # RWX Project sees Standard Project PRs
-    # ------------------------------------------------------------------
-
     def test_rwx_project_includes_standard_prs(self):
-        """RWX project history includes merged PRs from each linked Standard project."""
         _, std_proj, rwx_proj = _create_cross_project_setup(self.db)
-
         _add_pr_for_project(self.db, std_proj.project_id, pr_number=3)
         _add_pr_for_project(self.db, rwx_proj.project_id, pr_number=4)
 
-        with patch("workflows.user_tokens", {CROSS_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": CROSS_USER, "project_name": RWX_PROJECT},
-            )
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total"] == 2
-        pr_numbers = {pr["pr_number"] for pr in data["pull_requests"]}
-        assert pr_numbers == {3, 4}
+        assert {pr["pr_number"] for pr in self._history(RWX_PROJECT)} == {3, 4}
 
     def test_standard_pr_carries_source_project_name_in_rwx_query(self):
-        """PRs from the Standard project carry source_project_name when queried via RWX."""
-        _, std_proj, rwx_proj = _create_cross_project_setup(self.db)
-
+        _, std_proj, _ = _create_cross_project_setup(self.db)
         _add_pr_for_project(self.db, std_proj.project_id, pr_number=20)
 
-        with patch("workflows.user_tokens", {CROSS_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": CROSS_USER, "project_name": RWX_PROJECT},
-            )
-
-        assert response.status_code == 200
-        prs = response.json()["pull_requests"]
+        prs = self._history(RWX_PROJECT)
         assert len(prs) == 1
         assert prs[0]["source_project_name"] == STD_PROJECT
 
-    # ------------------------------------------------------------------
-    # No cross-project leakage without a link
-    # ------------------------------------------------------------------
-
     def test_unlinked_project_does_not_see_other_project_prs(self):
-        """Projects without a LinkedReusableWorkflow link do not see each other's PRs."""
         _, std_proj, rwx_proj = _create_cross_project_setup(self.db)
-
-        # Create a completely separate unlinked project
         unlinked = Project(
             project_name="unlinked_project",
             project_code="UNL",
@@ -599,20 +276,14 @@ class TestCrossProjectPRHistory:
         )
         self.db.add(unlinked)
         self.db.commit()
-        self.db.refresh(unlinked)
-
-        # Add a PR to the RWX project (which the unlinked project should NOT see)
         _add_pr_for_project(self.db, rwx_proj.project_id, pr_number=99)
 
-        with patch("workflows.user_tokens", {CROSS_USER: "fake-token"}):
-            response = client.get(
-                "/api/project-pr-history",
-                params={"github_user": CROSS_USER, "project_name": "unlinked_project"},
-            )
+        assert self._history("unlinked_project") == []
 
-        assert response.status_code == 200
-        assert response.json()["total"] == 0
 
+# ---------------------------------------------------------------------------
+# PR Campaigns tests
+# ---------------------------------------------------------------------------
 
 class TestPRCampaigns:
 

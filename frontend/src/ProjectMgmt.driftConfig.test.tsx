@@ -72,7 +72,7 @@ vi.mock("./api/actionsProjects", () => ({ listActionsProjects: vi.fn().mockResol
 vi.mock("./api/actionGroups", () => ({ listActionGroups: vi.fn().mockResolvedValue([]) }));
 
 vi.mock("./api/codeowners", () => ({
-  getProjectCodeownersStatuses: vi.fn().mockResolvedValue({ statuses: [] }),
+  getProjectCodeowners: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("./components/Sidebar", () => ({

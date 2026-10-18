@@ -2,35 +2,37 @@
 
 ## Overview
 
-This project has been configured to use **Tailwind CSS v3** alongside the existing CSS variable system. This allows for gradual migration while maintaining backward compatibility with existing styles.
+This project uses **Tailwind CSS v4** alongside the existing CSS variable system. This allows for gradual migration while maintaining backward compatibility with existing styles.
 
 ## Installation
 
 Tailwind CSS has been installed with the following packages:
-- `tailwindcss@^3` - Core Tailwind CSS framework
+- `tailwindcss@^4` - Core Tailwind CSS framework
+- `@tailwindcss/postcss@^4` - Tailwind's PostCSS plugin. It prefixes only the CSS Tailwind generates.
+- `autoprefixer@^10` - vendor prefixes for everything else, i.e. the stylesheets in `src/styles/`
 - `postcss@^8` - CSS processor
-- `autoprefixer@^10` - CSS vendor prefix automation
 
 ## Configuration Files
 
-### 1. `tailwind.config.js`
-Located at `/frontend/tailwind.config.js`, this file contains:
-- Content paths for scanning Tailwind classes
-- Dark mode configuration (class strategy using `.dark-theme`)
-- Extended theme with custom colors, spacing, shadows, etc. mapped from existing CSS variables
-- Custom color palette that matches the existing design system
+There is no `tailwind.config.js`: in v4 the configuration is CSS.
 
-### 2. `postcss.config.js`
-Located at `/frontend/postcss.config.js`, enables:
-- Tailwind CSS processing
-- Autoprefixer for browser compatibility
-
-### 3. `src/index.css`
+### 1. `src/index.css`
 Contains:
-- Tailwind directives (`@tailwind base`, `@tailwind components`, `@tailwind utilities`)
+- The Tailwind imports. Utilities are imported unlayered, as they were in v3, so they and the stylesheets in `src/styles/` still compete on specificity.
+- The `dark` variant, bound to the `.dark-theme` class (`@custom-variant dark`)
+- The theme (`@theme inline reference`): custom colors, shadows, radii and fonts mapped from the existing CSS variables. `inline` compiles utilities to the values themselves and `reference` keeps the variables off `:root`, as v3 did, because the app's own `.dark-theme` CSS reuses the same `--color-*` names.
+- `source('.')` on the utilities import: classes are found by scanning `src/` automatically; there are no content paths to maintain.
+- The `hover` variant redefined as a plain `:hover` (v4 limits it to devices that can hover).
+- Compatibility rules that keep v3's rendering where v4 changed a default: `space-*` and `divide-*` placement, form-field backgrounds, search and date fields, placeholder color, button cursor, table-cell padding and `text-*` line-heights. Each is commented with what it preserves.
 - All existing CSS variables preserved for backward compatibility
 - Both new Tailwind-style naming (e.g., `--color-primary`) and legacy naming (e.g., `--primary-color`)
 - Dark theme support via `.dark-theme` class
+
+### 2. `src/styles/tailwind-v3-palette.css`
+v3's color palette. v4 redefined every shade in OKLCH; this keeps the colors as they were. Delete it to adopt v4's palette.
+
+### 3. `postcss.config.js`
+Located at `/frontend/postcss.config.js`, enables Tailwind CSS processing through `@tailwindcss/postcss`, then Autoprefixer.
 
 ## Theme Configuration
 
@@ -64,13 +66,7 @@ Dark mode is configured using the `class` strategy, which means:
 
 ### Spacing System
 
-Custom spacing scale matching existing design:
-- `xs`: 0.25rem (4px)
-- `sm`: 0.5rem (8px)
-- `md`: 0.75rem (12px)
-- `lg`: 1.5rem (24px)
-- `xl`: 2rem (32px)
-- `2xl`: 3rem (48px)
+Use Tailwind's numeric spacing scale (`p-1` = 0.25rem, `p-2` = 0.5rem, `p-3` = 0.75rem, `p-6` = 1.5rem, `p-8` = 2rem, `p-12` = 3rem). There are no named spacing classes such as `p-md` or `gap-lg`: in Tailwind v4 named spacing keys would also redefine `max-w-sm`/`max-w-lg`, so the theme has none. The `--spacing-xs` … `--spacing-2xl` CSS variables are still defined in `:root` for the stylesheets in `src/styles/`.
 
 ### Border Radius
 
@@ -172,15 +168,14 @@ const Button = ({ variant = 'primary', children, ...props }) => (
 );
 ```
 
-### 3. Use @layer for Custom Styles
-When you need custom CSS, use Tailwind's layer system:
+### 3. Custom Styles
+Prefer utility classes. When you need a reusable class, define it with `@utility` in `src/index.css`, or write plain CSS in `src/styles/`:
 ```css
-@layer components {
-  .btn-primary {
-    @apply px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary-hover;
-  }
+@utility btn-primary {
+  @apply px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary-hover;
 }
 ```
+Avoid `@layer components { ... }`. In Tailwind v4 it is a real cascade layer, and since the utilities and `src/styles/` are unlayered here, every rule in it loses to them whatever its specificity.
 
 ### 4. Maintain Backward Compatibility
 During migration:
@@ -221,7 +216,7 @@ npm start
 **Solution**: Make sure:
 1. `index.css` is imported in `index.tsx`
 2. PostCSS is processing the CSS files
-3. Content paths in `tailwind.config.js` include all component files
+3. The file is under `src/` (Tailwind v4 scans the source automatically)
 
 ### Issue: Dark mode not working
 **Solution**: 

@@ -19,8 +19,10 @@ def free_tier():
 
 
 @pytest.fixture
-def client():
-    return TestClient(app)
+def client(authenticate_client):
+    c = TestClient(app)
+    authenticate_client(c, OWNER, TestingSessionLocal)
+    return c
 
 
 def _repos(n, prefix="org/repo"):

@@ -307,6 +307,24 @@ class TestCompatibility:
         assert not report["ok"]
         assert any("newer schema" in e for e in report["errors"])
 
+    def test_backup_naming_a_retired_migration_is_not_from_a_newer_schema(self, db_session, tmp_path):
+        """A backup made before a migration left run_migrations.py still lists it."""
+        _seed_install(db_session)
+        create_backup(db_session, tmp_path / "b.tar.gz")
+
+        def add_retired_migration(name, data):
+            if name != "manifest.json":
+                return data
+            manifest = json.loads(data)
+            manifest["migrations"].insert(0, "migrate_add_workflow_drift_states.py")
+            return json.dumps(manifest).encode()
+
+        older = _rewrite_archive(tmp_path / "b.tar.gz", tmp_path / "retired.tar.gz", add_retired_migration)
+        report = validate_backup(older, db_session)
+
+        assert report["ok"]
+        assert not any("newer schema" in e for e in report["errors"])
+
     def test_backup_in_a_newer_format_is_refused(self, db_session, tmp_path):
         _seed_install(db_session)
         create_backup(db_session, tmp_path / "b.tar.gz")
@@ -594,7 +612,7 @@ class TestVersionOrdering:
 
 class TestResyncFailureIsNotFatal:
     def test_a_sequence_failure_warns_instead_of_reporting_the_restore_failed(
-        self, db_session, tmp_path, monkeypatch
+        self, db_session, tmp_path, monkeypatch, capsys
     ):
         """The rows are committed by the time sequences are reset.
 
@@ -617,6 +635,10 @@ class TestResyncFailureIsNotFatal:
         # ... and the operator is told what still needs doing.
         assert any("identity sequences" in w for w in result["warnings"])
         assert any("backup_cli.py restore" in w for w in result["warnings"])
+        # The database's own text goes to the server's output, not the warnings
+        # the anonymous first-boot route returns (#2297).
+        assert not any("accounts_user_id_seq" in w for w in result["warnings"])
+        assert "accounts_user_id_seq" in capsys.readouterr().out
 
 
 class TestDecompressionLimits:

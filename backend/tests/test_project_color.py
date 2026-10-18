@@ -17,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from models import Account, Base, Project, ProjectMembership, WorkspaceMember  # noqa: E402
+from auth import create_auth_session  # noqa: E402
 from main import app  # noqa: E402
 from projects import get_db  # noqa: E402
 
@@ -35,7 +36,7 @@ def override_get_db():
 
 class TestProjectColor:
     @pytest.fixture(autouse=True)
-    def setup_database(self):
+    def setup_database(self, authenticate_client):
         app.dependency_overrides[get_db] = override_get_db
         Base.metadata.create_all(bind=engine)
 
@@ -45,15 +46,14 @@ class TestProjectColor:
             db.commit()
         finally:
             db.close()
+        self.client = TestClient(app)
+        authenticate_client(self.client, "coloruser", TestingSessionLocal)
 
         yield
 
         Base.metadata.drop_all(bind=engine)
         if get_db in app.dependency_overrides:
             del app.dependency_overrides[get_db]
-
-    def setup_method(self):
-        self.client = TestClient(app)
 
     def _payload(self, name: str, color: str | None = None, include_color: bool = True, project_type: str = "standard"):
         body = {
@@ -341,21 +341,26 @@ class TestProjectColor:
     # -----------------------------------------------------------------
 
     def _add_project_viewer(self, project_id: int, github_user: str) -> None:
-        """Register *github_user* as a read-only workspace member with an
-        explicit ``project_viewer`` membership on *project_id*."""
+        """Register *github_user* as a workspace member holding only
+        ``project_viewer`` on *project_id*, and sign the client in as them.
+
+        A full member, not read_only: the middleware refuses every read_only
+        write before the route runs, so only a member reaches the route's own
+        project_editor gate, which is what these tests are about."""
         db = TestingSessionLocal()
         try:
             viewer = Account(github_user=github_user, github_email=f"{github_user}@example.com", account_type="free")
             db.add(viewer)
             db.commit()
             db.refresh(viewer)
-            db.add(WorkspaceMember(user_id=viewer.user_id, workspace_role="read_only"))
+            db.add(WorkspaceMember(user_id=viewer.user_id, workspace_role="member"))
             db.add(ProjectMembership(
                 user_id=viewer.user_id,
                 project_id=project_id,
                 project_role="project_viewer",
             ))
             db.commit()
+            self.client.headers["Authorization"] = f"Bearer {create_auth_session(github_user, db)}"
         finally:
             db.close()
 
@@ -367,10 +372,10 @@ class TestProjectColor:
 
         update_resp = self.client.put(
             f"/api/projects/{project_id}/",
-            headers={"X-GitHub-User": "viewer-put"},
             json=self._payload("Viewer PUT Renamed", "rose"),
         )
         assert update_resp.status_code == 403, update_resp.text
+        assert "Insufficient project permissions" in update_resp.json()["detail"]
 
         db = TestingSessionLocal()
         try:
@@ -389,8 +394,8 @@ class TestProjectColor:
 
         patch_resp = self.client.patch(
             f"/api/projects/{project_id}/project-color",
-            headers={"X-GitHub-User": "viewer-patch"},
             json={"github_user": "viewer-patch", "project_color": "orange"},
         )
         assert patch_resp.status_code == 403, patch_resp.text
+        assert "Insufficient project permissions" in patch_resp.json()["detail"]
         assert self._get_color(project_id) == "blue"

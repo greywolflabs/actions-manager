@@ -11,12 +11,12 @@ Roles (highest → lowest):
 """
 
 from fastapi import Depends, HTTPException, Request, status
-from sqlalchemy import text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
-from typing import Optional
+from typing import List, Optional
 
 from database import get_db as _get_db
-from models import Account, WorkspaceMember, ProjectMembership, SEED_ACCOUNT_GITHUB_USER
+from models import Account, Project, WorkspaceMember, ProjectMembership, SEED_ACCOUNT_GITHUB_USER
 
 # Ordered from lowest to highest privilege
 ROLE_HIERARCHY = ["read_only", "member", "admin"]
@@ -203,36 +203,119 @@ def check_project_access(
     return None
 
 
-def require_project_access(minimum_project_role: str = "project_viewer"):
+# ---------------------------------------------------------------------------
+# Project access: the one place it is decided. Every lookup and gate delegates
+# here; a second copy of these rules is how the copies came to disagree.
+# ---------------------------------------------------------------------------
+
+PROJECT_ROLE_LEVEL = {"project_viewer": 0, "project_editor": 1, "project_admin": 2}
+
+# Project.pr_state while the pull requests removing its files from GitHub are
+# open. The project goes when they have all merged; closing one calls it off.
+PROJECT_DELETING = "deleting"
+
+
+def project_role(db: Session, account: Optional[Account], project: Optional[Project], *,
+                 settling: bool = False) -> Optional[str]:
+    """The caller's role on *project*, or None when they may not see it.
+
+    Workspace admins hold project_admin. The owner edits their own project with
+    no membership row. Otherwise the member rule in check_project_access
+    applies. A read_only member never edits, owner or not: they see their own
+    project and the ones granted to them, and WriteProtectionMiddleware refuses
+    their writes before any route as well.
+
+    A project being deleted is read-only to everyone, admins included: its
+    removal pull requests are the last change it makes. *settling* is for
+    merging or closing one of them, which finishes the deletion or calls it
+    off, so it takes the role the caller would otherwise hold.
     """
-    Factory: returns a FastAPI dependency that ensures the caller can access
-    the project identified by *project_id* in the path.
+    role = _role_ignoring_deletion(db, account, project)
+    if role is not None and not settling and project.pr_state == PROJECT_DELETING:
+        return "project_viewer"
+    return role
 
-    ``minimum_project_role`` can be ``"project_viewer"`` (default, read access)
-    or ``"project_editor"`` (write access).
 
-    Admin workspace members always pass.
+def _role_ignoring_deletion(db: Session, account: Optional[Account], project: Optional[Project]) -> Optional[str]:
+    if account is None or project is None:
+        return None
+    member = db.query(WorkspaceMember).filter(WorkspaceMember.user_id == account.user_id).first()
+    if member is not None and is_project_admin(member):
+        return "project_admin"
+    read_only = member is not None and member.workspace_role == "read_only"
+    if project.user_id == account.user_id:
+        return "project_viewer" if read_only else "project_editor"
+    role = check_project_access(db, member, project.project_id) if member is not None else None
+    return "project_viewer" if role and read_only else role
+
+
+def has_project_role(db: Session, account: Optional[Account], project: Optional[Project], minimum: str, *,
+                     settling: bool = False) -> bool:
+    role = project_role(db, account, project, settling=settling)
+    return role is not None and PROJECT_ROLE_LEVEL[role] >= PROJECT_ROLE_LEVEL[minimum]
+
+
+def ambiguous_project_name_detail(project_name: str) -> str:
+    return (
+        f"More than one project is named '{project_name.strip()}'. "
+        "Open it from the projects list, or rename one so they can be told apart."
+    )
+
+
+def _single(projects: List[Project], project_name: str) -> Optional[Project]:
+    if len(projects) > 1:
+        raise HTTPException(status_code=409, detail=ambiguous_project_name_detail(project_name))
+    return projects[0] if projects else None
+
+
+def find_project_by_name(
+    db: Session,
+    account: Optional[Account],
+    project_name: str,
+    *,
+    owner_name: Optional[str] = None,
+    hint: Optional[int] = None,
+) -> Optional[Project]:
+    """The project *project_name* means for *account*, among those it may see.
+
+    Names are unique per owner only (#2240), so a name can match several
+    projects. In order: the page's own project (*hint*, from X-Project-Id), the
+    named owner's, the caller's own, one the caller holds a grant on, then the
+    only one left. Several left is a 409 rather than a guess.
     """
-    # project role hierarchy: viewer < editor < admin
-    _project_role_level = {"project_viewer": 0, "project_editor": 1, "project_admin": 2}
-    min_level = _project_role_level.get(minimum_project_role, 0)
+    name = (project_name or "").strip()
+    if account is None or not name:
+        return None
+    # The exact match covers names SQLite's lower() leaves alone (non-ASCII).
+    candidates = (
+        db.query(Project)
+        .filter(or_(Project.project_name == name, func.lower(Project.project_name) == name.lower()))
+        .order_by(Project.project_id)
+        .all()
+    )
+    visible = [p for p in candidates if project_role(db, account, p) is not None]
+    if not visible:
+        return None
 
-    def _check(
-        project_id: int,
-        member: WorkspaceMember = Depends(get_current_member),
-        db: Session = Depends(_get_db),
-    ) -> WorkspaceMember:
-        effective_role = check_project_access(db, member, project_id)
-        if effective_role is None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this project",
-            )
-        if _project_role_level.get(effective_role, -1) < min_level:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Insufficient project permissions. Required: {minimum_project_role}",
-            )
-        return member
-
-    return _check
+    hinted = [p for p in visible if hint and p.project_id == hint]
+    if hinted:
+        return hinted[0]
+    if owner_name:
+        owner = db.query(Account).filter(Account.github_user == owner_name.strip()).first()
+        owned = [p for p in visible if owner is not None and p.user_id == owner.user_id]
+        if owned:
+            return owned[0]
+    own = [p for p in visible if p.user_id == account.user_id]
+    if own:
+        return own[0]
+    granted_ids = {
+        pm.project_id
+        for pm in db.query(ProjectMembership).filter(
+            ProjectMembership.user_id == account.user_id,
+            ProjectMembership.project_id.in_([p.project_id for p in visible]),
+        )
+    }
+    granted = [p for p in visible if p.project_id in granted_ids]
+    if granted:
+        return _single(granted, project_name)
+    return _single(visible, project_name)

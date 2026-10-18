@@ -67,6 +67,8 @@ const JobCard: React.FC<JobCardProps> = memo(({
 
   const hasErrors = validationErrors.some(error => error.severity === 'error');
   const hasWarnings = validationErrors.some(error => error.severity === 'warning');
+  const isCaller = job.uses !== undefined;
+  const needs = typeof job.needs === 'string' ? [job.needs] : job.needs ?? [];
 
   // Include `job` in deps so we don't spread a stale object
   const handleFieldChange = useCallback((field: keyof WorkflowJob, value: any) => {
@@ -208,26 +210,36 @@ const JobCard: React.FC<JobCardProps> = memo(({
             </div>
 
             {/* Runner */}
-            <div className="form-field">
-              <label className="form-label" htmlFor={`job-runner-${job.id}`}>
-                Runner *
-                {getFieldError('runsOn') && (
-                  <span className="field-error">{getFieldError('runsOn')!.message}</span>
-                )}
-              </label>
-              <select
-                id={`job-runner-${job.id}`}
-                value={job.runsOn}
-                onChange={(e) => handleFieldChange('runsOn', e.target.value)}
-                className={`form-select ${getFieldError('runsOn') ? 'error' : ''}`}
-              >
-                {RUNNER_OPTIONS.map(option => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </div>
+            {isCaller ? (
+              <div className="unsupported-fields-notice">
+                <span className="info-icon">ℹ️</span>
+                <span>
+                  Calls reusable workflow <code>{job.uses}</code>. Edit its <code>with:</code> and{' '}
+                  <code>secrets:</code> in YAML.
+                </span>
+              </div>
+            ) : (
+              <div className="form-field">
+                <label className="form-label" htmlFor={`job-runner-${job.id}`}>
+                  Runner *
+                  {getFieldError('runsOn') && (
+                    <span className="field-error">{getFieldError('runsOn')!.message}</span>
+                  )}
+                </label>
+                <select
+                  id={`job-runner-${job.id}`}
+                  value={job.runsOn}
+                  onChange={(e) => handleFieldChange('runsOn', e.target.value)}
+                  className={`form-select ${getFieldError('runsOn') ? 'error' : ''}`}
+                >
+                  {RUNNER_OPTIONS.map(option => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             {/* Job Dependencies (Needs) */}
             {availableJobIds.length > 0 && (
@@ -238,12 +250,11 @@ const JobCard: React.FC<JobCardProps> = memo(({
                     <label key={jobId} className="checkbox-item">
                       <input
                         type="checkbox"
-                        checked={job.needs?.includes(jobId) || false}
+                        checked={needs.includes(jobId)}
                         onChange={(e) => {
-                          const currentNeeds = job.needs || [];
                           const newNeeds = e.target.checked
-                            ? [...currentNeeds, jobId]
-                            : currentNeeds.filter(id => id !== jobId);
+                            ? [...needs, jobId]
+                            : needs.filter(id => id !== jobId);
                           handleNeedsChange(newNeeds);
                         }}
                       />
@@ -282,113 +293,119 @@ const JobCard: React.FC<JobCardProps> = memo(({
                 />
               </div>
 
-              {/* Timeout */}
-              <div className="form-field">
-                <label className="form-label" htmlFor={`job-timeout-${job.id}`}>Timeout (minutes)</label>
-                <input
-                  id={`job-timeout-${job.id}`}
-                  type="number"
-                  value={job.timeoutMinutes || ''}
-                  onChange={(e) => handleFieldChange('timeoutMinutes', e.target.value ? Number.parseInt(e.target.value, 10) : undefined)}
-                  placeholder="360"
-                  min="1"
-                  max="2160"
-                  className="form-input"
-                />
-              </div>
+              {!isCaller && (
+                <>
+                  {/* Timeout */}
+                  <div className="form-field">
+                    <label className="form-label" htmlFor={`job-timeout-${job.id}`}>Timeout (minutes)</label>
+                    <input
+                      id={`job-timeout-${job.id}`}
+                      type="number"
+                      value={job.timeoutMinutes || ''}
+                      onChange={(e) => handleFieldChange('timeoutMinutes', e.target.value ? Number.parseInt(e.target.value, 10) : undefined)}
+                      placeholder="360"
+                      min="1"
+                      max="2160"
+                      className="form-input"
+                    />
+                  </div>
 
-              {/* Job Environment Variables */}
-              <div className="form-field">
-                <label className="form-label" htmlFor={`job-env-${job.id}`}>Job Environment Variables</label>
-                <div className="env-vars-section" id={`job-env-${job.id}`}>
-                  {job.env && Object.keys(job.env).length > 0 ? (
-                    <div className="env-vars-list">
-                      {Object.entries(job.env).map(([key, value], index) => (
-                        <div key={index} className="env-var-item">
-                          <input
-                            type="text"
-                            value={key}
-                            onChange={(e) => {
-                              const newEnv = { ...(job.env || {}) };
-                              delete newEnv[key];
-                              if (e.target.value) newEnv[e.target.value] = value;
-                              handleEnvChange(newEnv);
-                            }}
-                            placeholder="Variable name"
-                            className="env-var-key"
-                          />
-                          <input
-                            type="text"
-                            value={value}
-                            onChange={(e) => {
-                              const newEnv = { ...(job.env || {}) };
-                              newEnv[key] = e.target.value;
-                              handleEnvChange(newEnv);
-                            }}
-                            placeholder="Variable value"
-                            className="env-var-value"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const newEnv = { ...(job.env || {}) };
-                              delete newEnv[key];
-                              handleEnvChange(newEnv);
-                            }}
-                            className="env-var-remove"
-                            title="Remove variable"
-                          >
-                            ✕
-                          </button>
+                  {/* Job Environment Variables */}
+                  <div className="form-field">
+                    <label className="form-label" htmlFor={`job-env-${job.id}`}>Job Environment Variables</label>
+                    <div className="env-vars-section" id={`job-env-${job.id}`}>
+                      {job.env && Object.keys(job.env).length > 0 ? (
+                        <div className="env-vars-list">
+                          {Object.entries(job.env).map(([key, value], index) => (
+                            <div key={index} className="env-var-item">
+                              <input
+                                type="text"
+                                value={key}
+                                onChange={(e) => {
+                                  const newEnv = { ...(job.env || {}) };
+                                  delete newEnv[key];
+                                  if (e.target.value) newEnv[e.target.value] = value;
+                                  handleEnvChange(newEnv);
+                                }}
+                                placeholder="Variable name"
+                                className="env-var-key"
+                              />
+                              <input
+                                type="text"
+                                value={value}
+                                onChange={(e) => {
+                                  const newEnv = { ...(job.env || {}) };
+                                  newEnv[key] = e.target.value;
+                                  handleEnvChange(newEnv);
+                                }}
+                                placeholder="Variable value"
+                                className="env-var-value"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const newEnv = { ...(job.env || {}) };
+                                  delete newEnv[key];
+                                  handleEnvChange(newEnv);
+                                }}
+                                className="env-var-remove"
+                                title="Remove variable"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          ))}
                         </div>
-                      ))}
+                      ) : (
+                        <div className="env-vars-empty">No job environment variables defined</div>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const newEnv = { ...(job.env || {}) };
+                          const newKey = `JOB_VAR_${Object.keys(newEnv).length + 1}`;
+                          newEnv[newKey] = '';
+                          handleEnvChange(newEnv);
+                        }}
+                        className="add-env-var-button"
+                      >
+                        ➕ Add Environment Variable
+                      </button>
                     </div>
-                  ) : (
-                    <div className="env-vars-empty">No job environment variables defined</div>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const newEnv = { ...(job.env || {}) };
-                      const newKey = `JOB_VAR_${Object.keys(newEnv).length + 1}`;
-                      newEnv[newKey] = '';
-                      handleEnvChange(newEnv);
-                    }}
-                    className="add-env-var-button"
-                  >
-                    ➕ Add Environment Variable
-                  </button>
-                </div>
-              </div>
+                  </div>
+                </>
+              )}
             </div>
           )}
 
           {/* Steps Section */}
-          <div className="steps-section" id={`job-steps-${job.id}`}>
-            <div className="section-header">
-              <label className="form-label" htmlFor={`job-steps-${job.id}`}>
-                Steps
-                {getFieldError('steps') && (
-                  <span className="field-error">{getFieldError('steps')!.message}</span>
-                )}
-              </label>
-            </div>
+          {!isCaller && (
+            <div className="steps-section" id={`job-steps-${job.id}`}>
+              <div className="section-header">
+                <label className="form-label" htmlFor={`job-steps-${job.id}`}>
+                  Steps
+                  {getFieldError('steps') && (
+                    <span className="field-error">{getFieldError('steps')!.message}</span>
+                  )}
+                </label>
+              </div>
 
-            <StepList
-              steps={job.steps}
-              onChange={handleStepsChange}
-              validationErrors={validationErrors}
-              jobIndex={jobIndex}
-              jobId={job.id}
-            />
-            <button
-              type="button"
-              onClick={addStep}
-              className="add-step-button"
-            >
-              ➕ Add Step
-            </button>
-          </div>
+              <StepList
+                steps={job.steps}
+                onChange={handleStepsChange}
+                validationErrors={validationErrors}
+                jobIndex={jobIndex}
+                jobId={job.id}
+              />
+              <button
+                type="button"
+                onClick={addStep}
+                className="add-step-button"
+              >
+                ➕ Add Step
+              </button>
+            </div>
+          )}
 
           {/* Unsupported Fields Notice */}
           {job.unsupportedFields && Object.keys(job.unsupportedFields).length > 0 && (

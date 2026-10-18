@@ -106,7 +106,7 @@ const StepDetailPanel: React.FC<StepDetailPanelProps> = ({
       // The dialog checks this flag instead and lets the panel take Escape
       // first; a second press, with nothing selected, collapses the editor.
       data-step-selected={resolved ? 'true' : undefined}
-      className="mt-4 rounded-lg border border-border bg-container p-3 dark:border-border-dark dark:bg-container-dark lg:mt-0 lg:sticky lg:top-4 lg:max-h-[var(--step-panel-max-h,calc(100vh-8rem))] lg:overflow-y-auto"
+      className="mt-4 rounded-lg border border-border bg-container p-3 dark:border-border-dark dark:bg-container-dark lg:mt-0 lg:sticky lg:top-4 lg:max-h-(--step-panel-max-h,calc(100vh-8rem)) lg:overflow-y-auto"
     >
       <div className="mb-3 flex items-start justify-between gap-2">
         <h3

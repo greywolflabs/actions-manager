@@ -113,6 +113,12 @@ Every restore validates integrity and version compatibility *before* changing an
 the data in a single transaction, and then runs any migrations the archive predates. A rejected
 archive leaves the installation exactly as it was.
 
+:::caution
+A backup taken on 1.13.0-beta.1 or earlier can fail to restore on a later version if a project
+had CODEOWNERS in more than one repository, and the failed restore is rolled back. Keep the
+version the backup came from available until you have a backup taken after upgrading.
+:::
+
 ## Before you upgrade
 
 Take a backup before every upgrade. If a migration fails:

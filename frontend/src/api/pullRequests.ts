@@ -5,14 +5,16 @@
  */
 
 import config from "../config";
+import { projectHintHeaders } from "./projectHint";
 
 const BACKEND_URL = config.BACKEND_URL;
 
 /**
- * Build common JSON headers. Authentication is handled by the HttpOnly session cookie.
+ * Build common JSON headers, with the project page's id (see projectHint).
+ * Authentication is handled by the HttpOnly session cookie.
  */
 function writeHeaders(): Record<string, string> {
-  return { "Content-Type": "application/json" };
+  return { "Content-Type": "application/json", ...projectHintHeaders() };
 }
 
 export interface PRStatus {
@@ -36,6 +38,7 @@ export interface PRStatus {
 }
 
 export interface ProjectPRStatus {
+  /** The project's pr_state, or "deleted" when a refresh finished its deletion. */
   project_state: string;
   pull_requests: PRStatus[];
   total_prs: number;
@@ -59,8 +62,6 @@ export interface CreatePRsResponse {
   task_id?: string;
   status?: string;
   campaign_id?: number;
-  /** Repos whose CODEOWNERS content was merged into an existing workflow/custom-file PR. */
-  codeowners_merged_repos?: string[];
 }
 
 export interface PRTaskStatusResponse {
@@ -70,8 +71,6 @@ export interface PRTaskStatusResponse {
   prs_created?: number;
   campaign_id?: number;
   error?: string;
-  /** Repos whose CODEOWNERS content was merged into an existing workflow/custom-file PR. */
-  codeowners_merged_repos?: string[];
 }
 
 export interface PreflightValidationResponse {
@@ -82,8 +81,8 @@ export interface PreflightValidationResponse {
 }
 
 /**
- * A single historical (merged or closed) pull request record returned by
- * GET /api/project-pr-history.
+ * A single pull request record: the base of each PR row that
+ * GET /api/project-pr-campaigns returns.
  *
  * ``source_project_name`` is only set when the PR was created by a *different*
  * project that is linked to the queried project via a reusable-workflow
@@ -95,7 +94,7 @@ export interface PRHistoryItem {
   repo_name: string;
   pr_number: number;
   pr_url: string;
-  pr_state: string; // "merged" | "closed"
+  pr_state: string; // "open" | "merged" | "closed"
   branch_name: string;
   target_branch: string;
   title: string | null;
@@ -243,7 +242,8 @@ export interface CreatePullRequestsOptions {
   selectedReusableWorkflows?: string[];
   /** Always send an array — omitting it means "all changed", [] means "none". */
   selectedCustomFileIds?: number[];
-  selectedCodeownersRepos?: string[];
+  /** Deliver the project's CODEOWNERS to every repository in the campaign. */
+  includeCodeowners?: boolean;
   campaign?: { name?: string; description?: string };
 }
 
@@ -254,7 +254,7 @@ export async function createPullRequests(
 ): Promise<CreatePRsResponse> {
   const {
     selectedRepos, selectedWorkflows, selectedReusableWorkflows,
-    selectedCustomFileIds, selectedCodeownersRepos, campaign,
+    selectedCustomFileIds, includeCodeowners, campaign,
   } = options;
   try {
     const response = await fetch(`${BACKEND_URL}/api/create-pull-requests`, {
@@ -267,7 +267,7 @@ export async function createPullRequests(
         selected_workflows: selectedWorkflows || null,
         selected_reusable_workflows: selectedReusableWorkflows || null,
         selected_custom_file_ids: selectedCustomFileIds ?? null,
-        selected_codeowners_repos: selectedCodeownersRepos || null,
+        include_codeowners: Boolean(includeCodeowners),
         campaign_name: campaign?.name || null,
         campaign_description: campaign?.description || null,
         async_mode: true
@@ -364,9 +364,7 @@ export async function getPreflightValidationStatus(
   const response = await fetch(`${BACKEND_URL}/api/preflight-validation-status?${params.toString()}`, {
     method: "GET",
     credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: writeHeaders(),
   });
 
   if (!response.ok) {
@@ -464,9 +462,7 @@ export async function getProjectPRStatus(
       {
         method: "GET",
         credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: writeHeaders(),
       }
     );
 
@@ -494,6 +490,8 @@ export interface MergePullRequestResponse {
   branch_deleted: boolean;
   /** Non-null when deletion was skipped or failed; contains a human-readable reason. */
   branch_delete_warning: string | null;
+  /** True when this was the last removal pull request of a project being deleted: the project is gone. */
+  project_deleted?: boolean;
 }
 
 /**
@@ -595,7 +593,7 @@ export async function getPRCampaigns(
       {
         method: "GET",
         credentials: "include",
-        headers: { "Content-Type": "application/json" },
+        headers: writeHeaders(),
       }
     );
 

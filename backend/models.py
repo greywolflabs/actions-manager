@@ -14,7 +14,7 @@ Defines SQLAlchemy models for:
 import json
 import secrets
 import string
-from sqlalchemy import BigInteger, Column, Index, Integer, String, DateTime, ForeignKey, Boolean, UniqueConstraint, Text
+from sqlalchemy import BigInteger, CheckConstraint, Column, Index, Integer, String, DateTime, ForeignKey, Boolean, UniqueConstraint, Text, event
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship, validates
 from database import Base
@@ -183,18 +183,6 @@ class Workflow(Base):
     # carries the removal merges.
     pending_delete = Column(Boolean, nullable=False, default=False)
 
-    # The name this workflow was last delivered to GitHub under, set when a
-    # rename happens on a workflow that was already delivered. A rename in Git
-    # is a remove plus an add, so delivery needs both halves: without this the
-    # old name is gone the moment workflow_name is reassigned, and the file sits
-    # in every repository under a name nothing tracks.
-    #
-    # Held until the campaign carrying the rename MERGES, not until it is
-    # committed. A campaign that is closed unmerged leaves the old file on
-    # GitHub, so the next one still has to remove it — which is why
-    # _cancel_pending_deletes has no counterpart here.
-    renamed_from = Column(String(255), nullable=True)
-
     # Audit: track who last modified this workflow
     last_modified_by = Column(String(255), nullable=True)  # GitHub username of last editor
 
@@ -231,7 +219,7 @@ class Project(Base):
     project_id = Column(Integer, primary_key=True, index=True)  
     project_code = Column(String(10), unique=True, default=generate_random_id)
     project_name = Column(String(255), nullable=False)  
-    user_id = Column(Integer, ForeignKey(_FK_ACCOUNTS_USER_ID, ondelete="CASCADE"), nullable=False)  
+    user_id = Column(Integer, ForeignKey(_FK_ACCOUNTS_USER_ID, ondelete="CASCADE"), nullable=False)
     branch_regex = Column(String(255), nullable=True) 
     branch_option = Column(String(50), nullable=True, default="default")  # default, pattern
     branch_max_age_days = Column(Integer, nullable=True, default=30)  # Filter branches by recency (1-30 days)
@@ -252,11 +240,22 @@ class Project(Base):
     drift_count = Column(Integer, nullable=False, default=0)
     last_drift_check_at = Column(DateTime, nullable=True)
     drift_error_summary = Column(String(500), nullable=True)
-    drift_check_failure_count = Column(Integer, nullable=False, default=0)  # Consecutive check_failed results, for sweep backoff; reset on clean/drifted
+    # Consecutive check_failed results, for sweep backoff; reset on clean/drifted. Indexed
+    # because every sweep tick looks up the failing projects' owners.
+    drift_check_failure_count = Column(Integer, nullable=False, default=0, index=True)
     # NULL = inherit the workspace default, 0 = never sweep this project, N = every N minutes.
     # ponytail: one column rather than an enabled flag plus an interval, so there is no
     # contradictory "disabled but every 30 minutes" state to validate against.
     drift_check_interval_minutes = Column(Integer, nullable=True)
+    # When the sweep next checks this project, derived by drift_worker.next_check_at
+    # from the columns above. NULL means due now: never checked, or not scheduled
+    # yet. It is never consulted while the interval is off.
+    next_drift_check_at = Column(DateTime, nullable=True, index=True)
+    # The interval, before backoff, next_drift_check_at was computed with; NULL until
+    # something has scheduled the row. Both are written by the mapper events below,
+    # and the sweep redoes any row whose inherited default has since changed
+    # (drift_worker.reconcile_schedules).
+    drift_check_scheduled_minutes = Column(Integer, nullable=True, index=True)
     # Build-metrics sync cursor. Kept here rather than derived from workflow_runs
     # because a project with no runs yet has no row to read a timestamp from, and
     # would re-hit GitHub on every panel open.
@@ -267,7 +266,28 @@ class Project(Base):
     # Audit: track who last modified this project
     last_modified_by = Column(String(255), nullable=True)  # GitHub username of last editor
 
+    # Finds the inheriting projects scheduled with another default without
+    # reading the ones with their own interval (drift_worker._untrusted_schedules).
+    __table_args__ = (
+        Index("ix_projects_drift_inherited_schedule", "drift_check_interval_minutes", "drift_check_scheduled_minutes"),
+        # Neither database indexes a foreign key on its own. Every per-owner
+        # lookup (project lists, name checks, pause recording) uses the
+        # leading column. The sweep's due reads use
+        # both: an owner's due projects in next-check order. On user_id alone,
+        # SQLite would read and sort all of an owner's projects every tick.
+        Index("ix_projects_user_id_next_drift_check_at", "user_id", "next_drift_check_at"),
+    )
+
     user = relationship("Account", back_populates="projects")
+
+
+@event.listens_for(Project, "before_insert")
+@event.listens_for(Project, "before_update")
+def _keep_drift_schedule_current(_mapper, connection, project):
+    # Registered with the model so no ORM writer can bypass it. Imported here
+    # because drift_worker imports this module.
+    from drift_worker import schedule_flushed_project
+    schedule_flushed_project(connection, project)
 
 
 class ActionsProject(Base):
@@ -634,12 +654,13 @@ class ProjectDisplayOrder(Base):
 
 class Codeowners(Base):
     """
-    CODEOWNERS file management table.
+    The project's CODEOWNERS file.
 
-    Stores the locally-managed CODEOWNERS content for a repository within a
-    project, mirroring how workflows are tracked.  The ``git_hash`` field
-    captures the GitHub blob SHA from the last successful sync so drift can
-    be detected efficiently against the live GitHub copy.
+    One per project, delivered to every repository and branch the project
+    delivers to, the way its workflows are. ``git_hash`` follows
+    ``Workflow.workflow_git_hash``: the blob SHA last committed to GitHub, or
+    NULL once edited in ActionsManager. Drift does not read it; it reads the
+    delivery record (``FileDelivery``).
 
     The ``status`` lifecycle mirrors the workflow status field:
         - ``new``                  – first save, never deployed
@@ -651,7 +672,6 @@ class Codeowners(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
-    repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete="CASCADE"), nullable=False, index=True)
     content = Column(Text, nullable=False, default="")
     file_path = Column(String(64), nullable=False, default=".github/CODEOWNERS")  # .github/CODEOWNERS or CODEOWNERS
     git_hash = Column(String(255), nullable=True)
@@ -660,9 +680,8 @@ class Codeowners(Base):
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
-    # Each repo within a project has at most one CODEOWNERS draft
     __table_args__ = (
-        UniqueConstraint('project_id', 'repo_id', name='uq_codeowners_project_repo'),
+        UniqueConstraint('project_id', name='uq_codeowners_project'),
     )
 
 
@@ -830,59 +849,75 @@ class DriftSettings(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
-class WorkflowDriftState(Base):
-    """Last known per-(workflow, repo, branch) drift check result.
+_FK_PROJECT_PULL_REQUESTS_PR_ID = "project_pull_requests.pr_id"
 
-    Exists so drift notifications can diff a newly-computed check against
-    the previous one to detect state transitions — drift is checked
-    on-demand (no scheduler), so this is the only place "previous state"
-    is available to compare against.
 
-    Keyed by branch as well as repo: a project can deliver the same workflow
-    to several branches and each drifts independently. Without the branch in
-    the key, resolving drift on one branch cleared the record for all of them
-    and the project reported clean while other branches were still wrong.
+class FileDelivery(Base):
+    """One (file, repo, branch): what ActionsManager delivered there, what an open
+    PR carries there, and what the last drift check saw there.
+
+    Read and written only through ``deliveries.py``. Exactly one of the three
+    file columns is set. ``project_id`` is the project that owns the file, which
+    for a linked reusable workflow is its Reusable Workflow Project.
+
+    ``delivered_at`` NULL means never delivered here; set with ``delivered_sha``
+    NULL means delivered with the blob unknown. ``pending_pr_id`` is set while an
+    open pull request carries a change here, ``pending_delete`` when that change
+    removes the file.
+
+    The drift columns hold the last check's outcome, so the drift panel renders
+    without calling GitHub and a check can notify only on a transition.
+    ``github_sha`` is the blob it saw (NULL when the file was missing), ``etag``
+    the validator of its last single-file read (CODEOWNERS, custom files;
+    workflows read through ``WorkflowTreeCache``). ``drift_cycle_count`` counts clean-to-drifted
+    transitions: it is part of the notification dedup key with ``content_hash``,
+    so a drift that resolves and recurs with identical content notifies again.
     """
-    __tablename__ = "workflow_drift_states"
+    __tablename__ = "file_deliveries"
 
-    state_id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey(_FK_PROJECTS_PROJECT_ID, ondelete="CASCADE"), nullable=False, index=True)
-    workflow_id = Column(Integer, ForeignKey(_FK_WORKFLOWS_WORKFLOW_ID, ondelete="CASCADE"), nullable=False, index=True)
     repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete="CASCADE"), nullable=False, index=True)
-    # Empty string, not NULL: this is part of the unique key, and NULL never
-    # compares equal to NULL, so a nullable column would let duplicate rows
-    # accumulate for any state written without a resolved branch.
+    # Empty string, not NULL: it is part of the unique key, and NULL never
+    # compares equal to NULL, so duplicate rows would accumulate.
     branch = Column(String(255), nullable=False, default="", server_default="")
-    has_drift = Column(Boolean, nullable=False, default=False)
-    content_hash = Column(String(64), nullable=True)
-    # Enough to render the drift list without calling GitHub. The YAML itself
-    # is deliberately not cached: a diff is only meaningful against GitHub's
-    # current content, so it is fetched when the user opens one rather than
-    # replayed from a snapshot that may already be stale.
-    github_sha = Column(String(255), nullable=True)
+    workflow_id = Column(Integer, ForeignKey(_FK_WORKFLOWS_WORKFLOW_ID, ondelete="CASCADE"), nullable=True)
+    custom_file_id = Column(Integer, ForeignKey("custom_files.id", ondelete="CASCADE"), nullable=True)
+    codeowners_id = Column(Integer, ForeignKey("codeowners.id", ondelete="CASCADE"), nullable=True)
+    delivered_sha = Column(String(255), nullable=True)
+    delivered_path = Column(String(500), nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    delivered_pr_id = Column(
+        Integer, ForeignKey(_FK_PROJECT_PULL_REQUESTS_PR_ID, ondelete=_ON_DELETE_SET_NULL), nullable=True, index=True
+    )
+    pending_sha = Column(String(255), nullable=True)
+    pending_path = Column(String(500), nullable=True)
+    pending_delete = Column(Boolean, nullable=False, default=False)
+    pending_pr_id = Column(
+        Integer, ForeignKey(_FK_PROJECT_PULL_REQUESTS_PR_ID, ondelete=_ON_DELETE_SET_NULL), nullable=True, index=True
+    )
+    # Server defaults too: migrations insert rows with raw SQL that names none of these.
+    has_drift = Column(Boolean, nullable=False, default=False, server_default="0")
     deleted_in_github = Column(Boolean, nullable=False, default=False, server_default="0")
-    # Set the first time a check actually finds this workflow's file on this
-    # (repo, branch), and never cleared while the pairing exists. It is the only
-    # durable record that the file was really delivered here.
-    #
-    # The fields that look like they already say so do not. ``workflow_git_hash``
-    # is the blob SHA of whatever branch was last written, including a PR branch,
-    # so a workflow whose campaign is still open carries a real hash while having
-    # never landed. ``github_sha`` above is cleared the moment a check finds the
-    # file gone, so it cannot outlive the check that reports a deletion. Reading
-    # either as delivery history is what made opening a campaign report every
-    # repo as "deleted" (issue #1981).
-    confirmed_present_at = Column(DateTime, nullable=True)
-    # Incremented on every not-drifted -> drifted transition. Included in the
-    # notification dedup key alongside content_hash so a drift that resolves
-    # and then reoccurs with byte-identical content (e.g. a revert) still
-    # gets its own notification instead of colliding with the stale one.
-    drift_cycle_count = Column(Integer, nullable=False, default=0)
-    last_checked_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    github_sha = Column(String(255), nullable=True)
+    etag = Column(String(255), nullable=True)
+    content_hash = Column(String(64), nullable=True)
+    drift_cycle_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_checked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
+    # NULLs never collide in a unique key, so each constrains only its own kind.
     __table_args__ = (
-        UniqueConstraint('workflow_id', 'repo_id', 'branch',
-                         name='uq_workflow_drift_state_workflow_repo_branch'),
+        UniqueConstraint('workflow_id', 'repo_id', 'branch', name='uq_file_delivery_workflow_repo_branch'),
+        UniqueConstraint('custom_file_id', 'repo_id', 'branch', name='uq_file_delivery_custom_file_repo_branch'),
+        UniqueConstraint('codeowners_id', 'repo_id', 'branch', name='uq_file_delivery_codeowners_repo_branch'),
+        CheckConstraint(
+            "(CASE WHEN workflow_id IS NULL THEN 0 ELSE 1 END)"
+            " + (CASE WHEN custom_file_id IS NULL THEN 0 ELSE 1 END)"
+            " + (CASE WHEN codeowners_id IS NULL THEN 0 ELSE 1 END) = 1",
+            name='ck_file_delivery_one_file',
+        ),
     )
 
 
@@ -955,8 +990,8 @@ class WorkflowRun(Base):
     # which is what ties a run back to a project's workflow.
     workflow_filename = Column(String(255), nullable=False)
     workflow_name = Column(String(255), nullable=True)
-    # Same rationale as WorkflowDriftState.branch: empty string rather than NULL
-    # so rows without a resolved branch still compare equal to each other.
+    # Empty string rather than NULL so rows without a resolved branch still
+    # compare equal to each other.
     branch = Column(String(255), nullable=False, default="", server_default="")
     event = Column(String(50), nullable=True)
     status = Column(String(30), nullable=True)  # queued, in_progress, completed

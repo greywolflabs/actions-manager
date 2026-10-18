@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from auth import user_tokens  # noqa: E402
+from auth import create_auth_session, user_tokens  # noqa: E402
 from main import app  # noqa: E402
 from models import (  # noqa: E402
     Account,
@@ -127,10 +127,21 @@ def _seed_pair(
     return standard, rwx, workflow
 
 
+def _signed_in(github_user):
+    """Headers for a real server-side session as ``github_user`` (#2241)."""
+    db = TestingSessionLocal()
+    try:
+        token = create_auth_session(github_user, db)
+    finally:
+        db.close()
+    return {"Authorization": f"Bearer {token}"}
+
+
 def _link(client, standard, rwx, workflow, user="alice"):
     return client.post(
         f"/api/projects/{standard.project_name}/linked-reusable-workflows",
         json={"github_user": user, "workflow_id": workflow.workflow_id, "rwx_project_id": rwx.project_id},
+        headers=_signed_in(user),
     )
 
 
@@ -259,7 +270,7 @@ def test_invalid_link_is_not_written_to_linked_reusable_workflows(client):
         db.close()
 
 
-def test_invalid_existing_link_does_not_generate_pr_or_commit(client, monkeypatch):
+def test_invalid_existing_link_does_not_generate_pr_or_commit(client, monkeypatch, authenticate_client):
     db = TestingSessionLocal()
     try:
         standard, rwx, workflow = _seed_pair(
@@ -285,6 +296,7 @@ def test_invalid_existing_link_does_not_generate_pr_or_commit(client, monkeypatc
 
     monkeypatch.setattr("workflows._process_reusable_workflows_update", fail_if_called)
     user_tokens["alice"] = "fake-token"
+    authenticate_client(client, "alice", TestingSessionLocal)
 
     response = client.post(
         "/api/create-pull-requests",

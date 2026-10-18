@@ -4,6 +4,7 @@ import { ChevronDown, ChevronLeft, ChevronRight, Plus } from 'lucide-react';
 import { UnifiedWorkflowItem } from '../types/workflow';
 import { normalizeWorkflowFilename, workflowDisplayFilename } from '../utils/workflowFilename';
 import { CustomFile } from '../api/customFiles';
+import type { CodeownersRecord } from '../api/codeowners';
 import {
   PANEL_DEFAULT_WIDTH,
   PANEL_MAX_WIDTH,
@@ -22,8 +23,6 @@ interface UnifiedWorkflowListProps {
   isCollapsed: boolean;
   projectCode: string | null;
   usePrefix?: boolean;
-  loadingStatuses: boolean;
-  workflowStatuses: Record<string, any>;
   selectedRepos: string[];
   projectType?: 'standard' | 'rwx';
   setIsCollapsed: (collapsed: boolean) => void;
@@ -36,11 +35,13 @@ interface UnifiedWorkflowListProps {
   customFiles?: CustomFile[];
   selectedCustomFileId?: number | null;
   onSelectCustomFile?: (id: number) => void;
-  // Project Files: CODEOWNERS
-  codeownersRepos?: string[];
-  selectedCodeownersRepo?: string | null;
-  onSelectCodeowners?: (repo: string) => void;
-  codeownersAggregateStatus?: string;
+  /** Ids of the custom files currently drifted on GitHub. */
+  driftedCustomFileIds?: Set<number>;
+  // Project Files: the project's CODEOWNERS file, listed once the project has a repository
+  codeowners?: CodeownersRecord | null;
+  codeownersSelected?: boolean;
+  codeownersDrifted?: boolean;
+  onSelectCodeowners?: () => void;
 }
 
 const WORKFLOW_STATUS_LABELS: Record<string, { label: string; className: string }> = {
@@ -293,8 +294,6 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
   isCollapsed,
   projectCode,
   usePrefix = true,
-  loadingStatuses,
-  workflowStatuses,
   selectedRepos,
   projectType = 'standard',
   setIsCollapsed,
@@ -304,10 +303,11 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
   customFiles,
   selectedCustomFileId,
   onSelectCustomFile,
-  codeownersRepos,
-  selectedCodeownersRepo,
+  driftedCustomFileIds,
+  codeowners,
+  codeownersSelected = false,
+  codeownersDrifted = false,
   onSelectCodeowners,
-  codeownersAggregateStatus,
 }) => {
   const [panelWidth, setPanelWidth] = React.useState(readStoredPanelWidth);
   const [closedSections, setClosedSections] = React.useState<Set<string>>(readStoredClosedSections);
@@ -357,7 +357,7 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
   // A caller project can hold reusable workflows, but they belong in a Reusable
   // Workflow Project - flag them so the row says so at a glance.
   const flagsReusable = projectType !== 'rwx';
-  const showCodeownersSection = !!codeownersRepos && codeownersRepos.length > 0;
+  const showCodeownersSection = !!onSelectCodeowners && selectedRepos.length > 0;
 
   /**
    * The project prefix the file will carry on GitHub, or '' in no-prefix mode.
@@ -420,8 +420,10 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
 
   const renderCustomFileRow = (cf: CustomFile) => {
     const status = getRowStatus(cf.file_status);
+    const drifted = !!driftedCustomFileIds?.has(cf.id);
     const stateParts = buildStateParts({
       status: status.label,
+      drifted,
       pendingDelete: cf.pending_delete,
     });
     const titleParts = [
@@ -442,6 +444,7 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
         statusClassName={status.className}
         selected={selectedCustomFileId === cf.id}
         onSelect={() => onSelectCustomFile?.(cf.id)}
+        drifted={drifted}
         pendingDelete={cf.pending_delete}
         testId="custom-file-row"
       />
@@ -449,19 +452,23 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
   };
 
   const renderCodeownersRow = () => {
-    const status = getRowStatus(codeownersAggregateStatus);
-    const repoCount = `${codeownersRepos!.length} repo${codeownersRepos!.length !== 1 ? 's' : ''}`;
+    const path = codeowners?.file_path ?? '.github/CODEOWNERS';
+    const status = getRowStatus(codeowners?.status);
+    const repoCount = `${selectedRepos.length} repo${selectedRepos.length !== 1 ? 's' : ''}`;
+    const stateParts = buildStateParts({ status: status.label, drifted: codeownersDrifted });
 
     return (
       <FileRow
         icon={SECTION_ICONS[SECTION_CODEOWNERS]}
-        name=".github/CODEOWNERS"
-        title={['.github/CODEOWNERS', repoCount, status.label].join(DETAIL_SEPARATOR)}
-        ariaLabel={`.github/CODEOWNERS, ${status.label}`}
+        name={path}
+        title={[path, repoCount, ...stateParts].join(DETAIL_SEPARATOR)}
+        ariaLabel={[path, ...stateParts].join(', ')}
         statusLabel={status.label}
         statusClassName={status.className}
-        selected={!!selectedCodeownersRepo}
-        onSelect={() => onSelectCodeowners?.(codeownersRepos?.[0] ?? selectedRepos[0])}
+        selected={codeownersSelected}
+        onSelect={() => onSelectCodeowners?.()}
+        drifted={codeownersDrifted}
+        testId="codeowners-row"
       />
     );
   };

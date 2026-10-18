@@ -613,7 +613,7 @@ class TestPageLoadPRSync:
         the count summary (open/merged/closed) reflects all states.
 
         Merged and closed PRs belong to the separate "PR History" view served
-        by /api/project-pr-history, and must never appear in the active panel
+        by /api/project-pr-campaigns, and must never appear in the active panel
         — otherwise users see resolved PRs as if they still required action.
         """
         from auth import user_tokens
@@ -684,7 +684,7 @@ class TestPageLoadPRSync:
         After every PR has been merged the active panel must surface an
         empty list so the "Pull Requests Open" banner / count UI no longer
         treat the project as having work-in-progress PRs. The historical
-        merged PR remains accessible via /api/project-pr-history.
+        merged PR remains accessible via /api/project-pr-campaigns.
         """
         from auth import user_tokens
         user_tokens["syncuser"] = "fake_token"

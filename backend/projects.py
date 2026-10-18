@@ -7,13 +7,13 @@ import string
 import traceback
 from typing import Annotated, List, Optional
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, Depends, Query, Path, Header, Request
+from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session, aliased
-from sqlalchemy.sql import func, union_all
+from sqlalchemy.sql import and_, func, or_, union_all
 from pydantic import BaseModel, field_validator
 from github_api_tracker import github_get
-from auth import user_tokens, resolve_optional_session_user
+from auth import CurrentAccount, user_tokens
 from models import (
     Project,
     Account,
@@ -30,22 +30,36 @@ from models import (
     Codeowners,
     RepoWorkflowOverride,
     CustomFile,
-    WorkflowDriftState,
     ProjectDisplayOrder,
     generate_project_key_from_name,
 )
 from database import get_db
+import deliveries
+from drift_notifications import resolve_drift_for_local_edit
 from workflows import (
-    cleanup_orphaned_workflows,
+    project_hint,
+    PROJECT_DELETED,
+    ProjectDeleted,
     create_or_update_workflow,
+    delete_project_record,
+    _listed_kind_change,
+    _assert_kind_changes_allowed,
     format_workflow_name,
     resolve_branch_config_for_repo,
     _normalize_reusable_workflow_name,
     _reusable_workflow_ids_locked_by_open_campaign,
     _utc_iso,
+    settle_project_and_linked,
 )
 from tier_service import check_new_project, check_repo_limit, check_private_visibility_scope
-from authorization import check_project_access, is_project_admin
+from authorization import (
+    PROJECT_ROLE_LEVEL,
+    find_project_by_name,
+    get_current_user,
+    has_project_role,
+    is_project_admin,
+    project_role,
+)
 from models import WorkspaceMember
 from reusable_workflow_visibility import (
     reusable_workflow_validation_payload,
@@ -64,7 +78,7 @@ _ERROR_RESPONSES = {
     401: {"description": _ERR_AUTH_REQUIRED},
     403: {"description": "Access denied"},
     404: {"description": "Not found"},
-    409: {"description": "Name is held by a workflow queued for removal"},
+    409: {"description": "Name conflict: held by a workflow queued for removal, or shared by more than one project"},
     422: {"description": "Request failed validation"},
     500: {"description": "Internal server error"},
 }
@@ -171,16 +185,15 @@ def _enforce_project_color_type_restriction(
     )
 
 
-def _resolve_caller(db: Session, x_github_user: Optional[str]):
-    """Look up the calling user's Account and WorkspaceMember from the
-    ``X-GitHub-User`` header value.
+def _resolve_caller(db: Session, github_user: Optional[str]):
+    """Look up the session caller's Account and WorkspaceMember by username.
 
     Returns ``(account, workspace_member)`` or ``(None, None)`` if no
-    header / user not found.
+    username / user not found.
     """
-    if not x_github_user:
+    if not github_user:
         return None, None
-    caller = db.query(Account).filter(Account.github_user == x_github_user).first()
+    caller = db.query(Account).filter(Account.github_user == github_user).first()
     if not caller:
         return None, None
     member = (
@@ -191,116 +204,53 @@ def _resolve_caller(db: Session, x_github_user: Optional[str]):
     return caller, member
 
 
-def _find_project_by_id(db: Session, project_id: int, caller_member, github_user: str = None):
-    """Look up a project by *project_id*, considering the caller's access.
+# The session caller, for routes whose ``github_user`` names a project owner
+# rather than the caller (#2241); CurrentAccount would refuse that name.
+SessionAccount = Annotated[Account, Depends(get_current_user)]
 
-    Privileged workspace members (admin) can access any project.
-    Members fall through to ProjectMembership lookup.
-    Other users fall back to ownership-based lookup.
 
-    Returns the Project or ``None``.
+def _owner_name(caller_member, account: Account, named: Optional[str]) -> Optional[str]:
+    """Whose project a name or id means (#2241).
+
+    With workspace members, the grant and editor checks that follow the lookup
+    decide access, so the named owner (or none) is passed on unchanged and only
+    picks between same-named projects. Without any, the lookup's ownership
+    fallback is the only check, so the caller means their own projects, and
+    naming another owner is refused rather than handing over their project, or
+    quietly acting on the caller's own project of the same name.
     """
-    if caller_member and is_project_admin(caller_member):
-        # Privileged users — find by ID alone (no ownership filter)
-        return db.query(Project).filter(Project.project_id == project_id).first()
+    named = (named or "").strip()
+    if caller_member is not None:
+        return named or None
+    if named and named.lower() != account.github_user.lower():
+        raise HTTPException(status_code=403, detail=_ERR_NO_ACCESS)
+    return account.github_user
 
-    # Non-admin members (member, read_only): check ProjectMembership for explicit project access
-    if caller_member:
-        pm = db.query(ProjectMembership).filter(
-            ProjectMembership.user_id == caller_member.user_id,
-            ProjectMembership.project_id == project_id,
-        ).first()
-        if pm:
-            return db.query(Project).filter(Project.project_id == project_id).first()
 
-    # Fallback: try ownership check for backward compat
-    if github_user:
-        user = db.query(Account).filter(Account.github_user == github_user.strip()).first()
-        if user:
-            owned = db.query(Project).filter(
-                Project.project_id == project_id,
-                Project.user_id == user.user_id,
-            ).first()
-            if owned:
-                return owned
+def _caller_account(db: Session, caller_member, github_user: Optional[str]) -> Optional[Account]:
+    """The session caller: the workspace member when there is one, else the account named *github_user*."""
+    if caller_member is not None:
+        return db.get(Account, caller_member.user_id)
+    if not github_user:
+        return None
+    return db.query(Account).filter(Account.github_user == github_user.strip()).first()
 
-    # A full member sees every project in this single-workspace model, by id as
-    # well as by name. Without this a member could open a project and then have
-    # its by-id screens - build metrics, backup export - answer 404: the same
-    # "listed but will not open" symptom, one screen along.
-    if caller_member and caller_member.workspace_role == "member":
-        return db.query(Project).filter(Project.project_id == project_id).first()
 
-    return None
+def _find_project_by_id(db: Session, project_id: int, caller_member, github_user: str = None):
+    """The project *project_id* names when the caller may see it, else None (see authorization.project_role)."""
+    project = db.get(Project, project_id) if project_id else None
+    return project if project_role(db, _caller_account(db, caller_member, github_user), project) else None
 
 
 def _find_project_by_name(db: Session, project_name: str, caller_member, github_user: str = None):
-    """Look up a project by *project_name*, considering the caller's access.
+    """The project *project_name* means for the caller (see authorization.find_project_by_name).
 
-    Privileged workspace members (admin) can access any project.
-    To avoid ambiguity when ``project_name`` is not globally unique, the
-    lookup first tries the owner-scoped query (using *github_user*) and
-    only falls back to a global name match when that does not produce a
-    result.
-
-    Members fall through to ProjectMembership-based lookup.
-    Other users fall back to ownership-based lookup.
-
-    Returns the Project or ``None``.
+    With a workspace member, *github_user* names the owner to prefer among
+    same-named projects; without one it is the caller (see _owner_name).
     """
-    if caller_member and is_project_admin(caller_member):
-        # Privileged users — try owner-scoped lookup first for disambiguation
-        if github_user:
-            owner = db.query(Account).filter(Account.github_user == github_user.strip()).first()
-            if owner:
-                project = db.query(Project).filter(
-                    Project.project_name.ilike(project_name.strip()),
-                    Project.user_id == owner.user_id,
-                ).first()
-                if project:
-                    return project
-        # Fallback: global name match (single-workspace model)
-        return db.query(Project).filter(
-            Project.project_name.ilike(project_name.strip())
-        ).first()
-
-    # Non-admin members (member, read_only): an explicit grant resolves first,
-    # so a name the caller was granted wins over a same-named project they only
-    # see by virtue of membership.
-    if caller_member and caller_member.workspace_role in ("member", "read_only"):
-        project = db.query(Project).join(
-            ProjectMembership, ProjectMembership.project_id == Project.project_id
-        ).filter(
-            Project.project_name.ilike(project_name.strip()),
-            ProjectMembership.user_id == caller_member.user_id,
-        ).first()
-        if project:
-            return project
-
-    # Non-privileged: ownership check required
-    if github_user:
-        user = db.query(Account).filter(Account.github_user == github_user.strip()).first()
-        if user:
-            owned = db.query(Project).filter(
-                Project.project_name.ilike(project_name.strip()),
-                Project.user_id == user.user_id,
-            ).first()
-            if owned:
-                return owned
-
-    # A full member sees every project in this single-workspace model, so a name
-    # they hold no grant for still resolves. read_only does not.
-    #
-    # Last, deliberately. Project names are unique per owner, not globally, so
-    # resolving workspace-wide ahead of the owner-scoped lookup above would make
-    # a caller's own project unreachable by name and hand them somebody else's
-    # same-named one - on a destructive route, the wrong project entirely.
-    if caller_member and caller_member.workspace_role == "member":
-        return db.query(Project).filter(
-            Project.project_name.ilike(project_name.strip())
-        ).first()
-
-    return None
+    account = _caller_account(db, caller_member, github_user)
+    owner_name = github_user if caller_member is not None else None
+    return find_project_by_name(db, account, project_name, owner_name=owner_name, hint=project_hint())
 
 # ✅ Define Schema for Workflows
 class WorkflowSchema(BaseModel):
@@ -320,7 +270,6 @@ class ProjectSchema(BaseModel):
     selected_repos: list[str]
     workflows: list[WorkflowSchema]
     rxworkflows: list[WorkflowSchema] = [] 
-    github_user: Optional[str] = None
     branch_regex: str = ""
     branch_option: str = "default"  # default, pattern
     branch_max_age_days: int = 30  # Filter branches by recency (1-30 days)
@@ -369,6 +318,12 @@ class ProjectSchema(BaseModel):
         return normalized
 
 
+class ProjectUpdateSchema(ProjectSchema):
+    """Update payload. ``github_user`` names the project's owner, not the caller."""
+
+    github_user: Optional[str] = None
+
+
 class ProjectOrderUpdateSchema(BaseModel):
     """Payload for saving a user's manual Projects-grid order (issue #1804).
 
@@ -376,7 +331,6 @@ class ProjectOrderUpdateSchema(BaseModel):
     row, so projects.updated_at is untouched.
     """
 
-    github_user: Optional[str] = None
     project_ids: List[int]
 
     @field_validator("project_ids")
@@ -453,11 +407,6 @@ class ProjectNameUpdateSchema(BaseModel):
             raise ValueError("project_name must not be empty")
         return stripped
 
-
-class ReusableWorkflowToggleSchema(BaseModel):
-    github_user: Optional[str] = None
-    project_name: str
-    enabled: bool
 
 class LinkWorkflowSchema(BaseModel):
     github_user: Optional[str] = None
@@ -561,6 +510,12 @@ def _validate_create_request(db: Session, project: ProjectSchema, github_user: s
         print(f"❌ POST /api/projects/ - GitHub user '{github_user}' not found")
         raise HTTPException(status_code=404, detail=GITHUB_USER_NOT_FOUND)
 
+    # A second project of the same name would leave name lookups picking
+    # either one (#2338); saving an existing project is PUT /projects/{id}/.
+    name = project.project_name.strip()
+    if _owner_has_project_named(db, user.user_id, name):
+        raise HTTPException(status_code=409, detail=f"You already have a project named '{name}'. Choose another name.")
+
     counts_by_type = dict(
         db.query(Project.project_type, func.count(Project.project_id))
         .filter(Project.user_id == user.user_id)
@@ -626,59 +581,36 @@ def _enforce_repo_limit_on_update(db: Session, existing_project: Project, select
         raise HTTPException(status_code=403, detail=error_msg)
 
 
-def _get_or_create_project(db: Session, user_id: int, project: ProjectSchema) -> Project:
-    """Fetch an existing project by name or create a new one.
+def _create_project_row(db: Session, user_id: int, project: ProjectSchema) -> Project:
+    """Create the project row; _validate_create_request has refused a taken name.
 
-    Flushes to obtain a primary key for new records but leaves the final
-    commit to the caller so the whole request stays in one transaction.
+    Flushes to obtain a primary key but leaves the final commit to the caller
+    so the whole request stays in one transaction.
     """
-    existing_project = db.query(Project).filter(
-        Project.project_name.ilike(project.project_name.strip()),
-        Project.user_id == user_id
-    ).first()
-
-    if existing_project:
-        if "project_color" in project.model_fields_set:
-            _enforce_project_color_type_restriction(
-                existing_project.project_type,
-                project.project_color,
-                existing_project.project_color,
-            )
-        existing_project.branch_regex = project.branch_regex.strip()
-        existing_project.branch_option = project.branch_option.strip()
-        existing_project.branch_max_age_days = project.branch_max_age_days
-        existing_project.reusable_workflows_enabled = project.reusable_workflows_enabled
-        existing_project.use_prefix = project.use_prefix
-        existing_project.repository_visibility_scope = project.repository_visibility_scope
-        if "project_color" in project.model_fields_set:
-            existing_project.project_color = project.project_color
-        # Explicitly update the updated_at timestamp to ensure it reflects the save operation
-        existing_project.updated_at = func.now()
-    else:
-        if "project_color" in project.model_fields_set:
-            _enforce_project_color_type_restriction(project.project_type, project.project_color)
-        # Generate project key based on name and custom input
-        project_key = generate_unique_project_key(db, project.project_name, project.custom_project_key)
-        existing_project = Project(
-            project_name=project.project_name.strip(),
-            user_id=user_id,
-            branch_regex=project.branch_regex.strip(),
-            branch_option=project.branch_option.strip(),
-            branch_max_age_days=project.branch_max_age_days,
-            project_code=project_key,
-            reusable_workflows_enabled=project.reusable_workflows_enabled,
-            project_type=project.project_type,
-            repository_visibility_scope=project.repository_visibility_scope,
-        )
-        if "project_color" in project.model_fields_set:
-            existing_project.project_color = project.project_color
-        # Explicitly set use_prefix after object creation to ensure it's not ignored
-        existing_project.use_prefix = project.use_prefix
-        db.add(existing_project)
+    if "project_color" in project.model_fields_set:
+        _enforce_project_color_type_restriction(project.project_type, project.project_color)
+    # Generate project key based on name and custom input
+    project_key = generate_unique_project_key(db, project.project_name, project.custom_project_key)
+    new_project = Project(
+        project_name=project.project_name.strip(),
+        user_id=user_id,
+        branch_regex=project.branch_regex.strip(),
+        branch_option=project.branch_option.strip(),
+        branch_max_age_days=project.branch_max_age_days,
+        project_code=project_key,
+        reusable_workflows_enabled=project.reusable_workflows_enabled,
+        project_type=project.project_type,
+        repository_visibility_scope=project.repository_visibility_scope,
+    )
+    if "project_color" in project.model_fields_set:
+        new_project.project_color = project.project_color
+    # Explicitly set use_prefix after object creation to ensure it's not ignored
+    new_project.use_prefix = project.use_prefix
+    db.add(new_project)
 
     db.flush()
-    db.refresh(existing_project)
-    return existing_project
+    db.refresh(new_project)
+    return new_project
 
 
 def _normalize_repo_names(selected_repos: list[str]) -> set[str]:
@@ -827,44 +759,54 @@ def _reusable_workflows_to_save(db: Session, project: ProjectSchema, project_id:
     return keep
 
 
-def _process_project_workflows(db: Session, project: ProjectSchema, project_id: int, last_modified_by: str = None) -> None:
+def _process_project_workflows(db: Session, project: ProjectSchema, project_id: int, last_modified_by: str = None) -> list:
     """Process regular and reusable workflows for a project.
 
     Empty workflow entries (blank name or content) are skipped. New reusable
     workflows are only created when the feature is enabled on the project;
-    edits to reusable workflows it already owns always save.
+    edits to reusable workflows it already owns always save. Returns the
+    workflows whose trigger gave them the other kind, for the UI to move (#2318).
     """
+    reusable_to_save = _reusable_workflows_to_save(db, project, project_id)
+    _assert_kind_changes_allowed(
+        db, project_id,
+        [(w, False) for w in project.workflows] + [(w, True) for w in reusable_to_save],
+    )
+    kind_changes = []
     # Process regular workflows - skip empty ones
     for workflow in project.workflows:
         if _is_workflow_non_empty(workflow):
             print(f"✅ ✅ REG workflow: name='{workflow.name}', content_length={len(workflow.content)}")
-            create_or_update_workflow(db, workflow, project_id, is_reusable=False, last_modified_by=last_modified_by)
+            saved = create_or_update_workflow(db, workflow, project_id, is_reusable=False, last_modified_by=last_modified_by)
+            kind_changes += _listed_kind_change(saved, False)
         else:
             print(f"⚠️ Skipping empty regular workflow: name='{workflow.name}', content_length={len(workflow.content) if workflow.content else 0}")
 
-    for workflow in _reusable_workflows_to_save(db, project, project_id):
+    for workflow in reusable_to_save:
         if _is_workflow_non_empty(workflow):
             print(f"✅ RW workflow: name='{workflow.name}', content_length={len(workflow.content)}")
-            create_or_update_workflow(db, workflow, project_id, is_reusable=True, last_modified_by=last_modified_by)
+            saved = create_or_update_workflow(db, workflow, project_id, is_reusable=True, last_modified_by=last_modified_by)
+            kind_changes += _listed_kind_change(saved, True)
         else:
             print(f"⚠️ Skipping empty reusable workflow: name='{workflow.name}', content_length={len(workflow.content) if workflow.content else 0}")
+    return kind_changes
 
 
 @router.post(
     "/projects/",
     responses={
-        **_responses(400, 401, 403, 404, 409, 500),
+        **_responses(400, 401, 403, 404, 500),
+        409: {"description": "Name conflict: you already have a project with that name, "
+                             "or a workflow name is held by one queued for removal or shared by more than one project"},
         422: {"description": "Invalid project_color for this project type"},
     },
 )
 def create_project(
     project: ProjectSchema,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: CurrentAccount,
 ):
-    github_user = x_github_user or (project.github_user or "")
-    if not github_user:
-        raise HTTPException(status_code=401, detail=_ERR_AUTH_REQUIRED)
+    github_user = account.github_user
     try:
         user = _validate_create_request(db, project, github_user)
         print(f"✅ POST /api/projects/ - Creating project '{project.project_name}' for user '{github_user}'")
@@ -879,21 +821,21 @@ def create_project(
 
     # Wrap the main creation logic in exception handling
     try:
-        existing_project = _get_or_create_project(db, user.user_id, project)
-        # Audit: record who created/saved this project
-        existing_project.last_modified_by = github_user.strip()
-        _process_project_repos(db, existing_project.project_id, project.selected_repos)
-        _sync_validation_repo(db, existing_project, project, github_user=github_user)
-        # Don't delete ProjectWorkflow associations - let create_or_update_workflow handle updates
-        _process_project_workflows(db, project, existing_project.project_id, last_modified_by=github_user.strip())
-        update_project_state_if_needed(existing_project, project.workflows, project.rxworkflows)
+        new_project = _create_project_row(db, user.user_id, project)
+        # Audit: record who created this project
+        new_project.last_modified_by = github_user.strip()
+        _process_project_repos(db, new_project.project_id, project.selected_repos)
+        _sync_validation_repo(db, new_project, project, github_user=github_user)
+        kind_changes = _process_project_workflows(db, project, new_project.project_id, last_modified_by=github_user.strip())
+        update_project_state_if_needed(new_project, project.workflows, project.rxworkflows)
         db.commit()
 
         return {
             "message": "✅ Project saved successfully!",
-            "project_id": existing_project.project_id,
-            "project_code": existing_project.project_code,
-            "pr_state": existing_project.pr_state,
+            "project_id": new_project.project_id,
+            "project_code": new_project.project_code,
+            "pr_state": new_project.pr_state,
+            "kind_changes": kind_changes,
         }
     except HTTPException:
         db.rollback()
@@ -905,19 +847,43 @@ def create_project(
         raise HTTPException(status_code=500, detail="Internal server error during project creation")
 
 
-def _require_project_editor(db: Session, caller_member, project_id: int) -> None:
-    """Enforce that the caller has at least ``project_editor`` access to *project_id*.
+def _require_project_editor(db: Session, account: Account, project: Project) -> None:
+    """Enforce at least project_editor on *project* (see authorization.project_role). Raises 403."""
+    role = project_role(db, account, project)
+    if role is None:
+        raise HTTPException(status_code=403, detail=_ERR_NO_ACCESS)
+    if PROJECT_ROLE_LEVEL[role] < PROJECT_ROLE_LEVEL["project_editor"]:
+        raise HTTPException(status_code=403, detail=_ERR_INSUFFICIENT_PROJECT_ROLE)
 
-    Admin workspace members always pass. Non-admin members must hold an explicit
-    ``project_editor`` (or higher) ``ProjectMembership``; ``project_viewer`` members
-    are rejected. Raises HTTPException(403) on failure.
+
+def _owner_has_project_named(db: Session, user_id: int, name: str, exclude_id: Optional[int] = None) -> bool:
+    """Whether the owner has a project of *name*, compared the way lookups compare."""
+    query = db.query(Project.project_id).filter(
+        Project.user_id == user_id,
+        func.lower(Project.project_name) == func.lower(name),
+    )
+    if exclude_id is not None:
+        query = query.filter(Project.project_id != exclude_id)
+    return query.first() is not None
+
+
+def _assert_project_name_free(db: Session, project: Project, new_name: str) -> None:
+    """Refuse a name the project's owner already uses for another project (#2250).
+
+    Lookups by name take the owner's first match, compared this same way, so a
+    second project of that name would leave them acting on either one. An
+    unchanged name is not checked, so a pair named alike before this existed
+    can still be saved, and renamed apart.
     """
-    if caller_member and not is_project_admin(caller_member):
-        effective_role = check_project_access(db, caller_member, project_id)
-        if effective_role is None:
-            raise HTTPException(status_code=403, detail=_ERR_NO_ACCESS)
-        if effective_role != "project_editor":
-            raise HTTPException(status_code=403, detail=_ERR_INSUFFICIENT_PROJECT_ROLE)
+    if new_name == project.project_name:
+        return
+    # The name sent, not the stored one: an editor of this project may not be
+    # able to see the owner's other projects.
+    if _owner_has_project_named(db, project.user_id, new_name, exclude_id=project.project_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"This project's owner already has a project named '{new_name}'. Choose another name.",
+        )
 
 
 @router.put(
@@ -931,7 +897,7 @@ def _require_project_editor(db: Session, caller_member, project_id: int) -> None
 def update_project_order(
     payload: ProjectOrderUpdateSchema,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: CurrentAccount,
 ):
     """Save the caller's manual ordering of the Projects grid (issue #1804).
 
@@ -942,7 +908,7 @@ def update_project_order(
     caller's accessible projects exactly.
     """
     try:
-        caller_member = _resolve_caller_member(db, x_github_user)
+        _, caller_member = _resolve_caller(db, account.github_user)
         if caller_member is None:
             raise HTTPException(status_code=401, detail="Authentication required to save project order")
 
@@ -998,31 +964,36 @@ def update_project_order(
 @router.put(
     "/projects/{project_id}/",
     responses={
-        **_responses(400, 409, 500),
+        **_responses(400, 500),
+        401: {"description": _ERR_AUTH_REQUIRED},
         403: {"description": "Access denied"},
         404: {"description": _ERR_PROJECT_NOT_FOUND_PLAIN},
+        409: {"description": "Name conflict: the project's owner already has a project with that name, "
+                             "or a workflow name is held by one queued for removal or shared by more than one project"},
         422: {"description": "Invalid project_color for this project type"},
     },
 )
 def update_project(
     project_id: int,
-    project: ProjectSchema,
+    project: ProjectUpdateSchema,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: SessionAccount,
 ):
     try:
-        # Resolve caller identity from header (set by apiClient interceptor)
-        _caller, caller_member = _resolve_caller(db, x_github_user)
+        _, caller_member = _resolve_caller(db, account.github_user)
 
         # Find the project — privileged users are not restricted to ownership
-        existing_project = _find_project_by_id(db, project_id, caller_member, project.github_user)
+        existing_project = _find_project_by_id(
+            db, project_id, caller_member, _owner_name(caller_member, account, project.github_user)
+        )
         if not existing_project:
-            print(f"❌ PUT /projects/{project_id}/ - Project not found (caller='{x_github_user}', github_user='{project.github_user}')")
+            print(f"❌ PUT /projects/{project_id}/ - Project not found (caller='{account.github_user}', github_user='{project.github_user}')")
             raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND_PLAIN)
 
-        _require_project_editor(db, caller_member, existing_project.project_id)
+        _require_project_editor(db, account, existing_project)
+        _assert_project_name_free(db, existing_project, project.project_name.strip())
 
-        print(f"✅ PUT /projects/{project_id}/ - Updating project '{existing_project.project_name}' (caller='{x_github_user}')")
+        print(f"✅ PUT /projects/{project_id}/ - Updating project '{existing_project.project_name}' (caller='{account.github_user}')")
         
     except HTTPException:
         # Re-raise HTTP exceptions
@@ -1081,33 +1052,38 @@ def update_project(
         # Explicitly update the updated_at timestamp to ensure it reflects the save operation
         existing_project.updated_at = func.now()
         # Audit: record who updated this project
-        existing_project.last_modified_by = (x_github_user or project.github_user or "").strip() or None
+        existing_project.last_modified_by = account.github_user
 
         _enforce_repo_limit_on_update(db, existing_project, project.selected_repos)
+        reusable_to_save = _reusable_workflows_to_save(db, project, existing_project.project_id)
+        _assert_kind_changes_allowed(
+            db, existing_project.project_id,
+            [(w, False) for w in project.workflows] + [(w, True) for w in reusable_to_save],
+        )
         # Preserve per-repo branch overrides on associations that survive.
         _process_project_repos(db, existing_project.project_id, project.selected_repos)
-        _github_user_for_sync = (x_github_user or project.github_user or "").strip() or ""
-        _sync_validation_repo(db, existing_project, project, github_user=_github_user_for_sync, preserve_unset=True)
+        _sync_validation_repo(db, existing_project, project, github_user=account.github_user, preserve_unset=True)
 
         # Don't delete ProjectWorkflow associations - let create_or_update_workflow handle updates
 
-        # Determine the caller for audit tracking
-        _last_modifier = (x_github_user or project.github_user or "").strip() or None
-
-        # Process regular workflows - skip empty ones
+        # Process regular workflows - skip empty ones. A workflow whose trigger
+        # changed its kind is reported back so the UI can move it (#2318).
+        kind_changes = []
         for workflow in project.workflows:
             if workflow.name and workflow.name.strip() and workflow.content and workflow.content.strip():
                 print(f"✅ REG: {workflow}")
-                create_or_update_workflow(db, workflow, existing_project.project_id, is_reusable=False, last_modified_by=_last_modifier)
+                saved = create_or_update_workflow(db, workflow, existing_project.project_id, is_reusable=False, last_modified_by=account.github_user)
+                kind_changes += _listed_kind_change(saved, False)
             else:
                 print(f"⚠️ Skipping empty regular workflow: name='{workflow.name}', content_length={len(workflow.content) if workflow.content else 0}")
 
         # New reusable workflows need the feature enabled; edits to ones the
         # project already owns always save - see _reusable_workflows_to_save.
-        for workflow in _reusable_workflows_to_save(db, project, existing_project.project_id):
+        for workflow in reusable_to_save:
             if workflow.name and workflow.name.strip() and workflow.content and workflow.content.strip():
                 print(f"✅ ❌ ❌ RW: {workflow}")
-                create_or_update_workflow(db, workflow, existing_project.project_id, is_reusable=True, last_modified_by=_last_modifier)
+                saved = create_or_update_workflow(db, workflow, existing_project.project_id, is_reusable=True, last_modified_by=account.github_user)
+                kind_changes += _listed_kind_change(saved, True)
             else:
                 print(f"⚠️ Skipping empty reusable workflow: name='{workflow.name}', content_length={len(workflow.content) if workflow.content else 0}")
 
@@ -1147,6 +1123,7 @@ def update_project(
             "pr_state": existing_project.pr_state,
             "pending_delivery_repos": pending_delivery_repos,
             "pending_delivery_known": pending_delivery_known,
+            "kind_changes": kind_changes,
         }
         
     except HTTPException:
@@ -1155,7 +1132,7 @@ def update_project(
     except Exception as e:
         print(f"❌ PUT /projects/{project_id}/ - Error during project update: {e}")
         db.rollback()  # Rollback the transaction on error
-        raise HTTPException(status_code=500, detail=f"Internal server error during project update: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error during project update")
 
 
 
@@ -1163,6 +1140,7 @@ def update_project(
     "/projects/{project_id}/project-color",
     responses={
         **_responses(500),
+        401: {"description": _ERR_AUTH_REQUIRED},
         403: {"description": "Access denied"},
         404: {"description": _ERR_PROJECT_NOT_FOUND_PLAIN},
         422: {"description": "Invalid project_color for this project type"},
@@ -1172,21 +1150,23 @@ def update_project_color(
     project_id: int,
     payload: ProjectColorUpdateSchema,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: SessionAccount,
 ):
     """Update a project's identity color without triggering GitHub writes."""
     try:
-        _caller, caller_member = _resolve_caller(db, x_github_user)
+        _, caller_member = _resolve_caller(db, account.github_user)
 
-        existing_project = _find_project_by_id(db, project_id, caller_member, payload.github_user)
+        existing_project = _find_project_by_id(
+            db, project_id, caller_member, _owner_name(caller_member, account, payload.github_user)
+        )
         if not existing_project:
             print(
                 f"❌ PATCH /projects/{project_id}/project-color - Project not found "
-                f"(caller='{x_github_user}', github_user='{payload.github_user}')"
+                f"(caller='{account.github_user}', github_user='{payload.github_user}')"
             )
             raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND_PLAIN)
 
-        _require_project_editor(db, caller_member, existing_project.project_id)
+        _require_project_editor(db, account, existing_project)
 
         _enforce_project_color_type_restriction(
             existing_project.project_type,
@@ -1196,7 +1176,7 @@ def update_project_color(
 
         print(
             f"✅ PATCH /projects/{project_id}/project-color - Updating color for "
-            f"project '{existing_project.project_name}' (caller='{x_github_user}')"
+            f"project '{existing_project.project_name}' (caller='{account.github_user}')"
         )
     except HTTPException:
         raise
@@ -1207,7 +1187,7 @@ def update_project_color(
     try:
         existing_project.project_color = payload.project_color
         existing_project.updated_at = func.now()
-        existing_project.last_modified_by = (x_github_user or payload.github_user or "").strip() or None
+        existing_project.last_modified_by = account.github_user
         db.commit()
         return {
             "message": "✅ Project color updated successfully!",
@@ -1224,6 +1204,7 @@ def update_project_color(
 @router.patch(
     "/projects/{project_id}/drift-config",
     responses={
+        401: {"description": _ERR_AUTH_REQUIRED},
         403: {"description": "Access denied"},
         404: {"description": _ERR_PROJECT_NOT_FOUND_PLAIN},
         422: {"description": "Invalid drift_check_interval_minutes"},
@@ -1236,7 +1217,7 @@ def update_project_drift_config(
     project_id: int,
     payload: ProjectDriftConfigUpdateSchema,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: SessionAccount,
 ):
     """Set how often the background sweep checks this project for drift.
 
@@ -1244,17 +1225,19 @@ def update_project_drift_config(
     never runs a check itself. The next sweep tick picks up the new cadence.
     """
     try:
-        _caller, caller_member = _resolve_caller(db, x_github_user)
+        _, caller_member = _resolve_caller(db, account.github_user)
 
-        existing_project = _find_project_by_id(db, project_id, caller_member, payload.github_user)
+        existing_project = _find_project_by_id(
+            db, project_id, caller_member, _owner_name(caller_member, account, payload.github_user)
+        )
         if not existing_project:
             print(
                 f"❌ PATCH /projects/{project_id}/drift-config - Project not found "
-                f"(caller='{x_github_user}', github_user='{payload.github_user}')"
+                f"(caller='{account.github_user}', github_user='{payload.github_user}')"
             )
             raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND_PLAIN)
 
-        _require_project_editor(db, caller_member, existing_project.project_id)
+        _require_project_editor(db, account, existing_project)
     except HTTPException:
         raise
     except Exception as e:
@@ -1264,7 +1247,7 @@ def update_project_drift_config(
     try:
         existing_project.drift_check_interval_minutes = payload.drift_check_interval_minutes
         existing_project.updated_at = func.now()
-        existing_project.last_modified_by = (x_github_user or payload.github_user or "").strip() or None
+        existing_project.last_modified_by = account.github_user
         db.commit()
         return {
             "message": "✅ Drift check schedule updated successfully!",
@@ -1281,8 +1264,10 @@ def update_project_drift_config(
 @router.patch(
     "/projects/{project_id}/project-name",
     responses={
+        401: {"description": _ERR_AUTH_REQUIRED},
         403: {"description": _ERR_INSUFFICIENT_PROJECT_ROLE},
         404: {"description": _ERR_PROJECT_NOT_FOUND_PLAIN},
+        409: {"description": "The project's owner already has a project with that name"},
         500: {"description": "Internal server error"},
     },
 )
@@ -1290,41 +1275,34 @@ def update_project_name(
     project_id: int,
     payload: ProjectNameUpdateSchema,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: SessionAccount,
 ):
     """Update a project's display name without triggering GitHub writes.
 
     project_code is never touched — it is immutable after creation.
     """
     try:
-        caller, caller_member = _resolve_caller(db, x_github_user)
+        _, caller_member = _resolve_caller(db, account.github_user)
 
-        existing_project = _find_project_by_id(db, project_id, caller_member, payload.github_user)
+        existing_project = _find_project_by_id(
+            db, project_id, caller_member, _owner_name(caller_member, account, payload.github_user)
+        )
         if not existing_project:
             print(
                 f"❌ PATCH /projects/{project_id}/project-name - Project not found "
-                f"(caller='{x_github_user}', github_user='{payload.github_user}')"
+                f"(caller='{account.github_user}', github_user='{payload.github_user}')"
             )
             raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND_PLAIN)
 
         # Renaming is a write. _find_project_by_id accepts any ProjectMembership
         # regardless of project_role, so without this a documented read-only
         # project_viewer could rename the project.
-        #
-        # Owners are allowed through explicitly. ProjectMembership rows are only
-        # ever created by the admin "add project member" route, never at project
-        # creation, and check_project_access has no ownership fast-path — so a
-        # non-admin owner of their own project has no membership row and
-        # _require_project_editor alone would lock them out of renaming it.
-        _caller_owns_project = (
-            caller is not None and existing_project.user_id == caller.user_id
-        )
-        if not _caller_owns_project:
-            _require_project_editor(db, caller_member, existing_project.project_id)
+        _require_project_editor(db, account, existing_project)
+        _assert_project_name_free(db, existing_project, payload.project_name)
 
         print(
             f"✅ PATCH /projects/{project_id}/project-name - Renaming project "
-            f"'{existing_project.project_name}' → '{payload.project_name}' (caller='{x_github_user}')"
+            f"'{existing_project.project_name}' → '{payload.project_name}' (caller='{account.github_user}')"
         )
     except HTTPException:
         raise
@@ -1335,7 +1313,7 @@ def update_project_name(
     try:
         existing_project.project_name = payload.project_name
         existing_project.updated_at = func.now()
-        existing_project.last_modified_by = (x_github_user or payload.github_user or "").strip() or None
+        existing_project.last_modified_by = account.github_user
         db.commit()
         return {
             "message": "✅ Project name updated successfully!",
@@ -1348,57 +1326,6 @@ def update_project_name(
         traceback.print_exc()
         db.rollback()
         raise HTTPException(status_code=500, detail="Internal server error during project name update")
-
-
-def _resolve_caller_member(db: Session, x_github_user: Optional[str]):
-    """Resolve the calling user's workspace membership from the X-GitHub-User header."""
-    if not x_github_user:
-        return None
-    caller = db.query(Account).filter(Account.github_user == x_github_user).first()
-    if not caller:
-        return None
-    return (
-        db.query(WorkspaceMember)
-        .filter(WorkspaceMember.user_id == caller.user_id)
-        .first()
-    )
-
-
-def _resolve_display_order_member(db: Session, request, x_github_user: Optional[str]):
-    """Identity used to pick whose saved project order to apply.
-
-    get_projects authorizes from the X-GitHub-User header, but the frontend's
-    apiClient authenticates GETs with the session cookie alone, so that header
-    is usually absent — without this fallback the saved order would silently
-    never apply in the real app. Falls back to the session rather than the
-    client-supplied github_user query param, which is spoofable and would let a
-    caller read another user's arrangement.
-    """
-    member = _resolve_caller_member(db, x_github_user)
-    if member is not None:
-        return member
-
-    session_user = resolve_optional_session_user(request, db)
-    if session_user is None:
-        return None
-    return (
-        db.query(WorkspaceMember)
-        .filter(WorkspaceMember.user_id == session_user.user_id)
-        .first()
-    )
-
-
-def _delete_project_display_order(db: Session, project_id: int) -> None:
-    """Remove every user's saved position for a project being deleted.
-
-    Cascade now handles this on both databases (issue #1811 enabled SQLite's
-    `PRAGMA foreign_keys`, which had made every ON DELETE CASCADE a no-op).
-    Kept as belt-and-braces so the cleanup is explicit at the call site and does
-    not depend on engine configuration.
-    """
-    db.query(ProjectDisplayOrder).filter(
-        ProjectDisplayOrder.project_id == project_id
-    ).delete(synchronize_session=False)
 
 
 def _accessible_project_ids(db: Session, caller_member) -> set:
@@ -1526,12 +1453,10 @@ def _effective_pr_state(
 
 @router.get("/projects/")
 def get_projects(
-    github_user: str,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: CurrentAccount,
 ):
-    """Fetches all projects for a given GitHub user, filtered by the caller's access."""
+    """Fetches all projects, filtered by the session caller's access (#2241)."""
     # Build a combined workflow count per project that includes both:
     #   1. Own workflows (ProjectWorkflow rows)
     #   2. Linked reusable workflows (LinkedReusableWorkflow rows for standard projects)
@@ -1552,15 +1477,13 @@ def get_projects(
         .subquery()
     )
 
-    caller_member = _resolve_caller_member(db, x_github_user)
+    _, caller_member = _resolve_caller(db, account.github_user)
 
     if caller_member and not is_project_admin(caller_member) and caller_member.workspace_role == "read_only":
-        # read_only: only the projects the caller is explicitly assigned to via
-        # ProjectMembership (regardless of project owner — projects may belong
-        # to any account). A full member sees the whole workspace instead, and
-        # falls through to the query below; being able to see a project is not
-        # being able to change it, which every write gate gets from
-        # check_project_access returning project_viewer for them.
+        # read_only: the projects the caller is assigned to via ProjectMembership
+        # (projects may belong to any account), plus their own - the rule
+        # authorization.project_role applies. A full member sees the whole
+        # workspace instead, and falls through to the query below.
         rows = (
             db.query(
                 Project,
@@ -1569,15 +1492,16 @@ def get_projects(
             )
             .join(Account, Account.user_id == Project.user_id)
             .outerjoin(workflow_count_subq, workflow_count_subq.c.project_id == Project.project_id)
-            .join(ProjectMembership, ProjectMembership.project_id == Project.project_id)
-            .filter(ProjectMembership.user_id == caller_member.user_id)
+            .outerjoin(ProjectMembership, and_(
+                ProjectMembership.project_id == Project.project_id,
+                ProjectMembership.user_id == caller_member.user_id,
+            ))
+            .filter(or_(ProjectMembership.id.isnot(None), Project.user_id == caller_member.user_id))
             .order_by(Project.updated_at.desc())
             .all()
         )
     else:
-        # Admin (or no header): show all workspace projects.
-        # Privileged users see every project regardless of which account owns
-        # them, so the URL-based github_user param does not restrict results.
+        # Admin, member, or no workspace membership: show all workspace projects.
         # NOTE: This application uses a single-workspace model — all projects
         # and members belong to the same workspace, so returning all projects
         # is correct.  If multi-workspace support is added, this query should
@@ -1597,9 +1521,8 @@ def get_projects(
     # updated_at only decides the *initial* arrangement now (issue #1804). Once a
     # user has a saved order it wins, so opening or editing a project no longer
     # moves its card.
-    order_member = _resolve_display_order_member(db, request, x_github_user)
-    _initialize_display_order(db, order_member, rows)
-    rows = _apply_saved_display_order(db, order_member, rows)
+    _initialize_display_order(db, caller_member, rows)
+    rows = _apply_saved_display_order(db, caller_member, rows)
 
     # For RWX projects, determine if any linked standard project has an open PR
     # campaign so the project list can show "Under Review" instead of "Synced".
@@ -1679,49 +1602,27 @@ def _pending_delivery_repo_names(db: Session, project_id: int, all_workflows: li
     has landed there: partial delivery is a different situation, and drift already
     speaks for it.
 
-    Delivery is judged per (workflow, repo) from ``confirmed_present_at`` — the
-    same evidence ``_delivery_confirmed_on_branch`` uses (issue #1981) — never
-    from ``workflow_status``, which is per-workflow and would call a repo
-    undelivered while the same workflow is live in every other repo.
+    Delivery is judged per (workflow, repo) from the delivery record, on any
+    branch of the repo, never from ``workflow_status``, which is per-workflow
+    and would call a repo undelivered while the same workflow is live in every
+    other repo.
 
-    A repo with an open ActionsManager PR is excluded: the file is on its way, so
-    the user has already done the thing the reminder would ask for. A campaign
-    stamps ``confirmed_present_at`` only when it lands on the target branch, so
-    without this the reminder would nag for the whole life of the PR.
+    A repo an open PR carries one of the workflows to is excluded: the file is on
+    its way, so the user has already done the thing the reminder would ask for.
+    A CODEOWNERS-only or custom-file-only PR delivers no workflow, so it does
+    not count.
+
+    Reusable workflows count too. Both callers skip RWX projects, and a standard
+    project's own reusable workflows are delivered to, and drift-checked in, its
+    repositories like the regular ones (#2085, #2309). A pending_delete row does
+    not: a campaign is removing it, and the save response would otherwise
+    disagree with the page load, which drops those rows.
     """
-    workflow_ids = [wf.workflow_id for wf in all_workflows if not wf.reusable_workflow]
+    workflow_ids = [wf.workflow_id for wf in all_workflows if not wf.pending_delete]
     if not workflow_ids:
         return []
 
-    delivered_repo_ids = {
-        repo_id for (repo_id,) in
-        db.query(WorkflowDriftState.repo_id)
-        .filter(
-            WorkflowDriftState.workflow_id.in_(workflow_ids),
-            WorkflowDriftState.confirmed_present_at.isnot(None),
-        )
-        .distinct()
-        .all()
-    }
-
-    # Only a PR that carries workflows means "the files are on their way". A
-    # CODEOWNERS-only or custom-file-only campaign also opens a PR for the repo,
-    # and suppressing on that would hide the reminder for the life of a PR that
-    # delivers no workflow at all. _clear_drift_for_merged_pr guards on the same
-    # field for the same reason.
-    repos_with_open_pr = {
-        repo_name for (repo_name,) in
-        db.query(ProjectPullRequest.repo_name)
-        .filter(
-            ProjectPullRequest.project_id == project_id,
-            ProjectPullRequest.pr_state == "open",
-            ProjectPullRequest.workflow_names.isnot(None),
-            ProjectPullRequest.workflow_names != "",
-        )
-        .distinct()
-        .all()
-    }
-
+    reached = deliveries.reached_repo_ids(db, workflow_ids)
     return sorted(
         repo_name
         for (repo_id, repo_name) in
@@ -1729,7 +1630,7 @@ def _pending_delivery_repo_names(db: Session, project_id: int, all_workflows: li
         .join(ProjectRepo, ProjectRepo.repo_id == Repo.repo_id)
         .filter(ProjectRepo.project_id == project_id)
         .all()
-        if repo_id not in delivered_repo_ids and repo_name not in repos_with_open_pr
+        if repo_id not in reached
     )
 
 
@@ -1753,20 +1654,6 @@ def _split_workflows(all_workflows: list) -> tuple:
     return workflows, rxworkflows
 
 
-def _get_under_review_linked_wf_ids(db: Session, project_id: int) -> list:
-    """Return IDs of linked reusable workflows currently in 'under_review' status."""
-    return [
-        r[0] for r in
-        db.query(Workflow.workflow_id).join(
-            LinkedReusableWorkflow,
-            LinkedReusableWorkflow.workflow_id == Workflow.workflow_id,
-        ).filter(
-            LinkedReusableWorkflow.standard_project_id == project_id,
-            Workflow.workflow_status == "under_review",
-        ).all()
-    ]
-
-
 def _linked_workflows_locked_by_open_campaign(db: Session, workflow_ids: list) -> set:
     """Return the subset of ``workflow_ids`` that must stay ``under_review``.
 
@@ -1779,133 +1666,6 @@ def _linked_workflows_locked_by_open_campaign(db: Session, workflow_ids: list) -
     workflow whose open campaign is owned by a different project.
     """
     return _reusable_workflow_ids_locked_by_open_campaign(db, workflow_ids)
-
-
-def _update_project_workflow_statuses(db: Session, project_id: int, new_status: str) -> list:
-    """Bulk-update all 'under_review' workflows for a project to new_status.
-
-    Returns the list of workflow IDs that were updated.
-    Query IDs first (join is valid for SELECT), then update by ID
-    because Query.update() cannot be used with join().
-    """
-    wf_ids = [
-        r[0] for r in
-        db.query(Workflow.workflow_id).join(ProjectWorkflow).filter(
-            ProjectWorkflow.project_id == project_id,
-            Workflow.workflow_status == "under_review",
-        ).all()
-    ]
-    if wf_ids:
-        db.query(Workflow).filter(
-            Workflow.workflow_id.in_(wf_ids)
-        ).update({"workflow_status": new_status}, synchronize_session=False)
-    return wf_ids
-
-
-def _autocorrect_pr_workflow_statuses(
-    db: Session,
-    project,
-    workflows: list,
-    rxworkflows: list,
-    under_review_linked_wf_ids: list,
-) -> None:
-    """Auto-correct workflow statuses based on PR records already stored in the DB.
-
-    This runs as a safety net on every project GET: if any workflow is still
-    'under_review' but all tracked PRs reached a terminal state (merged or
-    closed), the status is corrected before the response is returned.
-
-    All PRs merged  → promote  under_review → synced_with_github
-    All PRs closed  → revert   under_review → committed_locally
-    """
-    has_under_review = (
-        any(wf.get("workflowStatus") == "under_review" for wf in workflows)
-        or any(wf.get("workflowStatus") == "under_review" for wf in rxworkflows)
-        or bool(under_review_linked_wf_ids)
-    )
-    if not has_under_review:
-        return
-
-    # Collect PRs from both this project and any linked projects so that
-    # cross-project open PRs (e.g. a standard project's PR targeting an RWX
-    # project's reusable workflow) prevent premature status transitions.
-    related_project_ids = {project.project_id}
-    if project.project_type == "rwx":
-        linked_std_ids = [
-            r[0] for r in
-            db.query(LinkedReusableWorkflow.standard_project_id).filter(
-                LinkedReusableWorkflow.rwx_project_id == project.project_id
-            ).all()
-        ]
-        related_project_ids.update(linked_std_ids)
-    elif project.project_type == "standard":
-        linked_rwx_ids = [
-            r[0] for r in
-            db.query(LinkedReusableWorkflow.rwx_project_id).filter(
-                LinkedReusableWorkflow.standard_project_id == project.project_id
-            ).all()
-        ]
-        related_project_ids.update(linked_rwx_ids)
-
-    tracked_prs = db.query(ProjectPullRequest).filter(
-        ProjectPullRequest.project_id.in_(related_project_ids)
-    ).all()
-    total_tracked = len(tracked_prs)
-    if total_tracked == 0:
-        return
-
-    open_pr_count = sum(1 for p in tracked_prs if p.pr_state == "open")
-    if open_pr_count > 0:
-        return
-
-    merged_pr_count = sum(1 for p in tracked_prs if p.pr_state == "merged")
-    if merged_pr_count == total_tracked:
-        new_status = "synced_with_github"
-        new_pr_state = "synced"
-    else:
-        new_status = "committed_locally"
-        new_pr_state = "draft"
-
-    # Update in-memory workflow dicts
-    for wf in workflows:
-        if wf.get("workflowStatus") == "under_review":
-            wf["workflowStatus"] = new_status
-    for wf in rxworkflows:
-        if wf.get("workflowStatus") == "under_review":
-            wf["workflowStatus"] = new_status
-
-    # Persist project-owned workflow status changes
-    _update_project_workflow_statuses(db, project.project_id, new_status)
-
-    # Persist linked reusable workflow status changes (they live in the RWX
-    # project's ProjectWorkflow so the join-based query above misses them).
-    #
-    # A reusable workflow's under_review lock is a global, workflow-level state:
-    # it must persist while *any* project that shares the workflow (a sibling
-    # caller or the owning RWX project) still has an open PR campaign for it.
-    # Exclude those workflows from correction so a drift/sync refresh in one
-    # caller never unlocks a workflow another caller is still reviewing.
-    if under_review_linked_wf_ids:
-        locked_wf_ids = _linked_workflows_locked_by_open_campaign(
-            db, under_review_linked_wf_ids
-        )
-        correctable_wf_ids = [
-            wid for wid in under_review_linked_wf_ids if wid not in locked_wf_ids
-        ]
-        if correctable_wf_ids:
-            db.query(Workflow).filter(
-                Workflow.workflow_id.in_(correctable_wf_ids)
-            ).update({"workflow_status": new_status}, synchronize_session=False)
-            print(f"✅ Auto-corrected: {len(correctable_wf_ids)} linked workflow(s) → {new_status}")
-
-    # Update project PR state
-    if new_status == "synced_with_github" and project.pr_state != "synced":
-        project.pr_state = new_pr_state
-    elif new_status == "committed_locally" and project.pr_state not in ("draft", "synced"):
-        project.pr_state = new_pr_state
-
-    db.commit()
-    print(f"✅ Auto-corrected: workflows → {new_status} (project {project.project_id})")
 
 
 def _migrate_branch_option(branch_option: str | None) -> str:
@@ -2163,16 +1923,8 @@ def _build_project_backup_payload(db: Session, project: Project, exported_by: st
         for r in ruleset_rows
     ]
 
-    codeowners_rows = (
-        db.query(Codeowners, Repo)
-        .join(Repo, Repo.repo_id == Codeowners.repo_id)
-        .filter(Codeowners.project_id == project.project_id)
-        .order_by(Repo.repo_name.asc(), Codeowners.id.asc())
-        .all()
-    )
     codeowners_records = [
         {
-            "repo_name": repo.repo_name,
             "file_path": record.file_path,
             "content": record.content,
             "git_hash": record.git_hash,
@@ -2180,12 +1932,9 @@ def _build_project_backup_payload(db: Session, project: Project, exported_by: st
             "last_modified_by": record.last_modified_by,
             "created_at": _format_export_timestamp(record.created_at) if record.created_at else None,
             "updated_at": _format_export_timestamp(record.updated_at) if record.updated_at else None,
-            "source_metadata": {
-                "codeowners_id": record.id,
-                "repo_id": record.repo_id,
-            },
+            "source_metadata": {"codeowners_id": record.id},
         }
-        for record, repo in codeowners_rows
+        for record in db.query(Codeowners).filter(Codeowners.project_id == project.project_id).all()
     ]
 
     repo_override_rows = (
@@ -2347,90 +2096,38 @@ def _build_project_backup_payload(db: Session, project: Project, exported_by: st
     return payload
 
 
-@router.get("/projects/{project_name}", responses=_responses(403, 404))
+@router.get("/projects/{project_name}", responses=_responses(401, 403, 404, 409))
 def get_project(
     project_name: str,
     github_user: str,
     db: Annotated[Session, Depends(get_db)],
+    account: SessionAccount,
     check_drift: Annotated[bool, Query(description="Whether to check for workflow drift")] = False,
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
 ):
     """Fetch a project with its repositories and workflows (split into workflows + rxworkflows)."""
 
-    user = db.query(Account).filter(Account.github_user == github_user.strip()).first()
+    _, caller_member = _resolve_caller(db, account.github_user)
+    owner_name = _owner_name(caller_member, account, github_user)
+    user = db.query(Account).filter(Account.github_user == owner_name).first()
     if not user:
         raise HTTPException(status_code=404, detail=GITHUB_USER_NOT_FOUND)
 
-    # Resolve the calling user's workspace membership
-    caller_member = None
-    if x_github_user:
-        caller = db.query(Account).filter(Account.github_user == x_github_user).first()
-        if caller:
-            caller_member = (
-                db.query(WorkspaceMember)
-                .filter(WorkspaceMember.user_id == caller.user_id)
-                .first()
-            )
-
-    # Try to find the project by owner first
-    project = db.query(Project).filter(
-        Project.project_name.ilike(project_name.strip()),
-        Project.user_id == user.user_id
-    ).first()
-
-    # For privileged callers (admin/member), also look up globally
-    # because the URL github_user may not be the project owner.
-    if not project and caller_member and is_project_admin(caller_member):
-        project = (
-            db.query(Project)
-            .filter(Project.project_name.ilike(project_name.strip()))
-            .first()
-        )
-        if project:
-            user = db.query(Account).filter(Account.user_id == project.user_id).first()
-
-    # For non-admin callers, look up via ProjectMembership first
-    # (the project may belong to a different account). A grant resolves ahead
-    # of the workspace-wide lookup below, so an explicitly granted project wins
-    # a name collision.
-    if not project and caller_member and not is_project_admin(caller_member):
-        project = (
-            db.query(Project)
-            .join(ProjectMembership, ProjectMembership.project_id == Project.project_id)
-            .filter(
-                Project.project_name.ilike(project_name.strip()),
-                ProjectMembership.user_id == caller_member.user_id,
-            )
-            .first()
-        )
-        if project:
-            # Re-resolve the owning account for account_type in the response
-            user = db.query(Account).filter(Account.user_id == project.user_id).first()
-
-    # A full member sees every project in this single-workspace model, so one
-    # they hold no grant on still opens. What they get is read-only: the access
-    # check below resolves them to project_viewer, which every write gate
-    # refuses. Without this the project was listed but would not open, and the
-    # UI rendered its empty state rather than an error.
-    if not project and caller_member and caller_member.workspace_role == "member":
-        project = (
-            db.query(Project)
-            .filter(Project.project_name.ilike(project_name.strip()))
-            .first()
-        )
-        if project:
-            user = db.query(Account).filter(Account.user_id == project.user_id).first()
-
+    project = _find_project_by_name(db, project_name, caller_member, owner_name)
     if not project:
         raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND)
-
-    # Enforce project-level access for non-admin callers
-    if caller_member and not is_project_admin(caller_member):
-        effective_role = check_project_access(db, caller_member, project.project_id)
-        if effective_role is None:
-            raise HTTPException(status_code=403, detail=_ERR_NO_ACCESS)
+    # Whichever project it is, the response describes the owner's account.
+    if project.user_id != user.user_id:
+        user = db.query(Account).filter(Account.user_id == project.user_id).first()
 
     repo_names = _get_repo_names(db, project.project_id)
+
+    # A PR that resolved without its outcome reaching us (no webhook, no refresh
+    # yet) leaves files under_review. Settle from the stored PR rows first, so the
+    # workflows read below show the result. No GitHub call. Settling can finish
+    # the project's deletion, and then there is no project to show.
+    if settle_project_and_linked(db, project) == PROJECT_DELETED:
+        raise ProjectDeleted(project.project_id)
+    db.refresh(project)
 
     # pending_delete rows are queued for removal from GitHub by an open campaign.
     # Listing them shows the user a workflow they already asked to delete, with no
@@ -2444,17 +2141,6 @@ def get_project(
     )
     workflows, rxworkflows = _split_workflows(all_workflows)
 
-    # Auto-correct workflow statuses based on PR records already in the DB.
-    # `ProjectPullRequest.pr_state` values are kept current by
-    # `get_project_pr_status` (called on page load) and by the webhook
-    # endpoint, so reading from DB here is reliable without an extra GitHub
-    # API call.  Covers standard projects and RWX projects alike.
-    under_review_linked_wf_ids = _get_under_review_linked_wf_ids(db, project.project_id)
-    _autocorrect_pr_workflow_statuses(db, project, workflows, rxworkflows, under_review_linked_wf_ids)
-
-    # Refresh so pr_state reflects any commits made inside the auto-correction
-    db.refresh(project)
-
     project_type = project.project_type or "standard"
 
     linked_reusable_workflows = []
@@ -2465,32 +2151,27 @@ def get_project(
         linked_standard_projects = _load_linked_standard_projects(db, project.project_id, user.user_id)
 
     # Determine the caller's effective project role for frontend use
-    caller_project_role = "project_admin"  # default for admin or unknown caller
-    if caller_member:
-        caller_project_role = check_project_access(db, caller_member, project.project_id) or "project_viewer"
+    caller_project_role = project_role(db, account, project) or "project_viewer"
 
-    # Per-workflow drift state persisted by the last drift check (see issue
-    # #1793) — lets the initial page load show the correct drift badge
+    # Per-file drift the last drift check stored on the delivery record (see
+    # issue #1793) — lets the initial page load show the correct drift badge
     # immediately instead of defaulting to "no drift" and flipping once the
     # client-side live check (DriftDetection component) resolves.
-    workflow_ids = [wf.workflow_id for wf in all_workflows]
-    drifted_workflow_ids = set()
-    if workflow_ids:
-        drifted_workflow_ids = {
-            row.workflow_id
-            for row in db.query(WorkflowDriftState.workflow_id)
-            .filter(WorkflowDriftState.workflow_id.in_(workflow_ids), WorkflowDriftState.has_drift.is_(True))
-            .distinct()
-            .all()
-        }
+    drifted_workflow_ids = {
+        row.workflow_id for row in deliveries.drifted_rows(db, project.project_id, deliveries.WORKFLOW)
+    }
     drifted_workflow_names = sorted({
         wf.workflow_name for wf in all_workflows if wf.workflow_id in drifted_workflow_ids
     })
+    codeowners_drifted = bool(deliveries.drifted_rows(db, project.project_id, deliveries.CODEOWNERS))
+    drifted_custom_file_ids = sorted({
+        row.custom_file_id for row in deliveries.drifted_rows(db, project.project_id, deliveries.CUSTOM_FILE)
+    })
 
     # Repos still waiting for their first delivery. Gated on the project having
-    # been drift-checked at least once: before that, an absent
-    # confirmed_present_at means "never looked", not "never delivered", and a
-    # project delivered by direct commit would have every repo reported as
+    # been drift-checked at least once: before that, an absent delivery record
+    # can mean "never looked", not "never delivered", and a project delivered
+    # before the record existed would have every repo reported as
     # waiting. Saying nothing until there is evidence matches how drift itself
     # refuses to report a state it could not verify (issue #1815).
     pending_delivery_repos = (
@@ -2526,6 +2207,8 @@ def get_project(
         "last_preflight_pr_url": project.last_preflight_pr_url,
         "drift_detected": check_drift and len(repo_names) > 0,
         "drifted_workflow_names": drifted_workflow_names,
+        "codeowners_drifted": codeowners_drifted,
+        "drifted_custom_file_ids": drifted_custom_file_ids,
         "pending_delivery_repos": pending_delivery_repos,
         "drift_check_interval_minutes": project.drift_check_interval_minutes,
         "caller_project_role": caller_project_role,
@@ -2537,23 +2220,16 @@ def get_project(
 def export_project_backup(
     project_id: int,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: CurrentAccount,
 ):
     """Export a deterministic project-scoped JSON backup without sensitive secrets/tokens."""
-    caller, caller_member = _resolve_caller(db, x_github_user)
-    if not caller:
-        raise HTTPException(status_code=401, detail=_ERR_AUTH_REQUIRED)
+    _, caller_member = _resolve_caller(db, account.github_user)
 
-    project = _find_project_by_id(db, project_id, caller_member, caller.github_user)
+    project = _find_project_by_id(db, project_id, caller_member, account.github_user)
     if not project:
         raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND)
 
-    if caller_member and not is_project_admin(caller_member):
-        effective_role = check_project_access(db, caller_member, project.project_id)
-        if effective_role is None:
-            raise HTTPException(status_code=403, detail=_ERR_NO_ACCESS)
-
-    payload = _build_project_backup_payload(db, project, caller.github_user)
+    payload = _build_project_backup_payload(db, project, account.github_user)
     timestamp_for_filename = payload["metadata"]["exported_at"].replace(":", "-")
     safe_project_name = re.sub(r"[^A-Za-z0-9._-]+", "-", project.project_name.strip()).strip("-") or f"project-{project.project_id}"
     filename = f"actionsmanager-project-{safe_project_name}-{timestamp_for_filename}.json"
@@ -2563,20 +2239,20 @@ def export_project_backup(
     )
 
 
-@router.delete("/projects/{project_name}", responses=_responses(404, 500))
+@router.delete("/projects/{project_name}", responses=_responses(401, 403, 404, 409, 500))
 def delete_project(
     project_name: str,
     github_user: str,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: SessionAccount,
 ):
     """Deletes a specific project by name and GitHub user."""
     
     try:
-        print(f"📌 Debug: Attempting to delete project '{project_name}' for user '{github_user}'")
+        print(f"📌 Debug: '{account.github_user}' deleting project '{project_name}' (owner named: '{github_user}')")
 
-        _caller, caller_member = _resolve_caller(db, x_github_user)
-        project = _find_project_by_name(db, project_name, caller_member, github_user)
+        _, caller_member = _resolve_caller(db, account.github_user)
+        project = _find_project_by_name(db, project_name, caller_member, _owner_name(caller_member, account, github_user))
 
         if not project:
             raise HTTPException(status_code=404, detail="❌ Project not found or access denied")
@@ -2585,15 +2261,10 @@ def delete_project(
         # doubles as "or access denied". That only held while the lookup itself
         # was narrow, and it never distinguished a viewer from an editor - a
         # project_viewer grant resolves the project and could delete it.
-        _require_project_editor(db, caller_member, project.project_id)
+        _require_project_editor(db, account, project)
 
-        _delete_project_display_order(db, project.project_id)
-        db.delete(project)
-        db.commit()
-        
-        # Clean up any orphaned workflows that are no longer associated with any projects
-        cleanup_orphaned_workflows(db)
-        
+        delete_project_record(db, project)
+
         return {"message": "✅ Project deleted successfully!"}
 
     except HTTPException:
@@ -2605,67 +2276,22 @@ def delete_project(
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error deleting project: {str(e)}")
+        print(f"❌ Error deleting project: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting project")
 
     finally:
         db.close()
 
 
-@router.post("/projects/{project_name}/toggle-reusable-workflows", responses=_responses(404, 500))
-def toggle_reusable_workflows(
-    project_name: str,
-    db: Annotated[Session, Depends(get_db)],
-    payload: ReusableWorkflowToggleSchema = None,
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-):
-    """Toggle reusable workflows setting for a specific project."""
-    
-    try:
-        print(f"📌 Debug: Toggling reusable workflows for project '{project_name}' to {payload.enabled}")
-
-        _caller, caller_member = _resolve_caller(db, x_github_user)
-        project = _find_project_by_name(db, project_name, caller_member, payload.github_user)
-
-        if not project:
-            raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND)
-
-        _require_project_editor(db, caller_member, project.project_id)
-
-        # Update the reusable workflows setting
-        project.reusable_workflows_enabled = payload.enabled
-        project.updated_at = func.now()
-        
-        db.commit()
-        
-        return {
-            "message": f"✅ Reusable workflows {'enabled' if payload.enabled else 'disabled'} for project '{project_name}'",
-            "project_name": project.project_name,
-            "reusable_workflows_enabled": project.reusable_workflows_enabled
-        }
-
-    except HTTPException:
-        # Re-raise HTTPExceptions (like 404) without converting to 500
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error updating reusable workflow setting: {str(e)}")
-
-    finally:
-        db.close()
-
-@router.get("/rwx-workflows", responses=_responses(404))
+@router.get("/rwx-workflows", responses=_responses(404, 409))
 def get_rwx_workflows(
-    github_user: str,
     db: Annotated[Session, Depends(get_db)],
+    account: CurrentAccount,
     standard_project_name: Annotated[Optional[str], Query(description="Standard project name for link validation")] = None,
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
 ):
-    """Get all workflows from all RWX projects for a given user."""
-    caller, caller_member = _resolve_caller(db, x_github_user)
-    # github_user is client-supplied; trusting it let any caller, read_only
-    # included, list another user's reusable workflow YAML. The session-pinned
-    # caller wins whenever there is one.
-    owner_name = caller.github_user if caller else github_user.strip()
+    """Get all workflows from all RWX projects the session caller can see (#2241)."""
+    _, caller_member = _resolve_caller(db, account.github_user)
+    owner_name = account.github_user
 
     if caller_member and is_project_admin(caller_member):
         # Privileged users see all RWX projects
@@ -2735,27 +2361,28 @@ def get_rwx_workflows(
     return result
 
 
-@router.post("/projects/{project_name}/linked-reusable-workflows", responses=_responses(404, 422, 500))
+@router.post("/projects/{project_name}/linked-reusable-workflows", responses=_responses(401, 403, 404, 409, 422, 500))
 def link_reusable_workflow(
     project_name: str,
     payload: LinkWorkflowSchema,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: SessionAccount,
 ):
     """Link a reusable workflow from an RWX project to a standard project."""
     try:
-        _caller, caller_member = _resolve_caller(db, x_github_user)
+        _, caller_member = _resolve_caller(db, account.github_user)
+        owner_name = _owner_name(caller_member, account, payload.github_user)
 
-        standard_project = _find_project_by_name(db, project_name, caller_member, payload.github_user)
+        standard_project = _find_project_by_name(db, project_name, caller_member, owner_name)
         if not standard_project:
             raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND_PLAIN)
 
         # Linking writes a LinkedReusableWorkflow row into this project and
         # changes what its campaigns deliver, so it needs write access to it —
         # the same gate its unlink counterpart carries.
-        _require_project_editor(db, caller_member, standard_project.project_id)
+        _require_project_editor(db, account, standard_project)
 
-        rwx_project = _find_project_by_id(db, payload.rwx_project_id, caller_member, payload.github_user)
+        rwx_project = _find_project_by_id(db, payload.rwx_project_id, caller_member, owner_name)
         if not rwx_project or rwx_project.project_type != "rwx":
             raise HTTPException(status_code=404, detail="RWX project not found")
 
@@ -2805,26 +2432,29 @@ def link_reusable_workflow(
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error linking workflow: {str(e)}")
+        print(f"❌ Error linking workflow: {e}")
+        raise HTTPException(status_code=500, detail="Error linking workflow")
 
 
-@router.delete("/projects/{project_name}/linked-reusable-workflows/{workflow_id}", responses=_responses(404, 500))
+@router.delete("/projects/{project_name}/linked-reusable-workflows/{workflow_id}", responses=_responses(401, 403, 404, 409, 500))
 def unlink_reusable_workflow(
     project_name: str,
     workflow_id: int,
     github_user: str,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: SessionAccount,
 ):
     """Unlink a reusable workflow from a standard project."""
     try:
-        _caller, caller_member = _resolve_caller(db, x_github_user)
+        _, caller_member = _resolve_caller(db, account.github_user)
 
-        standard_project = _find_project_by_name(db, project_name, caller_member, github_user)
+        standard_project = _find_project_by_name(
+            db, project_name, caller_member, _owner_name(caller_member, account, github_user)
+        )
         if not standard_project:
             raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND_PLAIN)
 
-        _require_project_editor(db, caller_member, standard_project.project_id)
+        _require_project_editor(db, account, standard_project)
 
         link = db.query(LinkedReusableWorkflow).filter(
             LinkedReusableWorkflow.standard_project_id == standard_project.project_id,
@@ -2842,16 +2472,17 @@ def unlink_reusable_workflow(
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error unlinking workflow: {str(e)}")
+        print(f"❌ Error unlinking workflow: {e}")
+        raise HTTPException(status_code=500, detail="Error unlinking workflow")
 
 
-@router.put("/projects/{project_name}/linked-reusable-workflows/{workflow_id}", responses=_responses(403, 404, 500))
+@router.put("/projects/{project_name}/linked-reusable-workflows/{workflow_id}", responses=_responses(401, 403, 404, 409, 500))
 def update_linked_reusable_workflow(
     project_name: str,
     workflow_id: int,
     payload: UpdateLinkedWorkflowSchema,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: SessionAccount,
 ):
     """Update the YAML of a reusable workflow that is linked into a standard project.
 
@@ -2869,7 +2500,7 @@ def update_linked_reusable_workflow(
       canonical workflow is already associated with its source RWX project).
     * A new ``workflow_versions`` row is appended.
     * ``workflow_status`` is reset to ``committed_locally`` and
-      ``workflow_git_hash`` is reset to all zeros, mirroring normal local-edit
+      ``workflow_git_hash`` is cleared, mirroring normal local-edit
       behaviour for reusable workflows.  Exception: while any open PR campaign
       (from any project) still references the workflow, ``workflow_status``
       stays ``under_review`` so the global lock is not bypassed.
@@ -2878,24 +2509,23 @@ def update_linked_reusable_workflow(
       cannot mutate it via the linked path.
     """
     try:
-        _caller, caller_member = _resolve_caller(db, x_github_user)
+        _, caller_member = _resolve_caller(db, account.github_user)
+        owner_name = _owner_name(caller_member, account, payload.github_user)
 
         # Validate access to the consuming standard project
         standard_project = _find_project_by_name(
-            db, project_name, caller_member, payload.github_user
+            db, project_name, caller_member, owner_name
         )
         if not standard_project:
             raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND_PLAIN)
 
         # Enforce project_editor (write) access on the consuming project so that
         # project_viewer/read_only members cannot mutate via this endpoint.
-        if caller_member and not is_project_admin(caller_member):
-            std_role = check_project_access(db, caller_member, standard_project.project_id)
-            if std_role not in ("project_editor", "project_admin"):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Insufficient project permissions. Required: project_editor",
-                )
+        if not has_project_role(db, account, standard_project, "project_editor"):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient project permissions. Required: project_editor",
+            )
 
         # Validate the workflow is actually linked to this standard project
         link = db.query(LinkedReusableWorkflow).filter(
@@ -2911,7 +2541,7 @@ def update_linked_reusable_workflow(
         # Validate access to the source RWX project (the user must own/manage it
         # to mutate its workflows even when editing through the linked path)
         rwx_project = _find_project_by_id(
-            db, link.rwx_project_id, caller_member, payload.github_user
+            db, link.rwx_project_id, caller_member, owner_name
         )
         if not rwx_project:
             raise HTTPException(
@@ -2921,13 +2551,11 @@ def update_linked_reusable_workflow(
 
         # Enforce project_editor (write) access on the source RWX project too —
         # editing through the linked path mutates the RWX project's data.
-        if caller_member and not is_project_admin(caller_member):
-            rwx_role = check_project_access(db, caller_member, rwx_project.project_id)
-            if rwx_role not in ("project_editor", "project_admin"):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Insufficient project permissions on the source RWX project. Required: project_editor",
-                )
+        if not has_project_role(db, account, rwx_project, "project_editor"):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient project permissions on the source RWX project. Required: project_editor",
+            )
 
         # Resolve the canonical workflow row.  Confirm it is still associated with
         # the RWX project to avoid mutating an orphaned/migrated row.
@@ -2950,16 +2578,14 @@ def update_linked_reusable_workflow(
         new_content = (payload.content or "").strip()
         workflow.workflow_yaml = new_content
         workflow.reusable_workflow = True
-        workflow.workflow_git_hash = "0" * 40
+        workflow.workflow_git_hash = None
         if _linked_workflows_locked_by_open_campaign(db, [workflow.workflow_id]):
             # Global lock: an open PR campaign (from any project) still
             # references this workflow — keep it under_review everywhere.
             workflow.workflow_status = "under_review"
         else:
             workflow.workflow_status = "committed_locally"
-        last_modifier = (x_github_user or payload.github_user or "").strip() or None
-        if last_modifier:
-            workflow.last_modified_by = last_modifier
+        workflow.last_modified_by = account.github_user
 
         # Defensive: guarantee no duplicate reusable workflow exists in the
         # source RWX project for the canonical workflow's normalized name.
@@ -2999,6 +2625,7 @@ def update_linked_reusable_workflow(
             db.delete(dup)
 
         db.commit()
+        resolve_drift_for_local_edit(db, rwx_project, deliveries.WORKFLOW, workflow.workflow_id, new_content)
         db.refresh(workflow)
 
         # Append a new workflow_versions row for the existing workflow_id
@@ -3025,12 +2652,12 @@ def update_linked_reusable_workflow(
 
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         db.rollback()
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail=f"Error updating linked reusable workflow: {str(e)}",
+            detail="Error updating linked reusable workflow",
         )
 
 
@@ -3072,35 +2699,23 @@ _PROJECT_ROLE_LEVEL = {"project_viewer": 0, "project_editor": 1, "project_admin"
 def _require_project_access(
     db: Session,
     project_id: int,
-    github_user: str,
-    x_github_user: Optional[str],
+    account: Account,
     minimum_project_role: str = "project_viewer",
 ) -> Project:
-    """Resolve the project and enforce that the caller has access to it.
+    """Resolve the project and enforce the session caller's minimum role on it.
 
-    ``minimum_project_role`` enforces the minimum project role required.
-    Workspace/project admins always pass.
-
-    Raises HTTPException(400/401/403/404) on failure, returns the Project on success.
+    404 when the caller may not see it, 403 when their role is below
+    *minimum_project_role* (see authorization.project_role).
     """
-    if not github_user:
-        raise HTTPException(status_code=400, detail="github_user is required")
-
-    caller, caller_member = _resolve_caller(db, x_github_user or github_user)
-    project = _find_project_by_id(db, project_id, caller_member, github_user=github_user)
-    if not project:
+    project = db.get(Project, project_id) if project_id else None
+    role = project_role(db, account, project)
+    if role is None:
         raise HTTPException(status_code=404, detail=_ERR_PROJECT_NOT_FOUND)
-
-    if caller_member and not is_project_admin(caller_member):
-        effective_role = check_project_access(db, caller_member, project.project_id)
-        if effective_role is None:
-            raise HTTPException(status_code=403, detail=_ERR_NO_ACCESS)
-        min_level = _PROJECT_ROLE_LEVEL.get(minimum_project_role, 0)
-        if _PROJECT_ROLE_LEVEL.get(effective_role, -1) < min_level:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Insufficient project permissions. Required: {minimum_project_role}",
-            )
+    if PROJECT_ROLE_LEVEL[role] < PROJECT_ROLE_LEVEL.get(minimum_project_role, 0):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Insufficient project permissions. Required: {minimum_project_role}",
+        )
     return project
 
 
@@ -3150,12 +2765,11 @@ def _validate_repo_branch_config(payload: RepoBranchConfigSchema) -> None:
 @router.get("/projects/{project_id}/repo-branch-configs", responses=_responses(400, 403, 404))
 def list_project_repo_branch_configs(
     project_id: int,
-    github_user: str,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: CurrentAccount,
 ):
     """List all repositories in ``project_id`` along with their effective branch config."""
-    project = _require_project_access(db, project_id, github_user, x_github_user)
+    project = _require_project_access(db, project_id, account)
 
     rows = (
         db.query(ProjectRepo, Repo)
@@ -3179,14 +2793,11 @@ def update_project_repo_branch_config(
     project_id: int,
     repo_id: int,
     payload: RepoBranchConfigSchema,
-    github_user: str,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: CurrentAccount,
 ):
     """Update the branch override config for a single repo within a project."""
-    project = _require_project_access(
-        db, project_id, github_user, x_github_user, minimum_project_role="project_editor"
-    )
+    project = _require_project_access(db, project_id, account, minimum_project_role="project_editor")
     _validate_repo_branch_config(payload)
 
     assoc = (
@@ -3237,14 +2848,11 @@ def update_project_repo_branch_config(
 def reset_project_repo_branch_config(
     project_id: int,
     repo_id: int,
-    github_user: str,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: CurrentAccount,
 ):
     """Reset a repository back to the project's default branch configuration."""
-    project = _require_project_access(
-        db, project_id, github_user, x_github_user, minimum_project_role="project_editor"
-    )
+    project = _require_project_access(db, project_id, account, minimum_project_role="project_editor")
 
     assoc = (
         db.query(ProjectRepo)

@@ -343,7 +343,7 @@ class TestReadPathIdentitySecurity:
     def test_query_param_caller_must_match_the_session(self):
         """Routes taking the caller as ?github_user= check it against the session."""
         response = client.get(
-            "/api/project-pr-history",
+            "/api/project-pr-campaigns",
             params={"github_user": "victim", "project_name": "SecurityProject"},
             headers=auth_headers(),
         )

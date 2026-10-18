@@ -31,6 +31,7 @@ from models import (  # noqa: E402
 )
 from main import app  # noqa: E402
 from projects import get_db as projects_get_db  # noqa: E402
+from auth import create_auth_session  # noqa: E402
 
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test_unlink_rwx_workflow.db"
@@ -53,6 +54,16 @@ def setup_and_teardown_db():
     Base.metadata.create_all(bind=engine)
     yield
     Base.metadata.drop_all(bind=engine)
+
+
+def _signed_in(github_user):
+    """Headers for a real server-side session as ``github_user`` (#2241)."""
+    db = TestingSessionLocal()
+    try:
+        token = create_auth_session(github_user, db)
+    finally:
+        db.close()
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture
@@ -122,6 +133,7 @@ def test_unlink_removes_association_only(client):
     resp = client.delete(
         f"/api/projects/{std.project_name}/linked-reusable-workflows/{workflow_id}",
         params={"github_user": "alice"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()
@@ -164,6 +176,7 @@ def test_unlink_nonexistent_link_returns_404(client):
     resp = client.delete(
         f"/api/projects/{std.project_name}/linked-reusable-workflows/99999",
         params={"github_user": "alice"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 404
 
@@ -180,6 +193,7 @@ def test_unlink_nonexistent_project_returns_404(client):
     resp = client.delete(
         f"/api/projects/NonExistentProject/linked-reusable-workflows/{workflow_id}",
         params={"github_user": "alice"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 404
 
@@ -203,6 +217,7 @@ def test_unlink_unauthorized_user_cannot_unlink(client):
     resp = client.delete(
         f"/api/projects/{project_name}/linked-reusable-workflows/{workflow_id}",
         params={"github_user": "bob"},
+        headers=_signed_in("bob"),
     )
     assert resp.status_code == 404, "User without access should get 404 (project not found)"
 
@@ -239,6 +254,7 @@ def test_unlink_does_not_affect_other_projects_link(client):
     resp = client.delete(
         f"/api/projects/{std_name}/linked-reusable-workflows/{workflow_id}",
         params={"github_user": "alice"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 200
 

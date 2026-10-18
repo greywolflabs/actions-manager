@@ -90,7 +90,7 @@ describe('LinkedWorkflowsModal', () => {
 
   test('renders workflows after loading', async () => {
     render(<LinkedWorkflowsModal {...defaultProps} />);
-    expect(projectsApi.getAvailableRwxWorkflows).toHaveBeenCalledWith('test-user', 'My Project');
+    expect(projectsApi.getAvailableRwxWorkflows).toHaveBeenCalledWith('My Project');
     await waitFor(() => {
       expect(screen.getByText('build-workflow')).toBeInTheDocument();
       expect(screen.getByText('deploy-workflow')).toBeInTheDocument();

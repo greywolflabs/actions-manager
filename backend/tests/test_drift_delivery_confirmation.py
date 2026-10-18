@@ -5,9 +5,9 @@ campaign sets that to the blob SHA on the *PR branch*, so a brand-new workflow
 carried a real hash while having never landed — and opening a campaign reported
 every repo in the project as "Workflow was deleted from ..." (issue #1981).
 
-``confirmed_present_at`` records the fact directly. These tests pin both
-directions: no delivery history means never deleted, and real delivery history
-still means deleted.
+The delivery record (``file_deliveries``) records the fact directly. These
+tests pin both directions: no delivery history means never deleted, and real
+delivery history still means deleted.
 """
 import os
 import sys
@@ -25,10 +25,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from main import app  # noqa: E402
 from workflows import get_db as real_get_db  # noqa: E402
 from models import (  # noqa: E402
-    Base, Account, Project, Repo, ProjectRepo, Workflow, ProjectWorkflow,
-    WorkflowDriftState, RepoWorkflowOverride,
+    Base, Account, FileDelivery, Project, Repo, ProjectRepo, Workflow, ProjectWorkflow,
+    RepoWorkflowOverride,
 )
 from auth import user_tokens  # noqa: E402
+import deliveries  # noqa: E402
+from models import ProjectPullRequest  # noqa: E402
+from tests.delivery_records import record_delivered, record_drift, record_pr_carries  # noqa: E402
 
 engine = create_engine(
     "sqlite:///:memory:",
@@ -101,20 +104,11 @@ def make_project(authenticate_client):
                                    workflow_id=workflow.workflow_id))
 
             seen_at = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
-            for repo_name in confirmed_on:
-                db.add(WorkflowDriftState(
-                    project_id=project.project_id, workflow_id=workflow.workflow_id,
-                    repo_id=repo_ids[repo_name], branch="main",
-                    has_drift=False, github_sha="sha-seen-on-main",
-                    confirmed_present_at=seen_at,
-                ))
+            # Delivered there, and for prior_deleted a check that then found it gone.
+            for repo_name in (*confirmed_on, *prior_deleted):
+                record_delivered(db, workflow, repo_name, "main", sha="sha-seen-on-main", at=seen_at)
             for repo_name in prior_deleted:
-                db.add(WorkflowDriftState(
-                    project_id=project.project_id, workflow_id=workflow.workflow_id,
-                    repo_id=repo_ids[repo_name], branch="main",
-                    has_drift=True, github_sha=None, deleted_in_github=True,
-                    confirmed_present_at=seen_at,
-                ))
+                record_drift(db, workflow, repo_name, "main", deleted=True)
             if override_on:
                 db.add(RepoWorkflowOverride(
                     project_id=project.project_id, workflow_id=workflow.workflow_id,
@@ -231,20 +225,46 @@ def test_repo_outside_the_project_is_left_alone(make_project, no_files_on_github
     """Where no evidence could have been recorded, absence proves nothing.
 
     Drift state is only persisted for a project's own repos, so a linked
-    reusable workflow's source repo never gets a row. Suppressing there would
-    downgrade a real deletion to "not delivered yet".
+    reusable workflow's source repo never gets a row, and a delivery made there
+    before the delivery record existed left nothing to backfill. Suppressing
+    there would downgrade a real deletion to "not delivered yet".
     """
     project_id = make_project(extra_repos=["someone-else/rwx-source"])
-    from workflows import _delivery_confirmed_on_branch
+    from workflows import _check_regular_workflow_in_repo
+
+    def missing_from(db, workflow, repo_name):
+        owner, name = repo_name.split("/")
+        return _check_regular_workflow_in_repo(
+            db, workflow, repo_name, owner, name, "build-stuff.yml", {}, "P001", "token", project_id, "main",
+            deliveries.targets_for(db, project_id),
+        )
 
     db = TestingSessionLocal()
     try:
         workflow = db.query(Workflow).first()
-        assert _delivery_confirmed_on_branch(
-            db, workflow, "someone-else/rwx-source", "main", project_id
+        outside = missing_from(db, workflow, "someone-else/rwx-source")
+        inside = missing_from(db, workflow, REPOS[0])
+    finally:
+        db.close()
+    assert outside.deleted_in_github is True
+    assert (inside.has_drift, inside.deleted_in_github) == (False, False)
+    assert "not delivered" in inside.message
+
+
+def test_a_delivery_recorded_outside_the_project_is_on_record(make_project, no_files_on_github):
+    """The delivery record does not depend on drift state: a merge outside the
+    project's own repos records it like anywhere else."""
+    make_project(extra_repos=["someone-else/rwx-source"])
+
+    db = TestingSessionLocal()
+    try:
+        workflow = db.query(Workflow).first()
+        record_delivered(db, workflow, "someone-else/rwx-source", "main")
+        assert deliveries.delivered_here(
+            db, deliveries.WORKFLOW, workflow.workflow_id, "someone-else/rwx-source", "main"
         ) is True
-        assert _delivery_confirmed_on_branch(
-            db, workflow, REPOS[0], "main", project_id
+        assert deliveries.delivered_here(
+            db, deliveries.WORKFLOW, workflow.workflow_id, REPOS[0], "main"
         ) is False
     finally:
         db.close()
@@ -275,14 +295,15 @@ def test_the_cached_panel_stops_claiming_a_deletion(make_project, no_files_on_gi
     db = TestingSessionLocal()
     try:
         workflow = db.query(Workflow).first()
-        repo = db.query(Repo).filter(Repo.repo_name == REPOS[0]).first()
-        db.add(WorkflowDriftState(
-            project_id=project_id, workflow_id=workflow.workflow_id,
-            repo_id=repo.repo_id, branch="main",
-            has_drift=True, github_sha=None, deleted_in_github=True,
-            confirmed_present_at=None,
-        ))
-        db.commit()
+        record_drift(db, workflow, REPOS[0], "main", deleted=True)
+        # The open campaign that put it under review, as it records itself.
+        pr = ProjectPullRequest(
+            project_id=project_id, repo_name=REPOS[0], pr_number=5, pr_url="u",
+            branch_name="actions-manager/p001/test1/abc-main", target_branch="main",
+            pr_state="open", workflow_names="build-stuff",
+        )
+        db.add(pr)
+        record_pr_carries(db, pr, workflow)
     finally:
         db.close()
 
@@ -294,40 +315,33 @@ def test_the_cached_panel_stops_claiming_a_deletion(make_project, no_files_on_gi
 
 
 def test_a_repo_attached_mid_sweep_is_not_a_deletion(make_project, no_files_on_github):
-    """The sweep reuses one Session for a whole batch, so its caches must not.
+    """The sweep reuses one Session for a whole batch.
 
-    _delivery_confirmed_on_branch reads "repo not in this project" as "no
-    evidence could ever have been recorded here", so a repo attached after the
-    set was cached is reported as a deletion — the false positive the gate
-    exists to remove.
+    The delivery answer is read per (workflow, repo, branch) and never cached on
+    the Session, so a repo attached after an earlier answer in the same Session
+    is still answered from its own record — none, so not a deletion.
     """
     project_id = make_project(confirmed_on=[REPOS[0]])
-    from workflows import _delivery_confirmed_on_branch, _reset_drift_lookup_caches
 
     db = TestingSessionLocal()
     try:
         workflow = db.query(Workflow).first()
-        _delivery_confirmed_on_branch(db, workflow, REPOS[0], "main", project_id)
+        assert deliveries.delivered_here(db, deliveries.WORKFLOW, workflow.workflow_id, REPOS[0], "main")
 
         late_repo = Repo(repo_name="acme/attached-later")
         db.add(late_repo); db.commit(); db.refresh(late_repo)
         db.add(ProjectRepo(project_id=project_id, repo_id=late_repo.repo_id))
         db.commit()
 
-        assert _delivery_confirmed_on_branch(
-            db, workflow, late_repo.repo_name, "main", project_id
-        ) is True
-
-        _reset_drift_lookup_caches(db, project_id)
-        assert _delivery_confirmed_on_branch(
-            db, workflow, late_repo.repo_name, "main", project_id
+        assert deliveries.delivered_here(
+            db, deliveries.WORKFLOW, workflow.workflow_id, late_repo.repo_name, "main"
         ) is False
     finally:
         db.close()
 
 
-def test_finding_the_file_stamps_the_confirmation(make_project):
-    """The runtime half: seeing the file on a branch is what records delivery."""
+def test_finding_the_file_records_its_delivery(make_project):
+    """The runtime half: seeing ActionsManager's content on a branch is what records delivery."""
     project_id = make_project(workflow_status="under_review")
     content = "name: build-stuff\non:\n  workflow_dispatch:\n"
 
@@ -342,10 +356,10 @@ def test_finding_the_file_stamps_the_confirmation(make_project):
     db = TestingSessionLocal()
     try:
         stamped = (
-            db.query(WorkflowDriftState.confirmed_present_at)
-            .filter(WorkflowDriftState.confirmed_present_at.isnot(None))
+            db.query(FileDelivery.delivered_sha)
+            .filter(FileDelivery.delivered_at.isnot(None))
             .all()
         )
-        assert stamped, "a check that found the file should record delivery"
+        assert stamped == [("gh-sha-1",)] * len(REPOS), "a check that found the file should record delivery"
     finally:
         db.close()

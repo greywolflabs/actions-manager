@@ -25,6 +25,10 @@ export interface WorkflowEvent {
    * event; tag-triggered pushes are the `push` event filtered by tags. */
   tags?: string[];
   cron?: string;
+  /** Every `on.schedule` entry as read. The GUI edits only the first entry's
+   * cron, through `cron`; later entries and keys such as `timezone` are kept so
+   * the round trip stays lossless. */
+  schedule?: unknown[];
   types?: string[];
   inputs?: { [key: string]: WorkflowCallInput };
   /** Keys under this event that the GUI does not model - notably a reusable
@@ -41,13 +45,22 @@ export interface WorkflowJob {
   steps: WorkflowStep[];
   env?: { [key: string]: string };
   if?: string;
-  needs?: string[];
+  /** As written: a single `needs: build` stays a string so it round-trips. */
+  needs?: string | string[];
   timeoutMinutes?: number;
+  /** A job-level `uses:` makes this a call to a reusable workflow. GitHub then
+   * rejects `runs-on`, `steps`, `env` and `timeout-minutes` on it, so none of
+   * them are written or offered for it. */
+  uses?: string;
   unsupportedFields?: { [key: string]: any };
 }
 
 export interface WorkflowStep {
+  /** The GUI's own key for the step. Seeded from the YAML `id:` when there is
+   * one, otherwise minted (`step-1`, `x-copy`), so it is never written back. */
   id: string;
+  /** The step's YAML `id:` as read, which `steps.<id>` expressions reference. */
+  yamlId?: string;
   name?: string;
   uses?: string;
   run?: string;
@@ -166,7 +179,7 @@ export function yamlToGuiResult(yamlContent: string): { gui: WorkflowGUI; error:
     }
 
     const result: WorkflowGUI = {
-      name: parsed.name || 'Workflow',
+      name: parsed.name ?? '',
       events: parseEvents(parsed.on),
       jobs: parseJobs(parsed.jobs),
       env: parsed.env,
@@ -201,8 +214,10 @@ export function yamlToGui(yamlContent: string): WorkflowGUI {
 
 // Convert GUI structure to YAML string
 export function guiToYaml(gui: WorkflowGUI): string {
+  // `name:` is optional in GitHub Actions; an empty label means the YAML had
+  // none, and writing one would change what the Actions tab shows.
   const workflow: any = {
-    name: gui.name,
+    ...(gui.name ? { name: gui.name } : {}),
     trigger: serializeEvents(gui.events), // Use 'trigger' temporarily to avoid YAML quoting 'on'
     jobs: serializeJobs(gui.jobs)
   };
@@ -228,7 +243,108 @@ export function guiToYaml(gui: WorkflowGUI): string {
   return yamlStr.replace(/^trigger:/gm, 'on:');
 }
 
-const SUPPORTED_EVENT_FIELDS = new Set(['branches', 'paths', 'tags', 'schedule', 'types', 'inputs']);
+const WHOLE_WORKFLOW = 'entire workflow';
+const INPUT_EVENTS = new Set(['workflow_dispatch', 'workflow_call']);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Object.prototype.toString.call(value) === '[object Object]';
+}
+
+function mapValues(
+  record: Record<string, unknown>,
+  map: (key: string, value: unknown) => unknown
+): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(record).map(([key, value]) => [key, map(key, value)]));
+}
+
+// GitHub defaults an input to `required: false` and `type: string`, and
+// guiToYaml writes both out even when the original omitted them.
+function normalizeInput(input: unknown): unknown {
+  if (!isPlainObject(input)) {
+    return input;
+  }
+  const normalized = { ...input };
+  if (normalized.required === false) delete normalized.required;
+  if (normalized.type === 'string') delete normalized.type;
+  return normalized;
+}
+
+function normalizeEventConfig(event: string, config: unknown): unknown {
+  if (config === null) {
+    return {};
+  }
+  if (!INPUT_EVENTS.has(event) || !isPlainObject(config) || !isPlainObject(config.inputs)) {
+    return config;
+  }
+  return { ...config, inputs: mapValues(config.inputs, (_name, input) => normalizeInput(input)) };
+}
+
+// `on: push`, `on: [push]` and `on: {push: null}` are the same trigger to GitHub,
+// and guiToYaml picks whichever form fits the model, not the one the user wrote.
+function normalizeOn(on: unknown): unknown {
+  if (typeof on === 'string') {
+    return { [on]: {} };
+  }
+  if (Array.isArray(on) && on.every(event => typeof event === 'string')) {
+    return Object.fromEntries(on.map(event => [event, {}]));
+  }
+  return isPlainObject(on) ? mapValues(on, normalizeEventConfig) : on;
+}
+
+function normalizeWorkflow(doc: unknown): unknown {
+  return isPlainObject(doc) && Object.hasOwn(doc, 'on') ? { ...doc, on: normalizeOn(doc.on) } : doc;
+}
+
+function ownValue(record: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
+}
+
+function collectDifferences(before: unknown, after: unknown, path: string, differences: string[]): void {
+  if (Array.isArray(before) && Array.isArray(after)) {
+    const length = Math.max(before.length, after.length);
+    for (let index = 0; index < length; index++) {
+      collectDifferences(before[index], after[index], `${path}[${index}]`, differences);
+    }
+    return;
+  }
+  if (isPlainObject(before) && isPlainObject(after)) {
+    new Set([...Object.keys(before), ...Object.keys(after)]).forEach(key => {
+      const childPath = path ? `${path}.${key}` : key;
+      collectDifferences(ownValue(before, key), ownValue(after, key), childPath, differences);
+    });
+    return;
+  }
+  if (!Object.is(before, after)) {
+    differences.push(path || WHOLE_WORKFLOW);
+  }
+}
+
+/**
+ * The YAML paths GUI mode would change if it edited `gui` and wrote it back
+ * over `originalYaml`; empty means the round trip is lossless.
+ *
+ * Every GUI edit replaces the whole document with guiToYaml's output, and
+ * delivery is byte-exact, so anything the model can't represent would ship to
+ * every repository without the user having touched it. Callers refuse GUI mode
+ * on a non-empty result. Anything that goes wrong here is reported as a
+ * difference, never as safe.
+ */
+export function findGuiRoundTripLosses(originalYaml: string, gui: WorkflowGUI): string[] {
+  try {
+    const differences: string[] = [];
+    collectDifferences(
+      normalizeWorkflow(yaml.load(originalYaml)),
+      normalizeWorkflow(yaml.load(guiToYaml(gui))),
+      '',
+      differences
+    );
+    return differences;
+  } catch {
+    return [WHOLE_WORKFLOW];
+  }
+}
+
+const SUPPORTED_EVENT_FIELDS = new Set(['branches', 'paths', 'tags', 'types', 'inputs']);
 
 // GitHub rejects a workflow that sets both a filter and its `-ignore`
 // counterpart on the same event.
@@ -261,9 +377,41 @@ function applyUnsupportedEventFields(config: any, unsupportedFields: { [key: str
 
 function hasEventConfig(event: WorkflowEvent): boolean {
   return Boolean(
-    event.branches || event.paths || event.tags || event.cron || event.types || event.inputs ||
+    event.branches || event.paths || event.tags || event.types || event.inputs ||
+    event.cron !== undefined || event.schedule ||
     (event.unsupportedFields && Object.keys(event.unsupportedFields).length > 0)
   );
+}
+
+// `on.schedule` is a list of entries, not a mapping like the other events.
+// Before #2017 the GUI wrote the list nested under a second `schedule:` key.
+// Reading that too shows its cron, and the round-trip check then refuses GUI
+// mode for it, since GUI mode would rewrite it as a list.
+function parseSchedule(config: unknown): Pick<WorkflowEvent, 'cron' | 'schedule'> {
+  const entries = isPlainObject(config) ? config.schedule : config;
+  if (!Array.isArray(entries)) {
+    return {};
+  }
+  const first = entries[0];
+  if (isPlainObject(first) && typeof first.cron === 'string') {
+    return { cron: first.cron, schedule: entries };
+  }
+  return { schedule: entries };
+}
+
+function isScheduleList(event: WorkflowEvent): boolean {
+  return event.type === 'schedule' && (event.schedule !== undefined || event.cron !== undefined);
+}
+
+// Whatever the cron box holds is written, even empty, so the YAML never keeps a
+// cron the GUI no longer shows.
+function serializeSchedule(event: WorkflowEvent): unknown[] {
+  const entries = [...(event.schedule ?? [])];
+  if (event.cron !== undefined) {
+    const first = entries[0];
+    entries[0] = isPlainObject(first) ? { ...first, cron: event.cron } : { cron: event.cron };
+  }
+  return entries;
 }
 
 // Parse events from YAML 'on' field
@@ -285,6 +433,10 @@ function parseEvents(onField: any): WorkflowEvent[] {
     const eventConfig = onField[eventType];
     const event: WorkflowEvent = { type: eventType as any };
 
+    if (eventType === 'schedule') {
+      Object.assign(event, parseSchedule(eventConfig));
+    }
+
     if (eventConfig && typeof eventConfig === 'object' && !Array.isArray(eventConfig)) {
       if (eventConfig.branches) {
         event.branches = Array.isArray(eventConfig.branches) 
@@ -300,9 +452,6 @@ function parseEvents(onField: any): WorkflowEvent[] {
         event.tags = Array.isArray(eventConfig.tags)
           ? eventConfig.tags
           : [eventConfig.tags];
-      }
-      if (eventConfig.schedule && Array.isArray(eventConfig.schedule)) {
-        event.cron = eventConfig.schedule[0]?.cron;
       }
       if (eventConfig.types) {
         event.types = Array.isArray(eventConfig.types) 
@@ -360,6 +509,8 @@ function serializeEvents(events: WorkflowEvent[]): any {
   events.forEach(event => {
     if (!hasEventConfig(event)) {
       result[event.type] = null;
+    } else if (isScheduleList(event)) {
+      result[event.type] = serializeSchedule(event);
     } else {
       const config: any = {};
       if (event.branches && event.branches.length > 0) {
@@ -373,9 +524,6 @@ function serializeEvents(events: WorkflowEvent[]): any {
       }
       if (event.types && event.types.length > 0) {
         config.types = event.types;
-      }
-      if (event.cron) {
-        config.schedule = [{ cron: event.cron }];
       }
       // Handle workflow_call / workflow_dispatch inputs (see matching note
       // in parseEvents above).
@@ -425,13 +573,14 @@ function parseJobs(jobsField: any): WorkflowJob[] {
       if: job.if,
       needs: job.needs,
       timeoutMinutes: job['timeout-minutes'],
+      uses: job.uses,
       unsupportedFields: {}
     };
 
     // Store unsupported job fields
-    const supportedJobFields = ['name', 'runs-on', 'steps', 'env', 'if', 'needs', 'timeout-minutes'];
+    const supportedJobFields = new Set(['name', 'runs-on', 'steps', 'env', 'if', 'needs', 'timeout-minutes', 'uses']);
     Object.keys(job).forEach(key => {
-      if (!supportedJobFields.includes(key)) {
+      if (!supportedJobFields.has(key)) {
         result.unsupportedFields![key] = job[key];
       }
     });
@@ -445,16 +594,16 @@ function serializeJobs(jobs: WorkflowJob[]): any {
   const result: any = {};
   
   jobs.forEach(job => {
-    const jobConfig: any = {
-      'runs-on': job.runsOn,
-      steps: serializeSteps(job.steps)
-    };
+    const jobConfig: any = job.uses === undefined
+      ? { 'runs-on': job.runsOn, steps: serializeSteps(job.steps) }
+      : {};
 
     if (job.name) jobConfig.name = job.name;
     if (job.env && Object.keys(job.env).length > 0) jobConfig.env = job.env;
     if (job.if) jobConfig.if = job.if;
     if (job.needs && job.needs.length > 0) jobConfig.needs = job.needs;
     if (job.timeoutMinutes) jobConfig['timeout-minutes'] = job.timeoutMinutes;
+    if (job.uses !== undefined) jobConfig.uses = job.uses;
 
     // Add unsupported fields back
     if (job.unsupportedFields) {
@@ -476,6 +625,7 @@ function parseSteps(stepsField: any[]): WorkflowStep[] {
   return stepsField.map((step, index) => {
     const result: WorkflowStep = {
       id: step.id || `step-${index + 1}`,
+      yamlId: step.id,
       name: step.name,
       uses: step.uses,
       run: step.run,
@@ -510,6 +660,7 @@ function serializeSteps(steps: WorkflowStep[]): any[] {
     const stepConfig: any = {};
 
     if (step.name) stepConfig.name = step.name;
+    if (step.yamlId !== undefined) stepConfig.id = step.yamlId;
     if (step.uses) stepConfig.uses = step.uses;
     if (step.run) stepConfig.run = step.run;
     if (step.with && Object.keys(step.with).length > 0) stepConfig.with = step.with;
@@ -539,14 +690,8 @@ export interface ValidationError {
 export function validateWorkflow(gui: WorkflowGUI): ValidationError[] {
   const errors: ValidationError[] = [];
 
-  // Validate workflow name
-  if (!gui.name || gui.name.trim() === '') {
-    errors.push({
-      field: 'name',
-      message: 'Workflow name is required',
-      severity: 'error'
-    });
-  }
+  // No check on `name`: it is optional in GitHub Actions, which shows the
+  // file path when a workflow has none.
 
   // Validate events
   if (!gui.events || gui.events.length === 0) {
@@ -575,8 +720,8 @@ export function validateWorkflow(gui: WorkflowGUI): ValidationError[] {
         });
       }
 
-      // Validate runner
-      if (!job.runsOn || job.runsOn.trim() === '') {
+      // Validate runner. runs-on may also be a label list or a group map, kept as read.
+      if (!job.runsOn || (typeof job.runsOn === 'string' && job.runsOn.trim() === '')) {
         errors.push({
           field: `jobs[${jobIndex}].runsOn`,
           message: 'Runner is required',
@@ -584,36 +729,45 @@ export function validateWorkflow(gui: WorkflowGUI): ValidationError[] {
         });
       }
 
-      // Validate steps
-      if (!job.steps || job.steps.length === 0) {
-        errors.push({
-          field: `jobs[${jobIndex}].steps`,
-          message: 'At least one step is required',
-          severity: 'warning'
-        });
-      } else {
-        job.steps.forEach((step, stepIndex) => {
-          // Validate step has either uses or run
-          if (!step.uses && !step.run) {
-            errors.push({
-              field: `jobs[${jobIndex}].steps[${stepIndex}]`,
-              message: 'Step must have either "uses" (action) or "run" (script)',
-              severity: 'error'
-            });
-          }
-
-          // Validate action version if uses is present
-          if (step.uses && !step.uses.includes('@')) {
-            errors.push({
-              field: `jobs[${jobIndex}].steps[${stepIndex}].uses`,
-              message: 'Action must include a version (e.g., @v4)',
-              severity: 'warning'
-            });
-          }
-        });
-      }
+      validateJobSteps(job, jobIndex, errors);
     });
   }
 
   return errors;
+}
+
+// A job calling a reusable workflow has no steps of its own.
+function validateJobSteps(job: WorkflowJob, jobIndex: number, errors: ValidationError[]): void {
+  if (job.uses !== undefined) {
+    return;
+  }
+
+  if (!job.steps || job.steps.length === 0) {
+    errors.push({
+      field: `jobs[${jobIndex}].steps`,
+      message: 'At least one step is required',
+      severity: 'warning'
+    });
+    return;
+  }
+
+  job.steps.forEach((step, stepIndex) => {
+    // Validate step has either uses or run
+    if (!step.uses && !step.run) {
+      errors.push({
+        field: `jobs[${jobIndex}].steps[${stepIndex}]`,
+        message: 'Step must have either "uses" (action) or "run" (script)',
+        severity: 'error'
+      });
+    }
+
+    // Validate action version if uses is present
+    if (step.uses && !step.uses.includes('@')) {
+      errors.push({
+        field: `jobs[${jobIndex}].steps[${stepIndex}].uses`,
+        message: 'Action must include a version (e.g., @v4)',
+        severity: 'warning'
+      });
+    }
+  });
 }

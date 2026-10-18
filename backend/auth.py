@@ -13,7 +13,7 @@ import requests
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -30,8 +30,11 @@ from github_permissions import (
 )
 from models import Account, AuthSession, WorkspaceMember, SEED_ACCOUNT_GITHUB_USER  # ✅ Import the Account and WorkspaceMember models
 from authorization import lock_first_member_decision, workspace_is_uninitialized
+from error_detail import failure_kind
 
 router = APIRouter()
+
+ACCESS_DENIED_ERROR = "Access denied"
 
 # Error responses these endpoints can return, declared on each route so they
 # appear in the OpenAPI schema (and so generated clients know about them).
@@ -39,7 +42,7 @@ router = APIRouter()
 _ERROR_RESPONSES = {
     400: {"description": "Invalid request"},
     401: {"description": "Not authenticated"},
-    403: {"description": "Access denied"},
+    403: {"description": ACCESS_DENIED_ERROR},
     404: {"description": "User not found"},
     429: {"description": "Too many requests"},
     503: {"description": "Token encryption is not configured"},
@@ -100,41 +103,6 @@ _request_github_user: contextvars.ContextVar[Optional[str]] = contextvars.Contex
 ALLOW_INSECURE_HTTP = os.getenv("ALLOW_INSECURE_HTTP", "false").lower() == "true"
 
 HTTPS_SETUP_DOCS_URL = "https://actionsmanager.io/getting-started/https-setup.html"
-
-
-def _is_localhost(host: str) -> bool:
-    """
-    Check if a host is localhost or a local IP address.
-    
-    Args:
-        host: The hostname or IP address to check
-        
-    Returns:
-        True if the host is local, False otherwise
-    """
-    if not host:
-        return False
-    
-    # Remove port if present
-    if host.startswith("[") and "]" in host:
-        # IPv6 with port (e.g., "[::1]:8080")
-        host = host[1:host.index("]")]
-    elif ":" in host and host.count(":") == 1:
-        # IPv4 with port (e.g., "127.0.0.1:8080")
-        # Only split if there's exactly one colon (IPv4:port, not IPv6)
-        host = host.split(":")[0]
-    # If multiple colons and no brackets, it's probably IPv6 without port
-    
-    # Check for localhost names and loopback IPs
-    localhost_names = {
-        "localhost",
-        "127.0.0.1",
-        "::1",
-        "0.0.0.0",
-        "::",  # IPv6 any address
-    }
-    
-    return host.lower() in localhost_names
 
 
 def _validate_secure_connection(request: Request) -> None:
@@ -267,6 +235,14 @@ def _user_pat_status_payload(user: Account) -> dict:
     status = user.github_pat_status or ("configured" if configured else "not_configured")
     if not configured:
         message = "No personal access token configured."
+    elif user_tokens.has_unreadable_saved_token(user.github_user):
+        # The stored validation status describes a token we can no longer use.
+        status = "unreadable"
+        message = (
+            "The saved token cannot be decrypted, which usually means SECRET_KEY changed since it was "
+            "saved. Check that SECRET_KEY survives container updates, then save the personal access "
+            "token again to re-encrypt it under the current key."
+        )
     elif status == PermissionStatus.TOKEN_INVALID:
         message = "Stored token is invalid or expired."
     elif status in {PermissionStatus.MISSING_SCOPES, PermissionStatus.INSUFFICIENT_REPO_PERMISSIONS}:
@@ -275,6 +251,11 @@ def _user_pat_status_payload(user: Account) -> dict:
         message = "Stored token cannot access any repositories."
     elif status == PermissionStatus.MISSING_ORG_APPROVAL:
         message = "Organization policies are blocking this stored token."
+    elif status == PermissionStatus.UNKNOWN_ERROR:
+        message = (
+            "The stored token's permissions could not be checked with GitHub. They are checked again "
+            "each time you sign in or reopen ActionsManager."
+        )
     else:
         message = "Token configured."
     return {
@@ -674,28 +655,6 @@ def get_request_user() -> Optional[str]:
     return _request_github_user.get()
 
 
-def resolve_optional_session_user(request: Request, db: Session) -> Optional[Account]:
-    """Resolve the session user, or None when there is no valid session.
-
-    Same identity source as resolve_authenticated_user but never raises, for
-    read endpoints that must keep serving unauthenticated callers while still
-    personalising output when a session exists (e.g. per-user project order).
-    """
-    session_token = extract_session_token(request)
-    if not session_token:
-        return None
-
-    session = (
-        db.query(AuthSession)
-        .filter(AuthSession.token_hash == _hash_session_token(session_token))
-        .first()
-    )
-    if not session or session.revoked_at is not None or _as_utc(session.expires_at) <= _now_utc():
-        return None
-
-    return db.query(Account).filter(Account.github_user == session.github_user).first()
-
-
 def _persist_login_token_if_missing(user: Account, db: Session) -> None:
     """Durably save the login token of an account that only has one in memory.
 
@@ -777,16 +736,45 @@ def assert_session_owns_user(claimed_user: str, request: Request, db: Session) -
     Routes that take the caller's username as a ``github_user`` query parameter
     must call this — the parameter is client-supplied and proves nothing on its
     own.  Note this is only for parameters that name *the caller*: routes where
-    ``github_user`` names a project *owner* pass the caller separately in
-    X-GitHub-User, which WriteProtectionMiddleware pins to the session.
+    ``github_user`` names a project *owner* take the caller from the session
+    through ``authorization.get_current_user`` (#2241).
     """
     account = resolve_authenticated_user(request, db)
     if account.github_user.lower() != (claimed_user or "").strip().lower():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
+            detail=ACCESS_DENIED_ERROR,
         )
     return account
+
+
+def current_account(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    github_user: Annotated[
+        Optional[str],
+        Query(
+            deprecated=True,
+            description="Ignored: the caller comes from the session. Naming anyone else is refused.",
+        ),
+    ] = None,
+) -> Account:
+    """The signed-in caller's account, taken from the session (#2241).
+
+    Routes depend on this instead of trusting a client-supplied username.
+    It owns the legacy ``github_user`` query parameter, so a route converted to
+    it drops its own copy and cannot be steered by one. Not for routes where
+    ``github_user`` names a project owner: there it legitimately differs from
+    the caller.
+    """
+    account = resolve_authenticated_user(request, db)
+    claimed = (github_user or "").strip()
+    if claimed and claimed.lower() != account.github_user.lower():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ACCESS_DENIED_ERROR)
+    return account
+
+
+CurrentAccount = Annotated[Account, Depends(current_account)]
 
 
 def revoke_current_session(request: Request, db: Session) -> Optional[str]:
@@ -1130,7 +1118,7 @@ def _ensure_workspace_membership(user: Account, db: Session) -> None:
 class SignIn:
     """What a sign-in records beyond the GitHub user. The self-hosted rules.
 
-    cloud.signin.CloudSignIn replaces them at startup (use_sign_in); nothing
+    The cloud build replaces them at startup (use_sign_in); nothing
     here knows which deployment it runs in.
     """
 
@@ -1344,7 +1332,6 @@ def get_user_details(username: str, request: Request, db: Annotated[Session, Dep
         "github_user": user.github_user,
         "github_email": user.github_email,
         "account_type": effective_tier,  # Return effective tier instead of raw account_type
-        "installation_mode": config.get_installation_mode(),
         "plan": describe_plan(user),
         "github_account_type": _normalize_github_account_type(user.github_account_type),
         "connected_github_account": connected_github_account,
@@ -1524,9 +1511,9 @@ def check_github_permissions(username: str, request: Request, db: Annotated[Sess
             "valid": False,
             "missing_scopes": [],
             "granted_scopes": [],
-            "issues": [f"Error checking permissions: {str(e)}"],
+            "issues": [f"Error checking permissions: {failure_kind(e)}"],
             "warnings": [],
             "recommendations": ["Please try signing in again. If the problem persists, contact support."],
-            "message": f"⚠️ Error checking GitHub permissions: {str(e)}",
+            "message": f"⚠️ Error checking GitHub permissions: {failure_kind(e)}",
             "details": {}
         }

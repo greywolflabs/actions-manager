@@ -146,13 +146,23 @@ const UserAvatar: React.FC<UserAvatarProps> = ({
   const tokenStatusLabel = useMemo((): string => {
     if (!tokenConfigured) return 'Not configured';
     switch (tokenStatus?.status) {
+      case 'unreadable':
+        return 'Saved but unreadable';
       case 'token_invalid':
         return 'Invalid or expired';
       case 'missing_scopes':
       case 'insufficient_repo_permissions':
         return 'Missing required permissions';
-      default:
+      case 'missing_repo_access':
+        return 'No repository access';
+      case 'missing_org_approval':
+        return 'Blocked by organization policy';
+      case 'valid':
+      case 'configured':
         return 'Configured';
+      default:
+        // unknown_error, or a status this menu predates: never call it healthy (#2308).
+        return 'Not verified';
     }
   }, [tokenConfigured, tokenStatus?.status]);
 
@@ -244,7 +254,7 @@ const UserAvatar: React.FC<UserAvatarProps> = ({
             </AvatarFallback>
           </Avatar>
           <span
-            className="max-w-[10rem] truncate text-sm font-medium text-text-primary dark:text-text-primary-dark"
+            className="max-w-40 truncate text-sm font-medium text-text-primary dark:text-text-primary-dark"
             title={username || undefined}
           >
             {username}
