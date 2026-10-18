@@ -19,8 +19,8 @@ from sqlalchemy.pool import StaticPool
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from models import (
-    Base, Account, CustomFile, Project, ProjectEnvVar, ProjectWorkflow, Workflow,
-    WorkspaceMember,
+    Base, Account, CustomFile, Project, ProjectEnvVar, ProjectRepo, ProjectWorkflow, Repo,
+    Workflow, WorkspaceMember,
 )
 from main import app
 from database import get_db
@@ -115,6 +115,20 @@ def test_a_member_cannot_delete_another_users_project_by_naming_its_owner(signed
         "github_user": OWNER, "project_name": PROJECT, "delete_github_resources": False,
     })
 
+    # The body's name is ignored (#2241): the member's own projects hold no "Payments".
+    assert resp.status_code == 404, resp.text
+    assert _project_exists(project_id)
+
+
+def test_naming_someone_else_in_the_query_is_refused(signed_in):
+    """auth.current_account owns the legacy github_user query parameter (#2241)."""
+    project_id = _seed()
+
+    resp = signed_in(OWNER).request(
+        "DELETE", f"/api/projects/{PROJECT}/enhanced", params={"github_user": MEMBER},
+        json={"github_user": OWNER, "project_name": PROJECT, "delete_github_resources": False},
+    )
+
     assert resp.status_code == 403, resp.text
     assert _project_exists(project_id)
 
@@ -123,50 +137,65 @@ def test_the_owner_can_still_delete_their_own_project(signed_in):
     project_id = _seed()
 
     resp = signed_in(OWNER).request("DELETE", f"/api/projects/{PROJECT}/enhanced", json={
-        "github_user": OWNER, "project_name": PROJECT, "delete_github_resources": False,
+        "project_name": PROJECT, "delete_github_resources": False,
     })
 
     assert resp.status_code == 200, resp.text
     assert not _project_exists(project_id)
 
 
-# --- POST /api/update-workflow ----------------------------------------------
+def test_a_name_in_the_body_is_ignored(signed_in):
+    """The caller comes from the session (#2241), not a github_user the body still carries."""
+    project_id = _seed()
 
-def _update_workflow(client):
-    return client.post("/api/update-workflow", json={
+    resp = signed_in(OWNER).request("DELETE", f"/api/projects/{PROJECT}/enhanced", json={
+        "github_user": MEMBER, "project_name": PROJECT, "delete_github_resources": False,
+    })
+
+    assert resp.status_code == 200, resp.text
+    assert not _project_exists(project_id)
+
+
+# --- POST /api/update-project-files ----------------------------------------------
+
+def _update_workflow(client, repo_name="gate-member/own-repo"):
+    return client.post("/api/update-project-files", json={
         "project_name": PROJECT,
-        "repo_names": ["gate-member/own-repo"],
+        "repo_names": [repo_name],
         "workflows": [{"name": "deploy", "content": "on: push\n"}],
     })
 
 
-@mock.patch("workflows._restore_under_review_after_pr_update")
-@mock.patch("workflows._handle_reusable_workflows_section", return_value=None)
-@mock.patch("workflows._handle_regular_workflows_section", return_value=None)
-def test_a_member_without_editor_cannot_update_another_projects_workflows(
-    regular, _reusable, restore, signed_in,
-):
+@mock.patch("workflows.create_pull_requests", return_value={"results": {}})
+def test_a_member_without_editor_cannot_update_another_projects_workflows(campaign, signed_in):
     _seed()
 
     with mock.patch("workflows.user_tokens", {MEMBER: "member-token"}):
         resp = _update_workflow(signed_in(MEMBER))
 
     assert resp.status_code == 403, resp.text
-    regular.assert_not_called()
-    restore.assert_not_called()
+    campaign.assert_not_called()
 
 
-@mock.patch("workflows._restore_under_review_after_pr_update")
-@mock.patch("workflows._handle_reusable_workflows_section", return_value=None)
-@mock.patch("workflows._handle_regular_workflows_section", return_value=None)
-def test_the_owner_still_reaches_the_workflow_update(regular, _reusable, _restore, signed_in):
-    _seed()
+@mock.patch("workflows.create_pull_requests", return_value={"results": {}})
+def test_the_owner_still_reaches_the_workflow_update(campaign, signed_in):
+    project_id = _seed()
+    # A repository of the project's own: save-and-push writes nowhere else (#2316).
+    db = TestingSessionLocal()
+    try:
+        repo = Repo(repo_name="gate-owner/app")
+        db.add(repo)
+        db.flush()
+        db.add(ProjectRepo(project_id=project_id, repo_id=repo.repo_id))
+        db.commit()
+    finally:
+        db.close()
 
     with mock.patch("workflows.user_tokens", {OWNER: "owner-token"}):
-        resp = _update_workflow(signed_in(OWNER))
+        resp = _update_workflow(signed_in(OWNER), "gate-owner/app")
 
     assert resp.status_code == 200, resp.text
-    regular.assert_called_once()
+    campaign.assert_called_once()
 
 
 # --- DELETE /api/projects/{id}/custom-files/{file_id}?scope=project ---------
@@ -218,10 +247,14 @@ def test_read_only_cannot_list_another_users_reusable_workflows(signed_in):
     _seed()
     _seed_owner_rwx_project()
 
-    resp = signed_in(READER).get("/api/rwx-workflows", params={"github_user": OWNER})
+    resp = signed_in(READER).get("/api/rwx-workflows")
+    named = signed_in(READER).get("/api/rwx-workflows", params={"github_user": OWNER})
 
     assert resp.status_code == 200, resp.text
     assert "secret_owner_job" not in resp.text
+    # Naming the owner does not borrow their view (#2241).
+    assert named.status_code == 403, named.text
+    assert "secret_owner_job" not in named.text
 
 
 def test_the_owner_still_lists_their_own_reusable_workflows(signed_in):

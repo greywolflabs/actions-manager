@@ -7,7 +7,6 @@ import {
   mergePreflightValidationPR,
   runPreflightValidation,
 } from "../api/pullRequests";
-import { deployCodeowners } from "../api/codeowners";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { getDocsUrl } from "../help/helpLinks";
@@ -28,8 +27,8 @@ interface CreatePRModalProps {
   projectCode?: string;
   usePrefix?: boolean;
   customFiles?: Array<{ id: number; file_path: string; file_status: string; pending_delete: boolean }>;
-  /** Repos available for CODEOWNERS inclusion in this campaign. */
-  codeownersRepos?: string[];
+  /** The project's CODEOWNERS file, which a campaign can deliver to every repository it targets. */
+  codeowners?: { filePath: string; status: string } | null;
   validationRepo?: string | null;
   preflightRequired?: boolean;
   preflightStatus?: string | null;
@@ -44,7 +43,7 @@ interface CreatePRModalProps {
   }) => void;
   onClose: () => void;
   /** `targetedRepos` is what the user left ticked, not what the modal offered. */
-  onSuccess: (selectedWorkflowNames: string[], selectedReusableWorkflowNames: string[], selectedCustomFileIds: number[], selectedCodeownersRepos: string[], targetedRepos: string[]) => void;
+  onSuccess: (selectedWorkflowNames: string[], selectedReusableWorkflowNames: string[], selectedCustomFileIds: number[], includedCodeowners: boolean, targetedRepos: string[]) => void;
 }
 
 // ─── Pure helpers (no component state) ──────────────────────────────────────
@@ -266,13 +265,19 @@ function usePreflightValidation(
 // what an unnamed campaign would have been called anyway. Deliberately a
 // separate copy — sharing it would mean an API round-trip to name a text box.
 function suggestCampaignName(
-  workflows: Set<string>, reusableWorkflows: Set<string>, customFileCount: number, codeownersCount: number,
+  workflows: Set<string>, reusableWorkflows: Set<string>, customFileCount: number, includeCodeowners: boolean,
 ): string {
   const names = [...workflows, ...reusableWorkflows].map(normalizeWorkflowFilename);
   if (names.length === 1) return `Update ${names[0]}`;
   if (names.length > 1) return `Update ${names[0]} + ${names.length - 1} more`;
-  if (customFileCount > 0 || codeownersCount > 0) return "File rollout";
+  if (customFileCount > 0 || includeCodeowners) return "File rollout";
   return "";
+}
+
+/** Ticked when it has changes to deliver, or for a newly added repo, which needs every file. */
+function includesCodeownersByDefault(codeowners: CreatePRModalProps["codeowners"], preselectAll: boolean): boolean {
+  if (!codeowners) return false;
+  return preselectAll || codeowners.status !== "synced_with_github";
 }
 
 // ─── useCreatePRCampaign ─────────────────────────────────────────────────────
@@ -284,14 +289,14 @@ interface CreatePRCampaignParams {
   selectedWorkflows: Set<string>;
   selectedReusableWorkflows: Set<string>;
   selectedCustomFileIds: Set<number>;
-  onSuccess: (workflowNames: string[], reusableNames: string[], customFileIds: number[], codeownersRepos: string[], targetedRepos: string[]) => void;
-  selectedCodeownersRepos: Set<string>;
+  includeCodeowners: boolean;
+  onSuccess: (workflowNames: string[], reusableNames: string[], customFileIds: number[], includedCodeowners: boolean, targetedRepos: string[]) => void;
   campaignName: string;
   campaignDescription: string;
 }
 
 function useCreatePRCampaign({
-  user, projectName, selectedRepos, selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, selectedCodeownersRepos, onSuccess,
+  user, projectName, selectedRepos, selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, includeCodeowners, onSuccess,
   campaignName, campaignDescription,
 }: CreatePRCampaignParams) {
   const [creating, setCreating] = useState(false);
@@ -306,49 +311,27 @@ function useCreatePRCampaign({
 
   const handleCreate = useCallback(async () => {
     const hasWorkflowsOrFiles = selectedWorkflows.size > 0 || selectedReusableWorkflows.size > 0 || selectedCustomFileIds.size > 0;
-    const hasCodeowners = selectedCodeownersRepos.size > 0;
-    // Caller repos are only required when there are workflows/custom files to deploy
-    if (selectedRepos.size === 0 && hasWorkflowsOrFiles) { setError("Please select at least one repository"); return; }
-    if (!hasWorkflowsOrFiles && !hasCodeowners) {
+    // CODEOWNERS goes to the caller repositories like a custom file, so it needs them too.
+    if (selectedRepos.size === 0 && (hasWorkflowsOrFiles || includeCodeowners)) { setError("Please select at least one repository"); return; }
+    if (!hasWorkflowsOrFiles && !includeCodeowners) {
       setError("Please select at least one workflow, custom file, or CODEOWNERS"); return;
     }
     setCreating(true);
     setError(null);
     setResults(null);
-    const codeownersRepoList = Array.from(selectedCodeownersRepos);
-
-    // Deploy CODEOWNERS PRs under the given campaign so they appear in the same card.
-    // Repos already merged into an existing workflow/custom-file PR (see
-    // codeowners_merged_repos) are skipped here — they'd otherwise get a second,
-    // redundant PR for the same repo.
-    const deployCodeownersRepos = async (
-      campaignId?: number, alreadyMerged: string[] = [],
-    ): Promise<{ succeeded: string[]; failed: string[] }> => {
-      const remaining = codeownersRepoList.filter(repo => !alreadyMerged.includes(repo));
-      if (remaining.length === 0) return { succeeded: [...alreadyMerged], failed: [] };
-      const deployResults = await Promise.allSettled(
-        remaining.map(repo => deployCodeowners(repo, user, projectName, { mode: 'pr', campaignId }))
-      );
-      const succeeded: string[] = [...alreadyMerged];
-      const failed: string[] = [];
-      deployResults.forEach((r, i) => {
-        if (r.status === 'fulfilled') succeeded.push(remaining[i]);
-        else { failed.push(remaining[i]); console.error(`CODEOWNERS PR failed for ${remaining[i]}:`, r.reason); }
-      });
-      return { succeeded, failed };
-    };
+    const succeed = () => onSuccess(
+      Array.from(selectedWorkflows), Array.from(selectedReusableWorkflows), Array.from(selectedCustomFileIds),
+      includeCodeowners, Array.from(selectedRepos),
+    );
 
     try {
-      // Always go through createPullRequests — it creates the campaign record so that
-      // CODEOWNERS PRs (deployed afterwards) can share the same campaign_id and appear
-      // as a single campaign card rather than a separate legacy group.
       const response = await createPullRequests(user, projectName, {
         selectedRepos: Array.from(selectedRepos),
         selectedWorkflows: selectedWorkflows.size > 0 ? Array.from(selectedWorkflows) : undefined,
         selectedReusableWorkflows: selectedReusableWorkflows.size > 0 ? Array.from(selectedReusableWorkflows) : undefined,
         // Always send array so empty selection explicitly excludes files (not undefined=all)
         selectedCustomFileIds: Array.from(selectedCustomFileIds),
-        selectedCodeownersRepos: hasCodeowners ? codeownersRepoList : undefined,
+        includeCodeowners,
         campaign: { name: campaignName.trim() || undefined, description: campaignDescription.trim() || undefined },
       });
       if (response.task_id) {
@@ -359,15 +342,11 @@ function useCreatePRCampaign({
             setTaskStatus(statusResponse);
             if (statusResponse.status === "completed" || statusResponse.status === "error") {
               if (prPollIntervalRef.current) { clearInterval(prPollIntervalRef.current); prPollIntervalRef.current = null; }
+              setCreating(false);
               if (statusResponse.status === "completed") {
-                const { succeeded } = await deployCodeownersRepos(
-                  statusResponse.campaign_id, statusResponse.codeowners_merged_repos || [],
-                );
-                setCreating(false);
                 setResults({ message: "Pull requests created successfully", results: statusResponse.results, prs_created: statusResponse.prs_created });
-                onSuccess(Array.from(selectedWorkflows), Array.from(selectedReusableWorkflows), Array.from(selectedCustomFileIds), succeeded, Array.from(selectedRepos));
+                succeed();
               } else {
-                setCreating(false);
                 setError(statusResponse.error || "An error occurred during PR creation.");
               }
             }
@@ -376,17 +355,16 @@ function useCreatePRCampaign({
           }
         }, 1000);
       } else {
-        const { succeeded } = await deployCodeownersRepos(response.campaign_id, response.codeowners_merged_repos || []);
         setResults(response);
         setCreating(false);
-        onSuccess(Array.from(selectedWorkflows), Array.from(selectedReusableWorkflows), Array.from(selectedCustomFileIds), succeeded, Array.from(selectedRepos));
+        succeed();
       }
     } catch (err: any) {
       console.error("Error creating pull requests:", err);
       setError(err.message || "Failed to create pull requests");
       setCreating(false);
     }
-  }, [user, projectName, selectedRepos, selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, selectedCodeownersRepos, onSuccess, campaignName, campaignDescription]);
+  }, [user, projectName, selectedRepos, selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, includeCodeowners, onSuccess, campaignName, campaignDescription]);
 
   return { creating, error, results, taskStatus, handleCreate };
 }
@@ -764,10 +742,9 @@ interface PRCreationFormProps {
   onToggleReusableWorkflow: (name: string) => void;
   onSelectAllReusableWorkflows: () => void;
   onDeselectAllReusableWorkflows: () => void;
-  codeownersRepos?: string[];
-  selectedCodeownersRepos: Set<string>;
-  onSelectAllCodeownersRepos: () => void;
-  onDeselectAllCodeownersRepos: () => void;
+  codeowners?: { filePath: string; status: string } | null;
+  includeCodeowners: boolean;
+  onToggleCodeowners: () => void;
 }
 
 const PRCreationForm: React.FC<PRCreationFormProps> = ({
@@ -784,7 +761,7 @@ const PRCreationForm: React.FC<PRCreationFormProps> = ({
   onToggleRepo, onSelectAllRepos, onDeselectAllRepos,
   onToggleWorkflow, onSelectAllWorkflows, onDeselectAllWorkflows,
   onToggleReusableWorkflow, onSelectAllReusableWorkflows, onDeselectAllReusableWorkflows,
-  codeownersRepos = [], selectedCodeownersRepos, onSelectAllCodeownersRepos, onDeselectAllCodeownersRepos,
+  codeowners, includeCodeowners, onToggleCodeowners,
 }) => {
   const statusMessage = getPreflightStatusMessage(preflight.status, preflight.prState);
   const requiredMessage = getPreflightRequiredMessage(preflight.status, requiresPreflight, preflightPassed);
@@ -894,19 +871,19 @@ const PRCreationForm: React.FC<PRCreationFormProps> = ({
           </div>
         </div>
       )}
-      {codeownersRepos.length > 0 && (
+      {codeowners && (
         <div className="repo-selection">
           <h3 className="selection-section-title">CODEOWNERS</h3>
           <div className="repo-list">
-            <label className={`repo-item ${selectedCodeownersRepos.size > 0 ? "selected" : ""}`}>
+            <label className={`repo-item ${includeCodeowners ? "selected" : ""}`}>
               <input
                 type="checkbox"
-                checked={selectedCodeownersRepos.size > 0}
-                onChange={() => selectedCodeownersRepos.size > 0 ? onDeselectAllCodeownersRepos() : onSelectAllCodeownersRepos()}
+                checked={includeCodeowners}
+                onChange={onToggleCodeowners}
                 disabled={creating}
               />
-              <span className="repo-name">.github/CODEOWNERS</span>
-              <span className="workflow-status-badge">{codeownersRepos.length} repo{codeownersRepos.length !== 1 ? "s" : ""}</span>
+              <span className="repo-name">{codeowners.filePath}</span>
+              <span className="workflow-status-badge">every caller repository</span>
             </label>
           </div>
         </div>
@@ -964,7 +941,7 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
   projectCode,
   usePrefix,
   customFiles = [],
-  codeownersRepos = [],
+  codeowners = null,
   validationRepo = null,
   preflightRequired = false,
   preflightStatus = null,
@@ -1004,15 +981,24 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
   const [selectedWorkflows, setSelectedWorkflows] = useState<Set<string>>(
     new Set((!preselectAllWorkflows && changedWorkflows.length > 0 ? changedWorkflows : workflows).map((w) => w.name))
   );
+  // A campaign for a newly added repo (preselectAllWorkflows) needs every file
+  // that repo should hold. A reusable workflow this project owns is one of them;
+  // a linked one lives in its RWX project's repo, so it stays changed-only.
   const [selectedReusableWorkflows, setSelectedReusableWorkflows] = useState<Set<string>>(
-    new Set(changedReusableWorkflows.map((w) => w.name))
+    new Set(
+      reusableWorkflows
+        .filter((w) => w.status !== "synced_with_github" || (preselectAllWorkflows && w.deliversToProjectRepos))
+        .map((w) => w.name)
+    )
   );
 
   const changedCustomFiles = useMemo(() => customFiles.filter((f) => f.file_status !== "synced_with_github" || f.pending_delete), [customFiles]);
   const [selectedCustomFileIds, setSelectedCustomFileIds] = useState<Set<number>>(
     new Set(changedCustomFiles.map((f) => f.id))
   );
-  const [selectedCodeownersRepos, setSelectedCodeownersRepos] = useState<Set<string>>(new Set(codeownersRepos));
+  const [includeCodeowners, setIncludeCodeowners] = useState<boolean>(
+    () => includesCodeownersByDefault(codeowners, preselectAllWorkflows)
+  );
 
   const [campaignName, setCampaignName] = useState("");
   const [campaignDescription, setCampaignDescription] = useState("");
@@ -1020,8 +1006,8 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
   // overwrites a name the user typed.
   const [campaignNameTouched, setCampaignNameTouched] = useState(false);
   const suggestedCampaignName = useMemo(
-    () => suggestCampaignName(selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds.size, selectedCodeownersRepos.size),
-    [selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, selectedCodeownersRepos],
+    () => suggestCampaignName(selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds.size, includeCodeowners),
+    [selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, includeCodeowners],
   );
   useEffect(() => {
     if (!campaignNameTouched) setCampaignName(suggestedCampaignName);
@@ -1034,7 +1020,7 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
   );
 
   const { creating, error, results, taskStatus, handleCreate } = useCreatePRCampaign({
-    user, projectName, selectedRepos, selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, selectedCodeownersRepos, onSuccess,
+    user, projectName, selectedRepos, selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, includeCodeowners, onSuccess,
     campaignName, campaignDescription,
   });
 
@@ -1060,8 +1046,9 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
   const campaignBlockedByPreflight = requiresPreflight && !preflightPassed;
   const validationActionInProgress = creating || preflight.running || preflight.refreshing || preflight.closing || preflight.merging;
   const hasWorkflowsOrFiles = selectedWorkflows.size > 0 || selectedReusableWorkflows.size > 0 || selectedCustomFileIds.size > 0;
-  const canCreate = (selectedCodeownersRepos.size > 0 || hasWorkflowsOrFiles)
-    && (!hasWorkflowsOrFiles || selectedRepos.size > 0)
+  // Every selection, CODEOWNERS included, is delivered to the caller repositories.
+  const canCreate = (includeCodeowners || hasWorkflowsOrFiles)
+    && selectedRepos.size > 0
     && (!requiresPreflight || preflightPassed);
 
   const selectedReusableSourceRepos = useMemo(() => {
@@ -1079,13 +1066,12 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
 
   const totalPRTargetRepos = useMemo(() => {
     const allTargets = new Set<string>();
-    if (selectedWorkflows.size > 0 || selectedCustomFileIds.size > 0 || ownedReusableSelected) {
+    if (selectedWorkflows.size > 0 || selectedCustomFileIds.size > 0 || ownedReusableSelected || includeCodeowners) {
       selectedRepos.forEach((repo) => allTargets.add(repo));
     }
     selectedReusableSourceRepos.forEach((repo) => allTargets.add(repo));
-    selectedCodeownersRepos.forEach((repo) => allTargets.add(repo));
     return allTargets;
-  }, [selectedRepos, selectedReusableSourceRepos, ownedReusableSelected, selectedWorkflows.size, selectedCustomFileIds.size, selectedCodeownersRepos]);
+  }, [selectedRepos, selectedReusableSourceRepos, ownedReusableSelected, selectedWorkflows.size, selectedCustomFileIds.size, includeCodeowners]);
 
   const formattedPreflightStatus = useMemo(() => {
     const s = preflight.status || "not_run";
@@ -1176,10 +1162,9 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
               onToggleReusableWorkflow={handleToggleReusableWorkflow}
               onSelectAllReusableWorkflows={() => setSelectedReusableWorkflows(new Set(reusableWorkflows.map((w) => w.name)))}
               onDeselectAllReusableWorkflows={() => setSelectedReusableWorkflows(new Set())}
-              codeownersRepos={codeownersRepos}
-              selectedCodeownersRepos={selectedCodeownersRepos}
-              onSelectAllCodeownersRepos={() => setSelectedCodeownersRepos(new Set(codeownersRepos))}
-              onDeselectAllCodeownersRepos={() => setSelectedCodeownersRepos(new Set())}
+              codeowners={codeowners}
+              includeCodeowners={includeCodeowners}
+              onToggleCodeowners={() => setIncludeCodeowners((included) => !included)}
             />
           )}
         </div>
@@ -1192,7 +1177,7 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
             <>
               <Button onClick={onClose} variant="secondary" disabled={creating}>Cancel</Button>
               <Button data-testid="confirm-create-prs" onClick={handleCreate} disabled={creating || !canCreate}>
-                {createButtonText(creating, preflightConfigured, totalPRTargetRepos.size, totalSelectedWorkflows, selectedCustomFileIds.size + (selectedCodeownersRepos.size > 0 ? 1 : 0))}
+                {createButtonText(creating, preflightConfigured, totalPRTargetRepos.size, totalSelectedWorkflows, selectedCustomFileIds.size + (includeCodeowners ? 1 : 0))}
               </Button>
             </>
           )}

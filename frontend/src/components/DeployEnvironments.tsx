@@ -38,6 +38,7 @@ import {
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 import ConfigBadge from "./ConfigBadge";
+import { apiErrorMessage } from "../utils/apiErrorMessage";
 
 // TypeScript interfaces
 interface Environment {
@@ -242,7 +243,7 @@ const DeployEnvironments: React.FC<DeployEnvironmentsProps> = ({
       setSuccessMessage(`Environment "${trimmedName}" created in GitHub.`);
     } catch (error: any) {
       setErrorMessage(
-        error.response?.data?.error || "Failed to create environment."
+        error.response?.data?.error || apiErrorMessage(error, "Failed to create environment.")
       );
     } finally {
       setIsSaving(false);

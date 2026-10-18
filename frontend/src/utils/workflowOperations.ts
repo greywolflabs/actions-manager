@@ -1,4 +1,4 @@
-import { saveWorkflows, updateWorkflows, deleteWorkflowFromGitHub, deleteWorkflowFromDatabase, deleteReusableWorkflowFromGitHub } from '../api/workflows';
+import { saveWorkflows, updateWorkflows, deleteWorkflowFromGitHub, deleteWorkflowFromDatabase, deleteReusableWorkflowFromGitHub, type UpdateWorkflowsResponse } from '../api/workflows';
 import { saveRxWorkflows } from '../api/rxworkflows';
 import { updateLinkedReusableWorkflow } from '../api/projects';
 import { Workflow, RXWorkflow, UnifiedWorkflowItem } from '../types/workflow';
@@ -6,11 +6,20 @@ import type { RemovalDelivery, RemovalScope } from '../components/RemovalScopeDi
 import { WorkflowResult } from '../types/workflowResponse';
 import { RwxWorkflow } from '../api/projects';
 import { normalizeWorkflowStem, setWorkflowYamlName } from './workflowFilename';
+import type { WorkflowKindChange } from './workflowKindChanges';
 import { toast } from './toast';
-import { WorkflowGUI } from './workflowGuiConversion';
 import { tour } from './tour';
 
 // Save Draft functionality
+// A save whose trigger change moved the workflow to the other section says so,
+// or the workflow appears to vanish from where the user was editing it.
+const draftSavedMessage = (stem: string, kindChanges: WorkflowKindChange[]): string => {
+  const saved = `Workflow '${stem}.yml' saved as draft.`;
+  if (kindChanges.length === 0) return saved;
+  const kind = kindChanges[0].is_reusable ? 'reusable' : 'regular';
+  return `${saved} Its trigger makes it a ${kind} workflow now.`;
+};
+
 export const saveDraftWorkflow = async (
   index: number | null,
   type: 'regular' | 'reusable',
@@ -22,7 +31,8 @@ export const saveDraftWorkflow = async (
   markWorkflowAsSaved?: (index: number, type: 'regular' | 'reusable', workflowStatus?: string) => void,
   fetchWorkflowsCount?: () => Promise<void>,
   refreshProjectsList?: () => Promise<void>,
-  onProjectStateChange?: (state: string) => void
+  onProjectStateChange?: (state: string) => void,
+  applyKindChanges?: (changes: WorkflowKindChange[]) => void
 ): Promise<void> => {
   if (index === null) return;
   
@@ -52,12 +62,14 @@ export const saveDraftWorkflow = async (
         ? 'committed_locally'
         : 'new';
 
+    let kindChanges: WorkflowKindChange[] = [];
     if (type === 'regular') {
       const singleWorkflow: Workflow[] = [{ ...workflows[index], name: stem }];
       const saveResponse = await saveWorkflows(user, projectName, singleWorkflow);
       if (!saveResponse) {
         throw new Error("Invalid response from save API");
       }
+      kindChanges = saveResponse.kind_changes ?? [];
       // Notify parent of project state change if it changed (e.g. new → draft)
       if (onProjectStateChange && saveResponse.pr_state) {
         onProjectStateChange(saveResponse.pr_state);
@@ -68,6 +80,7 @@ export const saveDraftWorkflow = async (
       if (!saveResponse) {
         throw new Error("Invalid response from save API");
       }
+      kindChanges = saveResponse.kind_changes ?? [];
       // Notify parent of project state change if it changed (e.g. new → draft)
       // so the Create Pull Requests button enables without a page refresh
       if (onProjectStateChange && saveResponse.pr_state) {
@@ -78,10 +91,12 @@ export const saveDraftWorkflow = async (
     if (markWorkflowAsSaved) {
       markWorkflowAsSaved(index, type, newWorkflowStatus);
     }
+    // After the "saved" marks: the move is keyed by name and applies on top.
+    applyKindChanges?.(kindChanges);
     // This is the "Commit Locally" the tour points at — the editor's primary
     // action routes here, not through ProjectMgmt's toolbar save.
     tour.completed('commit-workflow');
-    toast.success(`Workflow '${stem}.yml' saved as draft.`);
+    toast.success(draftSavedMessage(stem, kindChanges));
     
     // Update count for free accounts
     if (accountType === "free" && fetchWorkflowsCount) {
@@ -98,21 +113,86 @@ export const saveDraftWorkflow = async (
   }
 };
 
+// The server pushes only to the project's own repositories (#2316). One ticked
+// but not saved yet is skipped, and a plain success would imply it got the push.
+const warnSkippedRepos = (skipped?: string[]): void => {
+  if (!skipped?.length) return;
+  const pronoun = skipped.length === 1 ? 'it' : 'them';
+  toast.warning(`Not pushed to ${skipped.join(', ')}: not part of this project yet. Save the project to add ${pronoun}.`);
+};
+
+// The repositories of the "owner/repo on branch" targets a pull request now carries the push to.
+const reposWithPullRequest = (results: Record<string, unknown>): string[] => [
+  ...new Set(
+    Object.entries(results)
+      .filter(([, r]) => {
+        const status = (r as WorkflowResult | null)?.status;
+        return status === 'pr_created' || status === 'pr_updated';
+      })
+      .map(([target]) => target.split(' on ')[0]),
+  ),
+];
+
+// Every Commit and Update PR reports a push the same way: the repositories whose
+// pull request now carries it, even when another failed, then the failure.
+export const assertPushed = (
+  updateResponse: UpdateWorkflowsResponse,
+  onReposDelivered?: (repos: string[]) => void
+): void => {
+  if (updateResponse.error) {
+    throw new Error(updateResponse.error);
+  }
+  const results = updateResponse.results || {};
+  onReposDelivered?.(reposWithPullRequest(results));
+  const hasErrors = Object.values(results).some(
+    (r): r is WorkflowResult => typeof r === 'object' && r !== null && r.status === 'error'
+  );
+  if (hasErrors) {
+    throw new Error("One or more repositories failed to update. Check console for details.");
+  }
+  warnSkippedRepos(updateResponse.skipped_repos);
+};
+
+/** Who pushes where for a Commit and Update PR, and what the page refreshes after it. */
+export interface PullRequestPush {
+  user: string;
+  projectName: string;
+  selectedRepos: string[];
+  fetchWorkflowsCount?: () => Promise<void>;
+  refreshProjectsList?: () => Promise<void>;
+  onProjectStateChange?: (state: string) => void;
+  onReposDelivered?: (repos: string[]) => void;
+}
+
+const refreshAfterPush = async (push: PullRequestPush): Promise<void> => {
+  await push.fetchWorkflowsCount?.();
+  await push.refreshProjectsList?.();
+};
+
+// The save a workflow's push then delivers from (as stem — backend handles .yml suffix).
+const saveBeforePush = async (
+  type: 'regular' | 'reusable',
+  index: number,
+  workflows: Workflow[],
+  rxworkflows: RXWorkflow[],
+  stem: string,
+  push: PullRequestPush
+): Promise<void> => {
+  const saveResponse = type === 'regular'
+    ? await saveWorkflows(push.user, push.projectName, [{ ...workflows[index], name: stem }])
+    : await saveRxWorkflows(push.user, push.projectName, [{ ...rxworkflows[index], name: stem }]);
+  if (!saveResponse) throw new Error("Invalid response from save API");
+  if (saveResponse.pr_state) push.onProjectStateChange?.(saveResponse.pr_state);
+};
+
 // Commit workflow changes and update the existing open pull request
 export const commitAndUpdatePRWorkflow = async (
   index: number | null,
   type: 'regular' | 'reusable',
   workflows: Workflow[],
   rxworkflows: RXWorkflow[],
-  user: string,
-  projectName: string,
-  selectedRepos: string[],
-  regexPattern: string,
-  branchOption: string = "default",
-  markWorkflowAsSaved?: (index: number, type: 'regular' | 'reusable', workflowStatus?: string) => void,
-  fetchWorkflowsCount?: () => Promise<void>,
-  refreshProjectsList?: () => Promise<void>,
-  onProjectStateChange?: (state: string) => void
+  push: PullRequestPush,
+  markWorkflowAsSaved?: (index: number, type: 'regular' | 'reusable', workflowStatus?: string) => void
 ): Promise<boolean> => {
   if (index === null) return false;
 
@@ -132,65 +212,18 @@ export const commitAndUpdatePRWorkflow = async (
   }
 
   try {
-    // Step 1: Save updated content to DB (as stem — backend handles .yml suffix)
-    if (type === 'regular') {
-      const saveResponse = await saveWorkflows(user, projectName, [{ ...workflows[index], name: stem }]);
-      if (!saveResponse) throw new Error("Invalid response from save API");
-      if (onProjectStateChange && saveResponse.pr_state) {
-        onProjectStateChange(saveResponse.pr_state);
-      }
-    } else {
-      const saveResponse = await saveRxWorkflows(user, projectName, [{ ...rxworkflows[index], name: stem }]);
-      if (!saveResponse) throw new Error("Invalid response from save API");
-      if (onProjectStateChange && saveResponse.pr_state) {
-        onProjectStateChange(saveResponse.pr_state);
-      }
-    }
+    await saveBeforePush(type, index, workflows, rxworkflows, stem, push);
 
-    // Step 2: Push to GitHub to update the existing PR branch (stem sent; backend adds prefix+.yml)
-    const workflowsPayload: Workflow[] = type === 'regular' ? [{ ...workflows[index], name: stem }] : [];
-    // RXWorkflow is structurally compatible with Workflow for the API (name + content)
-    const rxworkflowsPayload: Workflow[] = type === 'reusable'
-      ? [{ name: stem, content: workflow.content, isReusable: true }]
-      : [];
-
-    const updateResponse = await updateWorkflows(
-      user,
-      selectedRepos,
-      workflowsPayload,
-      rxworkflowsPayload,
-      regexPattern,
-      branchOption,
-      projectName
-    );
-
-    if (updateResponse.error) {
-      throw new Error(updateResponse.error);
-    }
-
-    // Check per-repo results for errors
-    const results = updateResponse.results || {};
-    const hasErrors = Object.values(results).some(
-      (r): r is WorkflowResult => typeof r === 'object' && r !== null && r.status === 'error'
-    );
-    if (hasErrors) {
-      throw new Error("One or more repositories failed to update. Check console for details.");
-    }
+    // Push to GitHub to update the existing PR branch (stem sent; backend adds prefix+.yml)
+    const files = type === 'regular'
+      ? { workflows: [{ ...workflows[index], name: stem }] }
+      : { rxworkflows: [{ name: stem, content: workflow.content, isReusable: true }] };
+    assertPushed(await updateWorkflows(push.projectName, push.selectedRepos, files), push.onReposDelivered);
 
     // Mark as saved in the frontend state – keep workflowStatus as 'under_review'
-    if (markWorkflowAsSaved) {
-      markWorkflowAsSaved(index, type, 'under_review');
-    }
-
+    markWorkflowAsSaved?.(index, type, 'under_review');
     toast.success(`Workflow '${stem}.yml' committed and pull request updated.`);
-
-    if (fetchWorkflowsCount) {
-      await fetchWorkflowsCount();
-    }
-    if (refreshProjectsList) {
-      await refreshProjectsList();
-    }
-
+    await refreshAfterPush(push);
     return true;
   } catch (error: any) {
     console.error("❌ Error committing and updating PR:", error);
@@ -203,19 +236,12 @@ export const commitAndUpdatePRWorkflow = async (
 // Linked workflows are stored in the RWX project's repo/DB, but their association to
 // an open PR is tracked via the standard project's ProjectPullRequest.  The save step
 // must target the RWX project so the correct DB record is updated, while the push step
-// uses the standard project name so the backend can resolve the right RWX repo via
-// LinkedReusableWorkflow.
+// uses the standard project name (push.projectName) so the backend can resolve the
+// right RWX repo via LinkedReusableWorkflow.
 export const commitAndUpdatePRLinkedWorkflow = async (
   index: number,
   linkedWorkflows: Array<{ workflow_id?: number; workflow_name: string; workflow_yaml: string; rwx_project_name: string }>,
-  user: string,
-  projectName: string,        // standard project name – used for the GitHub push
-  selectedRepos: string[],
-  regexPattern: string,
-  branchOption: string = "default",
-  fetchWorkflowsCount?: () => Promise<void>,
-  refreshProjectsList?: () => Promise<void>,
-  onProjectStateChange?: (state: string) => void
+  push: PullRequestPush
 ): Promise<boolean> => {
   const linkedWf = linkedWorkflows[index];
   if (!linkedWf?.workflow_name || !linkedWf?.workflow_yaml) {
@@ -232,11 +258,11 @@ export const commitAndUpdatePRLinkedWorkflow = async (
     // workflow_name (e.g. "AM_RWW1_testrwx.yml") does not match the
     // canonical stored stem ("testrwx").
     if (typeof linkedWf.workflow_id !== 'number') {
-      throw new Error("Linked workflow is missing workflow_id; please reload the project.");
+      throw new TypeError("Linked workflow is missing workflow_id; please reload the project.");
     }
     await updateLinkedReusableWorkflow(
-      user,
-      projectName,
+      push.user,
+      push.projectName,
       linkedWf.workflow_id,
       linkedWf.workflow_yaml
     );
@@ -244,44 +270,14 @@ export const commitAndUpdatePRLinkedWorkflow = async (
     // Step 2: Push to GitHub using the standard project context.
     // The backend resolves the target RWX repo via LinkedReusableWorkflow for the
     // standard project, so passing project_name=standardProjectName is correct.
-    const rxPayload: Workflow[] = [
+    const rxworkflows: Workflow[] = [
       { name: linkedWf.workflow_name, content: linkedWf.workflow_yaml, isReusable: true }
     ];
-    const updateResponse = await updateWorkflows(
-      user,
-      selectedRepos,
-      [],
-      rxPayload,
-      regexPattern,
-      branchOption,
-      projectName
-    );
+    assertPushed(await updateWorkflows(push.projectName, push.selectedRepos, { rxworkflows }));
 
-    if (updateResponse.error) {
-      throw new Error(updateResponse.error);
-    }
-
-    const results = updateResponse.results || {};
-    const hasErrors = Object.values(results).some(
-      (r): r is WorkflowResult => typeof r === 'object' && r !== null && r.status === 'error'
-    );
-    if (hasErrors) {
-      throw new Error("One or more repositories failed to update. Check console for details.");
-    }
-
-    if (onProjectStateChange) {
-      onProjectStateChange('open');
-    }
-
+    push.onProjectStateChange?.('open');
     toast.success(`Linked workflow '${linkedWf.workflow_name}' committed and pull request updated.`);
-
-    if (fetchWorkflowsCount) {
-      await fetchWorkflowsCount();
-    }
-    if (refreshProjectsList) {
-      await refreshProjectsList();
-    }
-
+    await refreshAfterPush(push);
     return true;
   } catch (error: any) {
     console.error("❌ Error committing and updating linked workflow PR:", error);
@@ -386,7 +382,9 @@ const handleDeleteError = (error: any): void => {
   }
 };
 
-// Helper function to delete regular workflow
+// Deletes a workflow through the delete-workflow route: every regular workflow,
+// a reusable one a caller project owns (#2309), and any workflow removed by a
+// PR Campaign, a Reusable Workflow Project's included.
 const deleteRegularWorkflow = async (
   params: {
     user: string;
@@ -397,11 +395,7 @@ const deleteRegularWorkflow = async (
     scope: RemovalScope;
     delivery: RemovalDelivery;
   },
-  state: {
-    workflows: Workflow[];
-    index: number;
-    setWorkflows: (workflows: Workflow[]) => void;
-  }
+  removeFromState: () => void
 ): Promise<boolean> => {
   if (params.scope === 'project_and_github') {
     await deleteWorkflowFromGitHub(
@@ -421,8 +415,7 @@ const deleteRegularWorkflow = async (
     }
   }
   await deleteWorkflowFromDatabase(params.user, params.projectName, params.workflowName);
-  const newWorkflows = state.workflows.filter((_, i) => i !== state.index);
-  state.setWorkflows(newWorkflows);
+  removeFromState();
   return true;
 };
 
@@ -459,6 +452,13 @@ export interface DeleteWorkflowParams {
   scope: RemovalScope;
   /** How a GitHub-scoped removal reaches the repositories. Ignored for scope 'project'. */
   delivery: RemovalDelivery;
+  /**
+   * A caller project's own reusable workflows live in its repositories, so they
+   * are removed from there like a regular workflow. Omitted, a reusable workflow
+   * is removed from the Reusable Workflow Project's repository: by a PR Campaign
+   * through the same route as any other, directly through its own.
+   */
+  projectType?: 'standard' | 'rwx';
   setWorkflows: (workflows: Workflow[]) => void;
   setRXWorkflows: (workflows: RXWorkflow[] | ((prev: RXWorkflow[]) => RXWorkflow[])) => void;
   setSelectedWorkflowId: (id: string | null) => void;
@@ -498,6 +498,7 @@ export const deleteWorkflow = async ({
   regexPattern,
   scope,
   delivery,
+  projectType,
   setWorkflows,
   setRXWorkflows,
   setSelectedWorkflowId,
@@ -510,7 +511,7 @@ export const deleteWorkflow = async ({
 
   try {
     let removed = true;
-    if (type === 'regular') {
+    if (type === 'regular' || projectType === 'standard' || delivery === 'campaign') {
       removed = await deleteRegularWorkflow(
         {
           user,
@@ -521,11 +522,9 @@ export const deleteWorkflow = async ({
           scope,
           delivery,
         },
-        {
-          workflows,
-          index,
-          setWorkflows,
-        }
+        type === 'regular'
+          ? () => setWorkflows(workflows.filter((_, i) => i !== index))
+          : () => setRXWorkflows(prev => (Array.isArray(prev) ? prev : []).filter((_, i) => i !== index))
       );
     } else {
       await deleteReusableWorkflow(user, workflow.name, projectName, scope, index, setRXWorkflows);
@@ -554,7 +553,10 @@ export const createBlankWorkflow = (
   setSelectedWorkflowId: (id: string) => void
 ): void => {
   const stem = normalizeWorkflowStem(workflowName);
-  const content = setWorkflowYamlName('', stem);
+  const template = setWorkflowYamlName('', stem);
+  // A reusable workflow is only callable through workflow_call, and GUI mode
+  // refuses one without it, since it would rewrite the trigger.
+  const content = type === 'reusable' ? template.replace('workflow_dispatch:', 'workflow_call:') : template;
 
   if (type === 'regular') {
     const newWorkflow: Workflow = {
@@ -590,11 +592,6 @@ export interface WorkflowChangeParams {
   workflows: Workflow[];
   setWorkflows: (workflows: Workflow[] | ((prev: Workflow[]) => Workflow[])) => void;
   setRXWorkflows: (workflows: RXWorkflow[] | ((prev: RXWorkflow[]) => RXWorkflow[])) => void;
-  editMode: 'yaml' | 'gui';
-  regularGuiWorkflow: WorkflowGUI;
-  guiWorkflow: WorkflowGUI;
-  setRegularGuiWorkflow: (workflow: WorkflowGUI) => void;
-  setGuiWorkflow: (workflow: WorkflowGUI) => void;
   markWorkflowAsModified: (index: number, type: 'regular' | 'reusable') => void;
   setLinkedWorkflows?: (updater: (prev: any[]) => any[]) => void;
 }
@@ -606,11 +603,6 @@ export const handleWorkflowChange = ({
   workflows,
   setWorkflows,
   setRXWorkflows,
-  editMode,
-  regularGuiWorkflow,
-  guiWorkflow,
-  setRegularGuiWorkflow,
-  setGuiWorkflow,
   markWorkflowAsModified,
   setLinkedWorkflows,
 }: WorkflowChangeParams) => {
@@ -626,9 +618,6 @@ export const handleWorkflowChange = ({
       };
       return newWorkflows;
     });
-    if (field === 'name' && editMode !== 'gui') {
-      setRegularGuiWorkflow({ ...regularGuiWorkflow, name: value });
-    }
     markWorkflowAsModified(selectedWorkflow.originalIndex, 'regular');
   } else if (selectedWorkflow.type === 'reusable') {
     setRXWorkflows(prev => {
@@ -640,9 +629,6 @@ export const handleWorkflowChange = ({
           [field]: value,
           isModified: true
         };
-        if (field === 'name' && editMode !== 'gui') {
-          setGuiWorkflow({ ...guiWorkflow, name: value });
-        }
       }
       return newWorkflows;
     });

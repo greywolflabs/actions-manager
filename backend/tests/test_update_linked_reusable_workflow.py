@@ -46,6 +46,8 @@ from models import (  # noqa: E402
 )
 from main import app  # noqa: E402
 from projects import get_db as projects_get_db  # noqa: E402
+from tests.delivery_records import record_pr_carries  # noqa: E402
+from auth import create_auth_session  # noqa: E402
 
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test_update_linked_rwx_workflow.db"
@@ -68,6 +70,16 @@ def setup_and_teardown_db():
     Base.metadata.create_all(bind=engine)
     yield
     Base.metadata.drop_all(bind=engine)
+
+
+def _signed_in(github_user):
+    """Headers for a real server-side session as ``github_user`` (#2241)."""
+    db = TestingSessionLocal()
+    try:
+        token = create_auth_session(github_user, db)
+    finally:
+        db.close()
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture
@@ -138,6 +150,7 @@ def test_update_linked_workflow_updates_existing_row_in_place(client):
     resp = client.put(
         f"/api/projects/{std.project_name}/linked-reusable-workflows/{original_workflow_id}",
         json={"github_user": "alice", "content": new_yaml},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -151,7 +164,7 @@ def test_update_linked_workflow_updates_existing_row_in_place(client):
         wf_after = db.query(Workflow).filter_by(workflow_id=original_workflow_id).one()
         assert wf_after.workflow_yaml.strip() == new_yaml.strip()
         assert wf_after.workflow_status == "committed_locally"
-        assert wf_after.workflow_git_hash == "0" * 40
+        assert wf_after.workflow_git_hash is None
         # No duplicate workflow was created in the RWX project
         rwx_workflows = (
             db.query(Workflow)
@@ -206,6 +219,7 @@ def test_update_linked_workflow_resolves_by_workflow_id_not_name(client):
     resp = client.put(
         f"/api/projects/{std.project_name}/linked-reusable-workflows/{original_workflow_id}",
         json={"github_user": "alice", "content": "name: Updated\non:\n  workflow_call: {}\n"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 200, resp.text
 
@@ -257,6 +271,7 @@ def test_update_linked_workflow_returns_404_when_not_linked(client):
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "alice", "content": "name: New\n"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 404
     assert "Linked reusable workflow not found" in resp.json()["detail"]
@@ -291,6 +306,7 @@ def test_unauthorized_user_cannot_update_linked_workflow(client):
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "mallory", "content": "name: Pwn\n"},
+        headers=_signed_in("mallory"),
     )
     assert resp.status_code in (403, 404), resp.text
 
@@ -320,6 +336,7 @@ def test_update_linked_workflow_appends_new_version_each_call(client):
             f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
             json={"github_user": "alice",
                   "content": f"name: V{i}\non:\n  workflow_call: {{}}\n"},
+            headers=_signed_in("alice"),
         )
         assert resp.status_code == 200, resp.text
 
@@ -366,6 +383,7 @@ def test_update_linked_workflow_cleans_up_pre_existing_duplicate(client):
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "alice", "content": "name: Cleaned\n"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 200, resp.text
 
@@ -429,6 +447,7 @@ def test_update_linked_workflow_cleans_up_display_formatted_duplicate(client):
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "alice", "content": "name: Cleaned\n"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 200, resp.text
 
@@ -491,6 +510,7 @@ def test_update_linked_workflow_does_not_delete_unrelated_underscore_names(clien
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "alice", "content": "name: Updated\n"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 200, resp.text
 
@@ -544,7 +564,7 @@ def test_project_viewer_member_cannot_update_linked_workflow(client):
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "viewer", "content": "name: Pwn\n"},
-        headers={"X-GitHub-User": "viewer"},
+        headers=_signed_in("viewer"),
     )
     assert resp.status_code == 403, resp.text
     assert "project_editor" in resp.json()["detail"]
@@ -588,7 +608,7 @@ def test_project_editor_on_consumer_only_cannot_update_linked_workflow(client):
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "halfeditor", "content": "name: Half\n"},
-        headers={"X-GitHub-User": "halfeditor"},
+        headers=_signed_in("halfeditor"),
     )
     assert resp.status_code == 403, resp.text
     assert "RWX" in resp.json()["detail"]
@@ -626,7 +646,7 @@ def test_project_editor_on_both_can_update_linked_workflow(client):
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "editor", "content": "name: OK\n"},
-        headers={"X-GitHub-User": "editor"},
+        headers=_signed_in("editor"),
     )
     assert resp.status_code == 200, resp.text
 
@@ -653,7 +673,7 @@ def test_update_preserves_under_review_while_campaign_open(client):
         wf.workflow_status = "under_review"
         # Open campaign referencing the workflow via its display-formatted
         # name, stored against the dedicated reusable workflow repo.
-        db.add(ProjectPullRequest(
+        pr = ProjectPullRequest(
             project_id=std.project_id,
             repo_name="alice/am-reuseable-workflow",
             pr_number=41,
@@ -662,8 +682,9 @@ def test_update_preserves_under_review_while_campaign_open(client):
             target_branch="main",
             pr_state="open",
             workflow_names="AM_RWW1_testrwx.yml",
-        ))
-        db.commit()
+        )
+        db.add(pr)
+        record_pr_carries(db, pr, wf)
     finally:
         db.close()
 
@@ -671,6 +692,7 @@ def test_update_preserves_under_review_while_campaign_open(client):
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "alice", "content": locked_yaml},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["workflow_status"] == "under_review", (
@@ -683,7 +705,7 @@ def test_update_preserves_under_review_while_campaign_open(client):
         wf_after = db.query(Workflow).filter_by(workflow_id=wf_id).one()
         assert wf_after.workflow_status == "under_review"
         assert wf_after.workflow_yaml.strip() == locked_yaml.strip()
-        assert wf_after.workflow_git_hash == "0" * 40
+        assert wf_after.workflow_git_hash is None
         # Negative control: resolve the campaign → normal reset applies.
         pr = db.query(ProjectPullRequest).filter_by(pr_number=41).one()
         pr.pr_state = "merged"
@@ -694,6 +716,7 @@ def test_update_preserves_under_review_while_campaign_open(client):
     resp = client.put(
         f"/api/projects/{std_name}/linked-reusable-workflows/{wf_id}",
         json={"github_user": "alice", "content": "name: Unlocked\non:\n  workflow_call: {}\n"},
+        headers=_signed_in("alice"),
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["workflow_status"] == "committed_locally"

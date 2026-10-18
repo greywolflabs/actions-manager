@@ -28,10 +28,6 @@ interface DeleteSecretsResponse {
   [key: string]: any;
 }
 
-interface SyncSecretResponse {
-  [key: string]: any;
-}
-
 interface GetSecretsCountResponse {
   count: number;
   [key: string]: any;
@@ -182,34 +178,6 @@ export const deleteSecrets = async (
   } catch (error) {
     console.error("❌ Error making delete request:", error);
     toast.error("Failed to delete secret. Please try again.");
-  }
-};
-
-// Sync secret to all repositories  
-export const syncSecret = async (
-  user: string,
-  projectName: string,
-  selectedRepos: string[],
-  secretKey: string
-): Promise<SyncSecretResponse> => {
-  try {
-    console.log("📌 Debug: Syncing Secret:", { user, projectName, selectedRepos, secretKey });
-
-    const response: AxiosResponse<SyncSecretResponse> = await apiClient.post(
-      `${BACKEND_URL}/api/sync-secret`,
-      {
-        user,
-        project_name: projectName,
-        repo_names: selectedRepos,
-        secret_key: secretKey,
-      }
-    );
-
-    console.log("✅ Sync response:", response.data);
-    return response.data;
-  } catch (error) {
-    console.error("❌ Error syncing secret:", error);
-    throw error;
   }
 };
 

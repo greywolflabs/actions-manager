@@ -100,8 +100,13 @@ Two things the campaign does *not* carry:
 - **Custom files that are already synced elsewhere.** A campaign only offers custom files with
   pending changes, so a file already delivered to the project's other repositories is not
   automatically copied to the new one. Edit it to include it in a campaign.
-- **Reusable workflow definitions.** Those live in the producer repository, not in the caller
-  repositories, so a new caller repository does not need them pushed to it.
+- **Linked reusable workflows.** Those are delivered to the repository of the Reusable Workflow
+  Project that owns them, not to caller repositories, so a new caller repository does not need
+  them pushed to it.
+
+A Caller Workflow Project's **own** reusable workflows are different: they are delivered to the
+project's repositories like its regular workflows, so the campaign for a new repository
+pre-selects all of them, as it does the regular workflows.
 
 Removing a repository never prompts — there is nothing to deliver.
 
@@ -161,6 +166,11 @@ code is not — it is fixed at creation, and the workflow filenames delivered in
 [prefix mode](workflows.html#workflow-names-across-projects) are
 built from it, so a project rename never renames or rewrites a managed file.
 
+Project names are unique per owner. A rename to a name the project's owner already
+uses for another project, in any capitalization, is refused and the name stays as it
+was. Creating a project with a name you already use is refused the same way, and your
+existing project is left untouched. A name only another owner uses is free.
+
 It is not completely invisible to your repositories, though. ActionsManager writes the
 project name into each campaign pull request's description, as a link back to the
 project's PR Campaigns view. Pull requests opened before the rename keep the old name,
@@ -170,6 +180,65 @@ Rename between campaigns if that matters to your reviewers.
 Renaming a project requires **editor** access to it. Project viewers can open the
 project and read it, but the rename is rejected. Project owners and workspace admins
 always qualify.
+
+## Deleting a Project
+
+Delete a project from **Project Configs → Danger Zone**. The dialog asks what happens to the
+project's files in GitHub: its workflows, reusable workflows, custom files and CODEOWNERS.
+
+| Choice | What happens |
+|--------|--------------|
+| **Delete the project, keep its files in GitHub** | The project is deleted from ActionsManager at once. Its files stay in your repositories exactly as they are, and nothing manages them any more. |
+| **Delete the project and remove its files from GitHub** | ActionsManager opens a [PR campaign](pr-campaigns.html) named *Delete project &lt;name&gt;*: one pull request per repository and branch it delivered any of the project's files to, each removing all of them from that branch. Nothing is committed directly. |
+
+Before you confirm, the dialog lists those pull requests by repository and branch, with the
+files each one removes. The list comes from ActionsManager's record of what it delivered where,
+so each file is removed at the path it was delivered to, on every branch it was delivered to,
+including branches the project no longer targets. A file ActionsManager has no record of
+delivering, such as one delivered by an earlier release, is listed as not removed: if it is in
+GitHub, remove it yourself.
+
+If the record shows nothing delivered, or every file is already gone from its branch, there is
+nothing to review and the project is deleted at once.
+
+### While the pull requests are open
+
+The project shows **Deleting** and is read-only for everyone, workspace admins included. Its
+pull requests can still be merged and closed from PR Campaigns.
+
+- When every one of them has merged, the project is deleted.
+- Closing any of them calls the deletion off. The project stays and can be edited again. A file
+  a merged pull request already removed is shown as **Committed Locally**, ready to deliver
+  again; the others stay in GitHub unchanged.
+
+If a pull request could not be opened for some repository and branch, the result names it. The
+files there are still delivered, so once the other pull requests have merged the deletion is
+called off rather than finished. If no pull request could be opened at all, nothing changes and
+the project is not deleted.
+
+### When removing the files is not available
+
+The second choice is disabled, with the reason shown, when:
+
+- the project has an open pull request, or another project's open pull request carries one of
+  its files. Merge or close them first.
+- it is a Reusable Workflow Project that Caller Workflow Projects link to. Removing its reusable
+  workflows would break the `uses:` lines that call them. Unlink those projects first.
+- some of its files are in repositories that are no longer in the project. Add those
+  repositories back so their files can be removed too.
+
+Deleting the project and keeping its files is always available.
+
+### Secrets and variables
+
+Secrets, variables and deployment environments cannot be removed by a pull request, so they are a
+separate checkbox: **Also delete secrets and variables now**. With either choice above, it deletes
+the project's secrets and variables (those named with its `AM_<CODE>_` prefix, or, for a project
+that does not use the prefix, the ones it tracks) from its repositories immediately. This cannot
+be undone, and calling the deletion off does not bring them back.
+
+Unless you also tick **Keep deployment environments**, every deployment environment in the
+project's repositories is deleted as well, not only ones the project created.
 
 ## Related Topics
 

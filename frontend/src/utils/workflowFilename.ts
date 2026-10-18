@@ -35,6 +35,27 @@ export function normalizeWorkflowStem(name: string): string {
 }
 
 /**
+ * Workflow names that occur more than once, compared the way the backend
+ * compares them: as a case-insensitive stem. A regular and a reusable workflow
+ * of one name are delivered to the same file, so both kinds go in one list.
+ *
+ * @example
+ * duplicateWorkflowNames(["deploy", "build", "Deploy.yml"]) // → ["Deploy"]
+ */
+export function duplicateWorkflowNames(names: string[]): string[] {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const name of names) {
+    const stem = normalizeWorkflowStem(name);
+    const key = stem.toLowerCase();
+    if (!key) continue;
+    if (seen.has(key)) duplicates.add(stem);
+    seen.add(key);
+  }
+  return [...duplicates];
+}
+
+/**
  * Trims whitespace, strips any existing `.yml`/`.yaml` extension, then
  * appends `.yml`.  Returns an empty string if the trimmed base is empty.
  *

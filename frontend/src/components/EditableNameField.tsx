@@ -233,7 +233,7 @@ const EditableNameField: React.FC<EditableNameFieldProps> = ({
                 'editable-name-input flex h-9 w-full rounded-md border px-3 py-1 text-sm shadow-sm transition-colors',
                 'border-input-border bg-input-bg text-text-primary',
                 'placeholder:text-text-muted',
-                'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-input-focus',
+                'focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-input-focus',
                 'disabled:cursor-not-allowed disabled:opacity-50',
                 'dark:border-input-dark-border dark:bg-input-dark-bg dark:text-text-primary-dark dark:placeholder:text-text-muted-dark',
                 inputClassName,

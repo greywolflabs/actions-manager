@@ -73,9 +73,11 @@ def setup_and_teardown_db():
 
 
 @pytest.fixture
-def client():
+def client(authenticate_client):
     with mock.patch("mode_validation.validate_startup_configuration"):
         with TestClient(app) as c:
+            # The merge/close routes take the caller from the session (#2241).
+            authenticate_client(c, TEST_GITHUB_USER, TestingSessionLocal)
             yield c
 
 
@@ -413,7 +415,7 @@ class TestLinkedWorkflowPrefixHandling:
         db.close()
 
     def test_update_workflow_endpoint_uses_rwx_prefix(self, client):
-        """The /api/update-workflow endpoint must use the RWX project's prefix
+        """The /api/update-project-files endpoint must use the RWX project's prefix
         settings when pushing linked reusable workflows from a standard project."""
         import workflows as wf_module
 
@@ -422,9 +424,11 @@ class TestLinkedWorkflowPrefixHandling:
         linked_wf = _add_linked_workflow(db, std_project, rwx_project, status="under_review")
 
         repo = Repo(repo_name="testuser/am-reuseable-workflow")
-        db.add(repo)
+        caller_repo = Repo(repo_name="testuser/caller-app")
+        db.add_all([repo, caller_repo])
         db.flush()
         db.add(ProjectRepo(project_id=rwx_project.project_id, repo_id=repo.repo_id))
+        db.add(ProjectRepo(project_id=std_project.project_id, repo_id=caller_repo.repo_id))
         db.commit()
 
         captured_calls = []
@@ -437,10 +441,10 @@ class TestLinkedWorkflowPrefixHandling:
              mock.patch.object(wf_module, "_process_reusable_workflows_update", side_effect=mock_process_rx), \
              mock.patch.object(wf_module, "validate_reusable_workflow_link", return_value=mock.Mock(allowed=True)):
             resp = client.post(
-                "/api/update-workflow",
+                "/api/update-project-files",
                 json={
                     "user": TEST_GITHUB_USER,
-                    "repo_names": [],
+                    "repo_names": ["testuser/caller-app"],
                     "workflows": [],
                     "rxworkflows": [{"name": linked_wf.workflow_name, "content": linked_wf.workflow_yaml}],
                     "regex_pattern": "",
@@ -451,13 +455,10 @@ class TestLinkedWorkflowPrefixHandling:
 
         assert resp.status_code == 200, resp.text
         assert len(captured_calls) == 1
-        call_args = captured_calls[0]["args"]
         call_kwargs = captured_calls[0]["kwargs"]
-        # Positional args: rxworkflows, user, project_code, regex_pattern, branch_max_age_days, headers, db
-        # project_code is the 3rd positional arg (index 2)
-        assert call_args[2] == rwx_project.project_code.upper(), (
-            f"Expected RWX project_code '{rwx_project.project_code.upper()}', "
-            f"got '{call_args[2]}'"
+        assert call_kwargs["project_code"] == rwx_project.project_code, (
+            f"Expected RWX project_code '{rwx_project.project_code}', "
+            f"got '{call_kwargs['project_code']}'"
         )
         # use_prefix is passed as a keyword arg and should be False (from RWX project)
         assert call_kwargs.get("use_prefix") is False, (

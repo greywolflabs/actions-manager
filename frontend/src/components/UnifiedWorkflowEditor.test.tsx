@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import UnifiedWorkflowEditor from './UnifiedWorkflowEditor';
 import { UnifiedWorkflowItem } from '../types/workflow';
@@ -68,8 +68,13 @@ vi.mock('./GUIWorkflowEditor', () => ({
 }));
 
 vi.mock('./VersionHistoryPanel', () => ({
-  default: function VersionHistoryPanel() {
-    return <div data-testid="version-history-panel">Version History Panel</div>;
+  default: function VersionHistoryPanel({ onRestore }: { onRestore: (content: string) => void }) {
+    return (
+      <div data-testid="version-history-panel">
+        <span>Version History Panel</span>
+        <button type="button" onClick={() => onRestore('name: restored\non: push')}>Restore this version</button>
+      </div>
+    );
   },
 }));
 
@@ -149,6 +154,18 @@ describe('UnifiedWorkflowEditor', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('re-reads drift once a version restore is saved, which resolves the workflow\'s drift', async () => {
+    const onVersionRestored = vi.fn();
+    render(<UnifiedWorkflowEditor {...defaultProps} onVersionRestored={onVersionRestored} />);
+
+    await user.click(screen.getByRole('button', { name: 'More options' }));
+    await user.click(screen.getByTitle('View version history for this workflow'));
+    await user.click(screen.getByRole('button', { name: 'Restore this version' }));
+
+    expect(defaultProps.handleWorkflowChange).toHaveBeenCalledWith('content', 'name: restored\non: push');
+    expect(onVersionRestored).toHaveBeenCalledTimes(1);
   });
 
   test('renders empty-state card when no workflow is selected', () => {
@@ -397,9 +414,34 @@ describe('UnifiedWorkflowEditor', () => {
     expect(defaultProps.setEditMode).toHaveBeenCalledWith('gui');
   });
 
-  test('shows update-PR commit label when projectPRState is open', () => {
-    render(<UnifiedWorkflowEditor {...defaultProps} projectPRState="open" />);
-    expect(screen.getByText('💾 Commit Locally (Update PR)')).toBeInTheDocument();
+  describe('primary commit button', () => {
+    const underReview = { ...mockRegularWorkflow, workflowStatus: 'under_review' as const };
+
+    test('commits locally as normal for a workflow no open PR carries', () => {
+      render(<UnifiedWorkflowEditor {...defaultProps} />);
+      expect(screen.getByTestId('commit-locally-button')).toHaveTextContent('💾 Commit Locally');
+      expect(screen.getByTestId('commit-locally-button')).not.toBeDisabled();
+      expect(screen.queryByText('🔄 Commit and Update PR')).not.toBeInTheDocument();
+    });
+
+    test('is a greyed-out Commit Locally while the workflow is locked under review', () => {
+      render(<UnifiedWorkflowEditor {...defaultProps} selectedWorkflow={underReview} commitAndUpdatePR={vi.fn()} />);
+      expect(screen.getByTestId('commit-locally-button')).toHaveTextContent('💾 Commit Locally');
+      expect(screen.getByTestId('commit-locally-button')).toBeDisabled();
+    });
+
+    test('becomes Commit and Update PR once the workflow is unlocked, and re-locks after it', async () => {
+      const commitAndUpdatePR = vi.fn().mockResolvedValue(true);
+      render(<UnifiedWorkflowEditor {...defaultProps} selectedWorkflow={underReview} commitAndUpdatePR={commitAndUpdatePR} />);
+
+      fireEvent.click(screen.getByTestId('unlock-workflow-button'));
+      fireEvent.click(screen.getByText('Unlock and Edit'));
+      fireEvent.click(screen.getByTestId('update-pr-button'));
+
+      await waitFor(() => expect(commitAndUpdatePR).toHaveBeenCalledWith(underReview.originalIndex, 'regular'));
+      expect(await screen.findByTestId('workflow-lock-overlay')).toBeInTheDocument();
+      expect(screen.getByTestId('commit-locally-button')).toBeDisabled();
+    });
   });
 
   describe('workflow state badge (per-workflow status, not project-wide)', () => {
@@ -420,11 +462,13 @@ describe('UnifiedWorkflowEditor', () => {
         <UnifiedWorkflowEditor
           {...defaultProps}
           selectedWorkflow={synced}
-          projectPRState="draft"
         />
       );
       expect(screen.getByText('Synced')).toBeInTheDocument();
       expect(screen.queryByText('Draft')).not.toBeInTheDocument();
+      // Synced is the workflow status, not a drift result. The editor is not
+      // given a drift result, so it must not claim the workflow is clean (#2209).
+      expect(screen.queryByText(/no drift/i)).not.toBeInTheDocument();
     });
 
     test('shows Draft only when this workflow is committed_locally', () => {
@@ -437,7 +481,6 @@ describe('UnifiedWorkflowEditor', () => {
         <UnifiedWorkflowEditor
           {...defaultProps}
           selectedWorkflow={committed}
-          projectPRState="synced"
         />
       );
       expect(screen.getByText('Draft')).toBeInTheDocument();
@@ -465,7 +508,6 @@ describe('UnifiedWorkflowEditor', () => {
         <UnifiedWorkflowEditor
           {...defaultProps}
           selectedWorkflow={underReview}
-          projectPRState="synced"
         />
       );
       expect(screen.getByText('Under Review')).toBeInTheDocument();
@@ -673,6 +715,41 @@ describe('UnifiedWorkflowEditor', () => {
       await user.click(screen.getByRole('button', { name: /Delete Everywhere/i }));
 
       expect(defaultProps.deleteWorkflow).toHaveBeenCalledWith(0, 'regular', 'project_and_github', 'campaign');
+    });
+
+    test("a caller project's own reusable workflow is deleted from its repositories like a regular one", async () => {
+      // #2309: it is delivered to this project's repositories, so the GitHub
+      // option is offered, with the same choice of delivery.
+      const user = userEvent.setup();
+      render(
+        <UnifiedWorkflowEditor {...defaultProps} selectedWorkflow={mockReusableWorkflow} projectType="standard" />
+      );
+      fireEvent.click(screen.getByLabelText('More options'));
+      fireEvent.click(screen.getByText(/Delete workflow/));
+
+      await user.click(screen.getByLabelText('Delete from ActionsManager and GitHub'));
+      await user.click(screen.getByRole('button', { name: /Delete Everywhere/i }));
+
+      expect(defaultProps.deleteWorkflow).toHaveBeenCalledWith(0, 'reusable', 'project_and_github', 'campaign');
+    });
+
+    test("a Reusable Workflow Project's workflow is offered the same choice of delivery", async () => {
+      // A removal campaign removes the file rather than delivering it, so an
+      // RWX project's own workflows can go through one like any other.
+      const user = userEvent.setup();
+      render(
+        <UnifiedWorkflowEditor {...defaultProps} selectedWorkflow={mockReusableWorkflow} projectType="rwx" />
+      );
+      fireEvent.click(screen.getByLabelText('More options'));
+      fireEvent.click(screen.getByText(/Delete workflow/));
+
+      await user.click(screen.getByLabelText('Delete from ActionsManager and GitHub'));
+
+      expect(screen.getByLabelText('Create a PR Campaign')).toBeChecked();
+      await user.click(screen.getByLabelText('Commit directly to the target branch'));
+      await user.click(screen.getByRole('button', { name: /Delete Everywhere/i }));
+
+      expect(defaultProps.deleteWorkflow).toHaveBeenCalledWith(0, 'reusable', 'project_and_github', 'direct');
     });
 
     test('GitHub option stays available for a locally-created workflow', () => {
@@ -1267,7 +1344,8 @@ describe('UnifiedWorkflowEditor expanded (pop-out) editor', () => {
     // matched, so it still holds if the exact number changes.
     const SIDEBAR_Z = 1000;
     const zFromClass = (el: Element) =>
-      Number.parseInt(/z-\[(\d+)\]/.exec(el.className)?.[1] ?? '0', 10);
+      // A whole class (not -z-<n>), as z-[n] or Tailwind v4's bare z-n.
+      Number.parseInt(/(?:^|\s)z-(?:\[(\d+)\]|(\d+))(?=\s|$)/.exec(el.className)?.slice(1).find(Boolean) ?? '0', 10);
 
     expect(zFromClass(screen.getByRole('dialog'))).toBeGreaterThan(SIDEBAR_Z);
   });

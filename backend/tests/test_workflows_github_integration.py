@@ -78,12 +78,6 @@ class TestGitHubIntegration:
 
     def test_get_workflow_from_github_success(self):
         """Test successfully fetching a workflow from GitHub."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "default_branch": "main"
-        }
-        
         mock_file_response = Mock()
         mock_file_response.status_code = 200
         mock_file_response.json.return_value = {
@@ -92,9 +86,9 @@ class TestGitHubIntegration:
         }
         
         with patch('workflows.requests.get') as mock_get:
-            mock_get.side_effect = [mock_response, mock_file_response]
+            mock_get.side_effect = [mock_file_response]
             
-            result = get_workflow_from_github("owner", "repo", "test.yml", "token123")
+            result = get_workflow_from_github("owner", "repo", "test.yml", "token123", default_branch="main")
             
             assert result is not None
             assert result["content"] == "name: Test\non: push"
@@ -102,38 +96,26 @@ class TestGitHubIntegration:
 
     def test_get_workflow_from_github_not_found(self):
         """Test fetching a workflow that doesn't exist."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "default_branch": "main"
-        }
-        
         mock_file_response = Mock()
         mock_file_response.status_code = 404
         
         with patch('workflows.requests.get') as mock_get:
-            mock_get.side_effect = [mock_response, mock_file_response]
+            mock_get.side_effect = [mock_file_response]
             
-            result = get_workflow_from_github("owner", "repo", "nonexistent.yml", "token123")
+            result = get_workflow_from_github("owner", "repo", "nonexistent.yml", "token123", default_branch="main")
             
             assert result is None
 
     def test_get_workflow_from_github_api_error(self):
         """Test handling GitHub API errors."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "default_branch": "main"
-        }
-        
         mock_file_response = Mock()
         mock_file_response.status_code = 500
         
         with patch('workflows.requests.get') as mock_get:
-            mock_get.side_effect = [mock_response, mock_file_response]
+            mock_get.side_effect = [mock_file_response]
             
             with pytest.raises(Exception) as exc_info:
-                get_workflow_from_github("owner", "repo", "test.yml", "token123")
+                get_workflow_from_github("owner", "repo", "test.yml", "token123", default_branch="main")
             
             assert "GitHub API error" in str(exc_info.value)
 
@@ -609,12 +591,6 @@ class TestGitHubIntegration:
 
     def test_get_workflow_from_github_with_custom_branch(self):
         """Test fetching workflow from GitHub with non-default branch."""
-        mock_repo_response = Mock()
-        mock_repo_response.status_code = 200
-        mock_repo_response.json.return_value = {
-            "default_branch": "develop"
-        }
-        
         mock_file_response = Mock()
         mock_file_response.status_code = 200
         mock_file_response.json.return_value = {
@@ -623,13 +599,22 @@ class TestGitHubIntegration:
         }
         
         with patch('workflows.requests.get') as mock_get:
-            mock_get.side_effect = [mock_repo_response, mock_file_response]
+            mock_get.side_effect = [mock_file_response]
             
-            result = get_workflow_from_github("owner", "repo", "test.yml", "token123")
+            result = get_workflow_from_github("owner", "repo", "test.yml", "token123", default_branch="develop")
             
-            # Verify it attempted to use the develop branch
+            # It reads the branch it was given, with no repo-metadata lookup
             assert result is not None
             assert result["sha"] == "def456"
+            assert mock_get.call_count == 1
+            assert mock_get.call_args[0][0].endswith("?ref=develop")
+
+    def test_get_workflow_from_github_needs_a_branch(self):
+        """It used to fall back to the repo default, a different file than the caller's (#2301)."""
+        with patch('workflows.requests.get') as mock_get, pytest.raises(ValueError):
+            get_workflow_from_github("owner", "repo", "test.yml", "token123", default_branch="")
+
+        mock_get.assert_not_called()
 
     def test_ensure_workflows_directory_exists_already_exists(self):
         """Test _ensure_workflows_directory_exists when directory already exists."""

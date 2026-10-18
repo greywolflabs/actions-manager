@@ -15,6 +15,7 @@ import base64
 from unittest.mock import patch, MagicMock
 
 import pytest
+import requests
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -32,7 +33,8 @@ from actions_projects import (  # noqa: E402
     _ApiError,
 )
 from auth import user_tokens, create_auth_session  # noqa: E402
-from models import Base, Account  # noqa: E402
+from models import Base, Account, ActionsProject  # noqa: E402
+from workflows import DriftCheckUnavailable  # noqa: E402
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
 engine = create_engine(
@@ -63,8 +65,7 @@ def _setup_account(db, github_user="testuser"):
 
 
 def _session_headers(db, github_user="testuser") -> dict:
-    """A real session for github_user, since routes now verify the caller's
-    session actually belongs to the github_user they claim in the request."""
+    """A real session for github_user: the routes take the caller from it (#2241)."""
     return {"Authorization": f"Bearer {create_auth_session(github_user, db)}"}
 
 
@@ -220,7 +221,7 @@ class TestPreview:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 
@@ -249,7 +250,7 @@ class TestPreview:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 
@@ -274,7 +275,7 @@ class TestPreview:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 
@@ -294,7 +295,7 @@ class TestPreview:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 
@@ -321,7 +322,6 @@ class TestPreview:
             resp = client.get(
                 "/api/actions-projects/preview",
                 params={
-                    "github_user": "testuser",
                     "url": "https://github.com/marketplace/actions/trufflehog-oss",
                 },
                 headers=headers,
@@ -349,7 +349,7 @@ class TestPreview:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/marketplace/actions/my-action"},
+                params={"url": "https://github.com/marketplace/actions/my-action"},
                 headers=headers,
             )
 
@@ -366,7 +366,7 @@ class TestPreview:
         with patch("actions_projects.requests.get", return_value=_mock_response(404)):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/marketplace/actions/nope"},
+                params={"url": "https://github.com/marketplace/actions/nope"},
                 headers=headers,
             )
 
@@ -386,7 +386,6 @@ class TestPreview:
             resp = client.get(
                 "/api/actions-projects/preview",
                 params={
-                    "github_user": "testuser",
                     "url": "https://github.com/octo/widgets/blob/v2/nested/actions.yaml",
                 },
                 headers=headers,
@@ -411,7 +410,7 @@ class TestPreview:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 
@@ -429,7 +428,7 @@ class TestPreview:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 
@@ -447,11 +446,43 @@ class TestPreview:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 
         assert resp.status_code == 404
+
+    def _preview_when_default_branch_raises(self, error):
+        db = TestingSessionLocal()
+        _setup_account(db)
+        headers = _session_headers(db)
+        db.close()
+
+        with patch("actions_projects.get_default_branch", side_effect=error):
+            return client.get(
+                "/api/actions-projects/preview",
+                params={"url": "https://github.com/octo/widgets"},
+                headers=headers,
+            )
+
+    def test_preview_shows_githubs_answer_for_the_default_branch(self):
+        """What GitHub said about the repo is the user's to see (#2295)."""
+        message = "GitHub returned 404 resolving the default branch of octo/widgets"
+
+        resp = self._preview_when_default_branch_raises(DriftCheckUnavailable(message, status_code=404))
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == message
+
+    def test_preview_hides_a_network_error_resolving_the_default_branch(self):
+        """A network error names internal hosts; it goes to the log, not the response (#2295)."""
+        error = requests.ConnectionError("proxy secret-marker-2295.internal refused the connection")
+
+        resp = self._preview_when_default_branch_raises(error)
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == "Could not determine the default branch of octo/widgets"
+        assert "secret-marker-2295" not in resp.text
 
     def test_preview_unauthenticated(self):
         resp = client.get(
@@ -468,7 +499,7 @@ class TestPreview:
 
         resp = client.get(
             "/api/actions-projects/preview",
-            params={"github_user": "testuser", "url": "not-a-url"},
+            params={"url": "not-a-url"},
             headers=headers,
         )
         assert resp.status_code == 400
@@ -481,7 +512,6 @@ class TestPreview:
 
 def _create_payload(**overrides):
     payload = {
-        "github_user": "testuser",
         "name": "My Action",
         "description": "Does a thing",
         "source_url": "https://github.com/octo/widgets",
@@ -508,13 +538,12 @@ class TestCrud:
         assert created["name"] == "My Action"
         assert created["inputs"][0]["name"] == "who-to-greet"
 
-        list_resp = client.get("/api/actions-projects/", params={"github_user": "testuser"}, headers=headers)
+        list_resp = client.get("/api/actions-projects/", headers=headers)
         assert list_resp.status_code == 200
         assert len(list_resp.json()) == 1
 
         get_resp = client.get(
             f"/api/actions-projects/{created['actions_project_id']}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert get_resp.status_code == 200
@@ -531,7 +560,6 @@ class TestCrud:
         update_resp = client.put(
             f"/api/actions-projects/{created['actions_project_id']}",
             json={
-                "github_user": "testuser",
                 "name": "Renamed Action",
                 "description": "Updated",
                 "inputs": [],
@@ -552,14 +580,12 @@ class TestCrud:
 
         delete_resp = client.delete(
             f"/api/actions-projects/{created['actions_project_id']}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert delete_resp.status_code == 204
 
         get_resp = client.get(
             f"/api/actions-projects/{created['actions_project_id']}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert get_resp.status_code == 404
@@ -580,20 +606,19 @@ class TestCrud:
 
             other_get = client.get(
                 f"/api/actions-projects/{created['actions_project_id']}",
-                params={"github_user": "otheruser"},
                 headers=other_headers,
             )
             assert other_get.status_code == 200
             assert other_get.json()["name"] == "My Action"
 
             other_list = client.get(
-                "/api/actions-projects/", params={"github_user": "otheruser"}, headers=other_headers
+                "/api/actions-projects/", headers=other_headers
             )
             assert len(other_list.json()) == 1
 
             other_update = client.put(
                 f"/api/actions-projects/{created['actions_project_id']}",
-                json={"github_user": "otheruser", "name": "Renamed by other user", "description": None, "inputs": []},
+                json={"name": "Renamed by other user", "description": None, "inputs": []},
                 headers=other_headers,
             )
             assert other_update.status_code == 200
@@ -601,7 +626,6 @@ class TestCrud:
 
             other_delete = client.delete(
                 f"/api/actions-projects/{created['actions_project_id']}",
-                params={"github_user": "otheruser"},
                 headers=other_headers,
             )
             assert other_delete.status_code == 204
@@ -615,10 +639,11 @@ class TestCrud:
     def test_cannot_impersonate_another_user_by_claiming_their_username(self):
         """A real session for testuser must not be able to act as otheruser
         just by putting otheruser's name in github_user - github_user is
-        client-controlled and GitHub usernames are public, so this is the
-        exact impersonation this endpoint must reject."""
+        client-controlled and GitHub usernames are public. The caller comes
+        from the session (#2241), so the name is ignored and the action is
+        imported as testuser's."""
         db = TestingSessionLocal()
-        _setup_account(db, "testuser")
+        testuser_id = _setup_account(db, "testuser")
         _setup_account(db, "otheruser")
         headers = _session_headers(db, "testuser")
         db.close()
@@ -630,9 +655,33 @@ class TestCrud:
                 json=_create_payload(github_user="otheruser"),
                 headers=headers,
             )
-            assert resp.status_code == 403
+            assert resp.status_code == 201, resp.text
+            db = TestingSessionLocal()
+            project = db.query(ActionsProject).filter_by(
+                actions_project_id=resp.json()["actions_project_id"]
+            ).one()
+            assert project.user_id == testuser_id
+            assert project.last_modified_by == "testuser"
+            db.close()
         finally:
             user_tokens.pop("otheruser", None)
+
+    def test_naming_someone_else_in_the_query_is_refused(self):
+        """auth.current_account owns the legacy github_user query parameter (#2241)."""
+        db = TestingSessionLocal()
+        _setup_account(db, "testuser")
+        _setup_account(db, "otheruser")
+        headers = _session_headers(db, "testuser")
+        db.close()
+
+        # The body names the caller, as the frontend still sends it.
+        resp = client.post(
+            "/api/actions-projects/",
+            params={"github_user": "otheruser"},
+            json=_create_payload(github_user="testuser"),
+            headers=headers,
+        )
+        assert resp.status_code == 403, resp.text
 
 
 class TestActionInputType:
@@ -664,7 +713,6 @@ class TestActionInputType:
 
         get_resp = client.get(
             f"/api/actions-projects/{created['actions_project_id']}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert get_resp.json()["inputs"][0]["options"] == ["debug", "info", "warn", "error"]
@@ -705,7 +753,6 @@ class TestActionInputType:
         update_resp = client.put(
             f"/api/actions-projects/{created['actions_project_id']}",
             json={
-                "github_user": "testuser",
                 "name": created["name"],
                 "description": None,
                 "inputs": [{
@@ -743,7 +790,7 @@ class TestBranding:
              patch("actions_projects.get_default_branch", return_value="main"):
             preview_resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 
@@ -762,7 +809,6 @@ class TestBranding:
 
         get_resp = client.get(
             f"/api/actions-projects/{created['actions_project_id']}",
-            params={"github_user": "testuser"},
             headers=headers,
         )
         assert get_resp.json()["branding_icon"] == "rocket"
@@ -781,7 +827,7 @@ class TestBranding:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 
@@ -809,7 +855,7 @@ class TestBranding:
              patch("actions_projects.get_default_branch", return_value="main"):
             resp = client.get(
                 "/api/actions-projects/preview",
-                params={"github_user": "testuser", "url": "https://github.com/octo/widgets"},
+                params={"url": "https://github.com/octo/widgets"},
                 headers=headers,
             )
 

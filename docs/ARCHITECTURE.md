@@ -158,7 +158,7 @@ Actions Manager is a web application for managing GitHub Actions workflows acros
 #### 5. Drift Detection (`workflows.py`, `drift_worker.py`, `drift_notifications.py`)
 - `workflows.py` — the check itself (`run_project_drift_check`), the `/api/projects/{id}/drift` and `/api/workflows/{id}/drift` endpoints, and the resolution endpoints
 - `drift_worker.py` — in-process asyncio sweep that re-checks stale projects on a timer, with per-project backoff
-- `drift_notifications.py` — persists `WorkflowDriftState` per (workflow, repo, branch), emits `drift.detected` / `drift.resolved` / `drift.check_failed`, and keeps the cached `projects.drift_*` columns in step
+- `drift_notifications.py` — records each check on the delivery record (`file_deliveries`) per (file, repo, branch), emits `drift.detected` / `drift.resolved` / `drift.check_failed`, and keeps the cached `projects.drift_*` columns in step
 
 #### 6. Secrets Management (`github_secrets.py`)
 - Encrypts secrets for GitHub
@@ -306,7 +306,7 @@ Actions Manager is a web application for managing GitHub Actions workflows acros
 6. Backend: Compare normalized YAML; classify local-edit / under-review /
    │        pending-merge / deleted / drift / check_failed
    ▼
-7. Backend: Persist WorkflowDriftState per (workflow, repo, branch), emit
+7. Backend: Record the check on file_deliveries per (file, repo, branch), emit
    │        transition notifications, cache the project drift summary
    ▼
 8. Frontend: Render banner/list from stored state; fetch GitHub's side of a
@@ -509,7 +509,7 @@ Actions Manager is a web application for managing GitHub Actions workflows acros
 - **[Deployment Guide](DEPLOYMENT.md)** - Production deployment
 - **[Database Schema](../DATABASE_SCHEMA.md)** - Data model details
 - **[Frontend Development](FRONTEND_DEVELOPMENT.md)** - Frontend architecture
-- **[Workflow Delivery Modes](guides/WORKFLOW_DELIVERY_MODES.md)** - Direct vs PR-based delivery
+- **[PR Campaigns](https://actionsmanager.io/features/pr-campaigns.html)** - Delivering workflows through pull requests
 - **[PR-Based Delivery](features/PR_BASED_DELIVERY.md)** - Technical implementation
 
 ---
@@ -578,19 +578,20 @@ POST /api/save-workflows
 project.pr_state = "draft"
 ```
 
-**3. Direct Commit Deployment (`draft` → `synced`)**
-```python
-# User deploys workflows directly to GitHub
-POST /api/update-workflow
-# Commits workflows to repository branches
-project.pr_state = "synced"
-```
-
-**4. Create Pull Requests (`draft` → `open`)**
+**3. Create Pull Requests (`draft` → `open`)**
 ```python
 # User creates PRs for review workflow
 POST /api/create-pull-requests
 # Creates PRs and ProjectPullRequest records
+project.pr_state = "open"
+```
+
+**4. Push Edits Into Open Pull Requests (stays `open`)**
+```python
+# User commits an edit to a file under review ("Commit and update PR")
+POST /api/update-project-files
+# A PR campaign of just the named files: adds commits to the open PRs,
+# opens one where none is open, and records what each carries
 project.pr_state = "open"
 ```
 
@@ -663,10 +664,9 @@ WHERE p.pr_state = 'open' AND pr.pr_state = 'open'
 GROUP BY p.project_id, p.project_name;
 ```
 
-For detailed information on workflow delivery modes, see:
-- **[Workflow Delivery Modes Guide](guides/WORKFLOW_DELIVERY_MODES.md)** - User guide
+For detailed information on workflow delivery, see:
+- **[PR Campaigns](https://actionsmanager.io/features/pr-campaigns.html)** - User guide
 - **[PR-Based Delivery Technical Docs](features/PR_BASED_DELIVERY.md)** - Implementation details
-- **[Migration Guide](guides/MIGRATION_DIRECT_TO_PR.md)** - Moving from direct to PR-based
 
 ---
 

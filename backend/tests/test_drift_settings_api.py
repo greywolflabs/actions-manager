@@ -163,6 +163,23 @@ class TestWritingSettings:
         assert len(rows) == 1
         assert rows[0].batch_size == 7
 
+    def test_a_save_goes_to_the_row_every_reader_uses(self, admin_user, member_user, test_db):
+        """Should two rows ever exist, the sweep and GET read the lowest id; a
+        save written anywhere else would look lost after a reload."""
+        test_db.add_all([
+            DriftSettings(settings_id=2, sweep_enabled=True, recheck_interval_minutes=15,
+                          batch_size=5, poll_interval_seconds=60),
+            DriftSettings(settings_id=1, sweep_enabled=True, recheck_interval_minutes=15,
+                          batch_size=5, poll_interval_seconds=60),
+        ])
+        test_db.commit()
+
+        client.put(SETTINGS_URL, json=VALID_PAYLOAD, headers=_auth(admin_user))
+
+        test_db.expire_all()
+        assert test_db.get(DriftSettings, 1).recheck_interval_minutes == 30
+        assert client.get(SETTINGS_URL, headers=_auth(member_user)).json() == VALID_PAYLOAD
+
     def test_the_kill_switch_persists(self, admin_user, member_user):
         client.put(SETTINGS_URL, json={**VALID_PAYLOAD, "sweep_enabled": False},
                    headers=_auth(admin_user))

@@ -31,6 +31,7 @@ from models import (
 )
 from main import app
 from projects import get_db as projects_get_db
+from tests.delivery_records import carried, record_pr_carries
 from workflows import get_db as workflows_get_db
 
 # ---------------------------------------------------------------------------
@@ -833,13 +834,13 @@ def test_standalone_rwx_project_workflow_locking_works(mock_tokens, client):
     REGRESSION TEST: Workflow locking must work correctly for standalone RWX projects.
 
     SCENARIO: A standalone RWX project has an open PR for a reusable workflow.
-    The _has_open_pr_for_workflow function should correctly identify the open PR
-    and mark the workflow as locked.
+    The delivery record should correctly identify the open PR and mark the
+    workflow as locked.
 
     EXPECTED: Workflow locking works for standalone RWX projects just as it did
     before cross-project PR visibility changes.
     """
-    from workflows import _has_open_pr_for_workflow
+    import deliveries
 
     mock_tokens[TEST_GITHUB_USER] = "fake_token"
 
@@ -870,6 +871,12 @@ def test_standalone_rwx_project_workflow_locking_works(mock_tokens, client):
         db.add(wf)
         db.flush()
         db.add(ProjectWorkflow(project_id=standalone_rwx.project_id, workflow_id=wf.workflow_id))
+        # A second workflow of the project that no PR carries.
+        other = Workflow(workflow_name="nonexistent.yml", workflow_yaml="on: workflow_call",
+                         reusable_workflow=True)
+        db.add(other)
+        db.flush()
+        db.add(ProjectWorkflow(project_id=standalone_rwx.project_id, workflow_id=other.workflow_id))
 
         # Create an open PR for the workflow
         pr = ProjectPullRequest(
@@ -883,14 +890,11 @@ def test_standalone_rwx_project_workflow_locking_works(mock_tokens, client):
             workflow_names="deploy.yml",
         )
         db.add(pr)
-        db.commit()
+        record_pr_carries(db, pr, wf)
 
-        # Test that _has_open_pr_for_workflow correctly identifies the open PR
-        has_open_pr = _has_open_pr_for_workflow(
-            db,
-            standalone_rwx.project_id,
-            "deploy.yml",
-            "testuser/rwx-repo"
+        # Test that the delivery record correctly identifies the open PR
+        has_open_pr = deliveries.pending_here(
+            db, deliveries.WORKFLOW, wf.workflow_id, "testuser/rwx-repo", "main",
         )
 
         assert has_open_pr is True, (
@@ -898,11 +902,8 @@ def test_standalone_rwx_project_workflow_locking_works(mock_tokens, client):
         )
 
         # Test that workflow without open PR returns False
-        has_open_pr_nonexistent = _has_open_pr_for_workflow(
-            db,
-            standalone_rwx.project_id,
-            "nonexistent.yml",
-            "testuser/rwx-repo"
+        has_open_pr_nonexistent = deliveries.pending_here(
+            db, deliveries.WORKFLOW, other.workflow_id, "testuser/rwx-repo", "main",
         )
 
         assert has_open_pr_nonexistent is False, (
@@ -996,7 +997,7 @@ def test_rwx_workflow_stays_under_review_after_reload(mock_tokens, client):
             workflow_names="deploy",  # This workflow is in the PR
         )
         db.add(pr)
-        db.commit()
+        record_pr_carries(db, pr, wf)
 
         # Verify initial state
         db.refresh(wf)
@@ -1157,6 +1158,7 @@ def test_second_pr_campaign_blocked_when_reusable_workflow_under_review(
         _add_repo(db, caller2, repo_name="testuser/repo2")
         _link_existing_workflow(db, caller2, rwx_project, linked_wf)
         db.commit()
+        mock_process_rx.return_value["testuser/am-reuseable-workflow on main"]["deliveries"] = carried(linked_wf)
     finally:
         db.close()
 
@@ -1366,6 +1368,7 @@ def test_sibling_caller_refresh_does_not_unlock_workflow_with_open_campaign(
             pr_state="closed",
         ))
         db.commit()
+        mock_process_rx.return_value["testuser/am-reuseable-workflow on main"]["deliveries"] = carried(linked_wf)
     finally:
         db.close()
 
@@ -1639,7 +1642,7 @@ def test_status_downgrade_helper_respects_global_lock(client):
             workflow_names="AM_RWX1_deploy.yml",
         )
         db.add(pr)
-        db.commit()
+        record_pr_carries(db, pr, linked_wf)
 
         # Downgrade attempt against the RWX project (e.g. its own PR resolved).
         _update_project_workflows_status(
@@ -1693,7 +1696,7 @@ def test_rwx_page_load_resolution_keeps_lock_and_pr_state(client):
         rwx_project.pr_state = "open"
         linked_wf = _add_linked_workflow(db, caller1, rwx_project, status="under_review")
         # caller-p1 still has the open campaign for the shared workflow.
-        db.add(ProjectPullRequest(
+        open_pr = ProjectPullRequest(
             project_id=caller1.project_id,
             repo_name="testuser/rwx-repo",
             pr_number=21,
@@ -1702,7 +1705,9 @@ def test_rwx_page_load_resolution_keeps_lock_and_pr_state(client):
             target_branch="main",
             pr_state="open",
             workflow_names="deploy.yml",
-        ))
+        )
+        db.add(open_pr)
+        record_pr_carries(db, open_pr, linked_wf)
         # The RWX project's own earlier PR is fully merged → its page load
         # triggers the all-resolved transition.
         db.add(ProjectPullRequest(
@@ -1718,7 +1723,7 @@ def test_rwx_page_load_resolution_keeps_lock_and_pr_state(client):
         db.commit()
 
         rwx = db.query(Project).filter_by(project_id=rwx_project.project_id).one()
-        _apply_all_prs_resolved_transitions(db, rwx, total_count=1, merged_count=1)
+        _apply_all_prs_resolved_transitions(db, rwx, all_merged=True)
 
         wf = db.query(Workflow).filter_by(workflow_id=linked_wf.workflow_id).one()
         rwx = db.query(Project).filter_by(project_id=rwx_project.project_id).one()
@@ -1736,7 +1741,7 @@ def test_rwx_page_load_resolution_keeps_lock_and_pr_state(client):
         pr.pr_state = "merged"
         db.commit()
         rwx = db.query(Project).filter_by(project_id=rwx_project.project_id).one()
-        _apply_all_prs_resolved_transitions(db, rwx, total_count=1, merged_count=1)
+        _apply_all_prs_resolved_transitions(db, rwx, all_merged=True)
 
         wf = db.query(Workflow).filter_by(workflow_id=linked_wf.workflow_id).one()
         rwx = db.query(Project).filter_by(project_id=rwx_project.project_id).one()
@@ -1751,8 +1756,8 @@ def test_sibling_caller_merge_sync_keeps_lock_until_campaign_resolves(client):
     REGRESSION (issue: merging one caller's PR must not unlock a workflow that
     another caller's open campaign still references).
 
-    ``_sync_linked_reusable_workflows_after_merge`` runs when a caller project
-    merges its last PR.  It previously promoted every linked under_review
+    ``_apply_all_prs_resolved_transitions`` runs when a caller project merges
+    its last PR.  It previously promoted every linked under_review
     workflow to synced_with_github — including workflows whose open campaign
     belongs to a *different* caller.
 
@@ -1760,7 +1765,7 @@ def test_sibling_caller_merge_sync_keeps_lock_until_campaign_resolves(client):
     the RWX pr_state untouched while caller-p1's campaign is open; once that
     campaign is closed the same sync completes the transition.
     """
-    from workflows import _sync_linked_reusable_workflows_after_merge
+    from workflows import _apply_all_prs_resolved_transitions
 
     db = TestingSessionLocal()
     try:
@@ -1773,7 +1778,7 @@ def test_sibling_caller_merge_sync_keeps_lock_until_campaign_resolves(client):
         _add_repo(db, caller2, repo_name="testuser/repo2")
         _link_existing_workflow(db, caller2, rwx_project, linked_wf)
         # caller-p1 holds the open campaign for the shared workflow.
-        db.add(ProjectPullRequest(
+        open_pr = ProjectPullRequest(
             project_id=caller1.project_id,
             repo_name="testuser/rwx-repo",
             pr_number=31,
@@ -1782,11 +1787,12 @@ def test_sibling_caller_merge_sync_keeps_lock_until_campaign_resolves(client):
             target_branch="main",
             pr_state="open",
             workflow_names="deploy.yml",
-        ))
-        db.commit()
+        )
+        db.add(open_pr)
+        record_pr_carries(db, open_pr, linked_wf)
 
         # caller-p2 merges its own last PR → merge sync runs for caller-p2.
-        _sync_linked_reusable_workflows_after_merge(db, caller2.project_id)
+        _apply_all_prs_resolved_transitions(db, caller2, all_merged=True)
 
         wf = db.query(Workflow).filter_by(workflow_id=linked_wf.workflow_id).one()
         rwx = db.query(Project).filter_by(project_id=rwx_project.project_id).one()
@@ -1803,7 +1809,7 @@ def test_sibling_caller_merge_sync_keeps_lock_until_campaign_resolves(client):
         pr = db.query(ProjectPullRequest).filter_by(pr_number=31).one()
         pr.pr_state = "closed"
         db.commit()
-        _sync_linked_reusable_workflows_after_merge(db, caller2.project_id)
+        _apply_all_prs_resolved_transitions(db, caller2, all_merged=True)
 
         wf = db.query(Workflow).filter_by(workflow_id=linked_wf.workflow_id).one()
         rwx = db.query(Project).filter_by(project_id=rwx_project.project_id).one()
@@ -1882,6 +1888,7 @@ def test_project_pr_status_exposes_cross_project_lock_for_sibling_caller(
             pr_state="closed",
         ))
         db.commit()
+        mock_process_rx.return_value["testuser/am-reuseable-workflow on main"]["deliveries"] = carried(linked_wf)
     finally:
         db.close()
 

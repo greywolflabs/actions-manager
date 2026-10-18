@@ -115,7 +115,7 @@ const ScopeOption: React.FC<ScopeOptionProps> = ({
         checked={selected}
         onChange={onSelect}
         disabled={disabled}
-        className="mt-1 mr-3 flex-shrink-0"
+        className="mt-1 mr-3 shrink-0"
       />
       <div className="flex-1">
         <strong className="block text-base text-slate-900 mb-1 dark:text-slate-100">{label}</strong>
@@ -169,7 +169,7 @@ const DeliveryOption: React.FC<{
       aria-label={label}
       checked={selected}
       onChange={onSelect}
-      className="mt-1 mr-3 flex-shrink-0"
+      className="mt-1 mr-3 shrink-0"
     />
     <span className="text-sm text-slate-600 dark:text-slate-400">
       <strong className="block text-slate-900 dark:text-slate-100">{label}</strong>

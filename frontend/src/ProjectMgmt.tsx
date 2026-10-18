@@ -6,8 +6,10 @@ import { useParams, useNavigate, useLocation, Link } from "react-router";
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { fetchProjects, loadProject, Project, linkReusableWorkflow, RwxWorkflow, LinkedStandardProject, updateProjectColor, updateProjectDriftConfig, updateProjectName, updateProjectOrder, exportProjectBackup } from "./api/projects";
 import { fetchDriftSettings, formatDriftInterval, DriftSettings, DEFAULT_DRIFT_SETTINGS, DRIFT_INTERVAL_OPTIONS } from "./api/driftSettings";
-import { deleteProjectEnhanced } from "./api/projectDeletion";
+import { deleteProjectEnhanced, deletionErrorMessage, type DeleteProjectOptions, type EnhancedDeletionResult } from "./api/projectDeletion";
 import { campaignReusableWorkflows } from "./utils/campaignReusableWorkflows";
+import { duplicateWorkflowNames } from "./utils/workflowFilename";
+import { planWorkflowKindMoves, type WorkflowKindChange } from "./utils/workflowKindChanges";
 import { handleSaveProjectWithModal, type UpdateResult } from "./api/handlers";
 import { getSecrets } from "./api/secrets";
 import { getEnvVars } from "./api/envVars";
@@ -27,7 +29,7 @@ import DeleteProjectModal from "./components/DeleteProjectModal";
 import DangerZone from "./components/DangerZone";
 import ProjectMembers from "./components/ProjectMembers";
 import DriftDetection from "./components/DriftDetection";
-import type { WorkflowDriftDetail } from "./api/drift";
+import type { CodeownersDriftDetail, CustomFileDriftDetail, WorkflowDriftDetail } from "./api/drift";
 import Sidebar from "./components/Sidebar";
 import PRStatusPanel from "./components/PRStatusPanel";
 import PRHistoryPanel from "./components/PRHistoryPanel";
@@ -40,7 +42,7 @@ import { getProjectTypeConfig, ProjectType } from "./utils/projectTypeConfig";
 import { getPrefixModeConfig, projectKeyFixedNote } from "./utils/prefixModeConfig";
 import { normalizeProjectColorKey, type ProjectColorKey } from "./utils/projectColors";
 import { getProjectPRStatus } from "./api/pullRequests";
-import { getProjectCodeownersStatuses } from "./api/codeowners";
+import { getProjectCodeowners, type CodeownersRecord } from "./api/codeowners";
 import type { GitHubTokenStatus, Plan } from "./api/user";
 import { ProjectPRState } from "./types/workflow";
 import "./styles/projectMgmt.css";
@@ -50,6 +52,8 @@ import { toast } from './utils/toast';
 import { tour } from './utils/tour';
 import ConfirmDialog from './components/ConfirmDialog';
 import PendingDeliveryNotice from './components/PendingDeliveryNotice';
+import { setProjectHint } from './api/projectHint';
+import type { AxiosError } from 'axios';
 
 // Constant empty array to prevent unnecessary re-renders
 const EMPTY_BUILD_TYPES: any[] = [];
@@ -76,9 +80,35 @@ const REPO_CONFIG_SCROLL_DELAY_MS = 50;
 // `scroll-behavior` property is not inherited.
 const REPO_CONFIG_SLIDE_CLASS = 'min-h-screen';
 const REPO_CONFIG_SLIDE_TITLE_CLASS =
-  'sticky top-0 z-10 bg-[var(--container-background-color)]';
+  'sticky top-0 z-10 bg-(--container-background-color)';
 
-const VALID_PROJECT_PR_STATES = new Set<ProjectPRState>(["new", "draft", "open", "synced"]);
+const VALID_PROJECT_PR_STATES = new Set<ProjectPRState>(["new", "draft", "open", "synced", "deleting"]);
+
+// The PR status's project_state once a refresh found the last removal PR merged.
+const PROJECT_DELETED_STATE = "deleted";
+const PROJECT_DELETED_NOTICE = "Project deleted: its removal pull requests merged.";
+
+/** The server's reason when the project the page asked for is gone (a 404), else null. */
+const projectGoneDetail = (error: unknown): string | null => {
+  const response = (error as AxiosError<{ detail?: string }> | null)?.response;
+  if (response?.status !== 404) return null;
+  return response.data?.detail ?? "Project not found.";
+};
+
+// What a deletion did, for its toast: deleted, or waiting on the pull requests removing its files.
+const deletionOutcomeMessage = (result: EnhancedDeletionResult): string => {
+  const details = result.details;
+  let message = result.project_deleted
+    ? "✅ Project deleted."
+    : `Opened ${result.prs_created ?? 0} pull request(s) to remove its files. The project is deleted once they have all merged; closing one keeps it.`;
+  if (details?.github_resources_deleted.length) {
+    message += `\n\nDeleted from GitHub:\n${details.github_resources_deleted.join("\n")}`;
+  }
+  if (details?.errors.length) {
+    message += `\n\nNot done:\n${details.errors.join("\n")}`;
+  }
+  return message;
+};
 
 const normalizeProjectPRState = (state?: string | null): ProjectPRState => {
   return state && VALID_PROJECT_PR_STATES.has(state as ProjectPRState)
@@ -212,6 +242,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   }>();
   const navigate = useNavigate();
   const location = useLocation();
+  const navProjectId = toNumericProjectId((location.state as { projectId?: number | string } | null)?.projectId);
   const [projectName, setProjectName] = useState<string>(urlProjectName || "");
   const [repos, setRepos] = useState<Repository[]>([]);
   const [selectedRepos, setSelectedRepos] = useState<string[]>([]);
@@ -244,6 +275,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   // banner needs the persisted seed to survive until that check resolves.
   const [seededDriftNames, setSeededDriftNames] = useState<string[]>([]);
   const [driftRefreshSignal, setDriftRefreshSignal] = useState<number>(0);
+  const refreshDrift = useCallback(() => setDriftRefreshSignal(prev => prev + 1), []);
   // Project repos that have never received any of the project's workflows,
   // from the server so the reminder survives a reload.
   const [pendingDeliveryRepos, setPendingDeliveryRepos] = useState<string[]>([]);
@@ -259,23 +291,23 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     return pendingDeliveryRepos.filter((repo) => selected.has(repo));
   }, [pendingDeliveryRepos, selectedRepos]);
 
-  const [codeownersStatuses, setCodeownersStatuses] = useState<Record<string, string>>({});
-
-  const codeownersAggregateStatus = useMemo(() => {
-    const statuses = Object.values(codeownersStatuses);
-    if (statuses.length === 0) return null;
-    if (statuses.some(s => s === 'under_review')) return 'under_review';
-    if (statuses.some(s => s === 'committed_locally' || s === 'new')) return 'committed_locally';
-    if (statuses.every(s => s === 'synced_with_github')) return 'synced_with_github';
-    return 'committed_locally';
-  }, [codeownersStatuses]);
-
-  const codeownersWithChanges = useMemo(() =>
-    Object.entries(codeownersStatuses)
-      .filter(([, status]) => status === 'committed_locally' || status === 'new')
-      .map(([repo]) => repo),
-    [codeownersStatuses]
+  // The project's CODEOWNERS file: undefined until loaded, null when it has none.
+  const [codeowners, setCodeowners] = useState<CodeownersRecord | null | undefined>(undefined);
+  // Where the last drift check found it changed on GitHub, from <DriftDetection>.
+  const [codeownersDrift, setCodeownersDrift] = useState<CodeownersDriftDetail[]>([]);
+  // From the project fetch, so the drift banner counts it on first paint.
+  const [seededCodeownersDrift, setSeededCodeownersDrift] = useState<boolean>(false);
+  // Where the last drift check found each custom file changed on GitHub, from
+  // <DriftDetection>; null until it has loaded for this project.
+  const [customFileDrift, setCustomFileDrift] = useState<CustomFileDriftDetail[] | null>(null);
+  // From the project fetch, so the list and the banner show it on first paint.
+  const [seededCustomFileDriftIds, setSeededCustomFileDriftIds] = useState<number[]>([]);
+  const driftedCustomFileIds = useMemo(
+    () => new Set(customFileDrift ? customFileDrift.map(d => d.custom_file_id) : seededCustomFileDriftIds),
+    [customFileDrift, seededCustomFileDriftIds],
   );
+  // Set by the drift panel; the Project Files view opens the editor and clears it.
+  const [codeownersOpenRequested, setCodeownersOpenRequested] = useState<boolean>(false);
 
   // New state for enhanced deletion modal
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState<boolean>(false);
@@ -393,6 +425,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   const [showPRStatusPanel, setShowPRStatusPanel] = useState<boolean>(false);
   const [showCreatePRModal, setShowCreatePRModal] = useState<boolean>(false);
   const [prStatusRefreshKey, setPRStatusRefreshKey] = useState<number>(0);
+  // Bumped when the server may have changed the CODEOWNERS file's status (a
+  // campaign carrying it, or its PRs merging or closing).
   const [codeownersRefreshCounter, setCodeownersRefreshCounter] = useState<number>(0);
 
   // State for the caller's effective project role (from backend)
@@ -400,6 +434,9 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
 
   // project_viewer users or users with workspace-level read_only role should not be able to modify the project
   const isProjectReadOnly = callerProjectRole === "project_viewer" || userDetails?.workspace_role === "read_only";
+  // Its removal pull requests are open. The server reports every caller as
+  // project_viewer meanwhile, so isProjectReadOnly already holds.
+  const isProjectDeleting = projectPRState === "deleting";
   // Project Configs manages the project itself — its members, drift
   // configuration, export and deletion — rather than the work inside it, so it
   // is workspace-admin only. Deliberately not derived from isProjectReadOnly:
@@ -421,6 +458,11 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   
   // State for clear workflow modified states function
   const [clearWorkflowModifiedStatesFn, setClearWorkflowModifiedStatesFn] = useState<(() => void) | null>(null);
+  const [followKindChangesFn, setFollowKindChangesFn] = useState<((changes: WorkflowKindChange[]) => void) | null>(null);
+  // Read after a save's await, so an edit typed while it was in flight is moved
+  // with the workflow rather than replaced by the copy the save started from.
+  const workflowListsRef = useRef({ workflows, rxworkflows });
+  workflowListsRef.current = { workflows, rxworkflows };
 
   // Allow deep-linking into the workflow creation dialog from the project list
   // via `?addWorkflow=1`. Once launched, remove the param to avoid reopening.
@@ -442,8 +484,9 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     params.delete("addWorkflow");
     params.delete("workflowType");
     const search = params.toString();
-    navigate(`${location.pathname}${search ? `?${search}` : ""}`, { replace: true });
-  }, [urlProjectName, location.pathname, location.search, navigate, addWorkflowFn, addRXWorkflowFn, activeSection]);
+    const query = search ? `?${search}` : "";
+    navigate(`${location.pathname}${query}`, { replace: true, state: location.state });
+  }, [urlProjectName, location.pathname, location.search, location.state, navigate, addWorkflowFn, addRXWorkflowFn, activeSection]);
 
   useEffect(() => {
     return () => {
@@ -616,7 +659,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           return Number(id) === numericProjectId ? { ...p, project_name: newName, name: newName } : p;
         }),
       );
-      navigate(`/project/${user}/${encodeURIComponent(newName)}`, { replace: true });
+      navigate(`/project/${user}/${encodeURIComponent(newName)}`, { replace: true, state: { projectId: numericProjectId } });
     } catch (error: any) {
       setProjectName(previousName);
       const detail = error?.response?.data?.detail || error?.message || "Failed to rename project.";
@@ -660,6 +703,35 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   const [addEnvVarFn, setAddEnvVarFn] = useState<(() => void) | null>(null);
   const [addSecretFn, setAddSecretFn] = useState<(() => void) | null>(null);
 
+  // Only state setters, so it never changes and the loads below can call it.
+  const resetProjectState = useCallback((): void => {
+    console.log("📌 Resetting project state before cancel.");
+    setProjectName("");
+    setSelectedRepos([]);
+    setWorkflows([]);
+    setRXWorkflows([]);
+    setRegexPattern("");
+    setBranchOption("default");
+    setProjectCode("");
+    setProjectId("");
+    setSecrets([]);
+    setEnvVars([]);
+    setManualEnvVars([]);
+    setManualSecrets([]);
+    setDeploymentEnvironments([]);
+    setReusableWorkflowsEnabled(false);
+    setLinkedWorkflows([]);
+    setActiveSection('workflows');
+  }, []);
+
+  // The project this page shows no longer exists: deleted here, or its last
+  // removal pull request merged. Leave it for the list, which no longer has it.
+  const handleProjectGone = useCallback((notice?: string): void => {
+    if (notice) toast.info(notice);
+    resetProjectState();
+    if (user) fetchProjects(user).then(setProjects);
+  }, [user, resetProjectState]);
+
   // Function to load PR status for the current project
   const loadPRStatus = useCallback(async (projectNameToLoad: string, refreshFromGitHub: boolean = false): Promise<void> => {
     if (!user || !projectNameToLoad) return;
@@ -667,6 +739,10 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     try {
       // Use cached database state by default; refresh from GitHub when explicitly requested
       const prStatus = await getProjectPRStatus(user, projectNameToLoad, refreshFromGitHub);
+      if (prStatus.project_state === PROJECT_DELETED_STATE) {
+        handleProjectGone(PROJECT_DELETED_NOTICE);
+        return;
+      }
       const newState = normalizeProjectPRState(prStatus.project_state);
       setProjectPRState(newState);
       console.log(`📌 Loaded PR status (${refreshFromGitHub ? 'live from GitHub' : 'cached'}): ${newState}, Open PRs: ${prStatus.open_prs}, Merged: ${prStatus.merged_prs}, Total: ${prStatus.total_prs}`);
@@ -773,7 +849,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
       // Set to default state on error
       setProjectPRState("new");
     }
-  }, [user]);
+  }, [user, handleProjectGone]);
 
   // Function to refresh projects list
   const refreshProjectsList = useCallback(async (): Promise<void> => {
@@ -818,12 +894,15 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         setWorkflows((response.workflows ?? []).map(w => ({ ...w, savedName: w.name })));
         setRXWorkflows((response.rxworkflows ?? []).map(w => ({ ...w, savedName: w.name })));
         setCustomFiles(response.custom_files ?? []);
-        // Seed the drift badge from the last persisted check (WorkflowDriftState)
+        // Seed the drift badge from the last persisted check (the delivery record)
         // so it's correct on first paint instead of defaulting to "no drift" and
         // flipping once <DriftDetection>'s live check resolves. That live check
         // still runs unconditionally and fully replaces this with authoritative
         // data via handleDriftLoaded/setDriftDetails below.
         setSeededDriftNames(response.drifted_workflow_names ?? []);
+        setSeededCodeownersDrift(Boolean(response.codeowners_drifted));
+        setSeededCustomFileDriftIds(response.drifted_custom_file_ids ?? []);
+        setCustomFileDrift(null);
         setPendingDeliveryRepos(response.pending_delivery_repos ?? []);
         setDriftDetails(
           (response.drifted_workflow_names ?? []).map((name): WorkflowDriftDetail => ({
@@ -928,7 +1007,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         
         // Load PR status if project has an ID.
         // Refresh from GitHub when:
-        //   - pr_state is "open" (PRs are known to be open, may have been merged externally)
+        //   - pr_state is "open" or "deleting" (PRs are known to be open, may have been
+        //     merged externally — for "deleting", merging the last one deletes the project)
         //   - pr_state is null/undefined (legacy projects with no tracked state)
         //   - any workflow (regular, reusable, or linked) is stuck at "under_review" (indicates
         //     outstanding PRs; handles DB inconsistency — applies to standard, RWX, and linked)
@@ -943,6 +1023,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           const shouldRefreshFromGitHub =
             options?.refreshPRFromGitHub ??
             (response.pr_state === "open" ||
+              response.pr_state === "deleting" ||
               !response.pr_state ||
               workflowsNeedSync);
           await loadPRStatus(name, shouldRefreshFromGitHub);
@@ -950,11 +1031,16 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
       }
     } catch (error) {
       console.error("❌ Error loading project:", error);
+      const goneDetail = projectGoneDetail(error);
+      if (goneDetail !== null) {
+        if (thisRequestId === loadRequestCounterRef.current) handleProjectGone(goneDetail);
+        return;
+      }
       if (options?.throwOnError) {
         throw error;
       }
     }
-  }, [user, navigate, loadPRStatus]);
+  }, [user, navigate, loadPRStatus, handleProjectGone]);
 
   const refreshProjectCampaignState = useCallback(async (refreshFromGitHub: boolean = false): Promise<void> => {
     if (!projectName) return;
@@ -962,6 +1048,16 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     await refreshProjectsList();
     setDriftRefreshSignal((current) => current + 1);
   }, [loadProjectFromAPI, projectName, refreshProjectsList]);
+
+  // Requests from this page name its project by id as well as by name, so a name
+  // another owner's project shares still resolves to this one (#2240). Declared
+  // before the load below so the load itself carries the id the list passed.
+  // The list view renders this same component, so leaving a project clears it.
+  useEffect(() => {
+    setProjectHint(urlProjectName ? navProjectId ?? toNumericProjectId(projectId) : null);
+  }, [urlProjectName, navProjectId, projectId]);
+
+  useEffect(() => () => setProjectHint(null), []);
 
   useEffect(() => {
     if (urlProjectName) {
@@ -977,16 +1073,19 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     }
   }, [urlProjectName, loadProjectFromAPI]);
 
+  // A response for a project the page has since left must not land on this one.
+  const codeownersProjectRef = useRef<number>(0);
   useEffect(() => {
-    if (!user || !projectName) return;
-    getProjectCodeownersStatuses(user, projectName)
-      .then((data) => {
-        const map: Record<string, string> = {};
-        data.statuses.forEach(({ repo_name, status }) => { map[repo_name] = status; });
-        setCodeownersStatuses(map);
-      })
-      .catch(() => {}); // best-effort; badge just won't show
-  }, [user, projectName, codeownersRefreshCounter]);
+    const id = toNumericProjectId(projectId) ?? 0;
+    if (codeownersProjectRef.current !== id) {
+      codeownersProjectRef.current = id;
+      setCodeowners(undefined);
+    }
+    if (!user || !id) return;
+    getProjectCodeowners(id)
+      .then((record) => { if (codeownersProjectRef.current === id) setCodeowners(record); })
+      .catch(() => {}); // best-effort; the row just shows no status
+  }, [user, projectId, codeownersRefreshCounter]);
 
   useEffect(() => {
     if (user) {
@@ -1083,26 +1182,6 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     setWorkflows(prevWorkflows => [...prevWorkflows, newWorkflow]);
   };
 
-  const resetProjectState = (): void => {
-    console.log("📌 Resetting project state before cancel.");
-    setProjectName("");
-    setSelectedRepos([]);
-    setWorkflows([]);
-    setRXWorkflows([]);
-    setRegexPattern("");
-    setBranchOption("default");
-    setProjectCode("");
-    setProjectId("");
-    setSecrets([]);
-    setEnvVars([]);
-    setManualEnvVars([]);
-    setManualSecrets([]);
-    setDeploymentEnvironments([]);
-    setReusableWorkflowsEnabled(false);
-    setLinkedWorkflows([]);
-    setActiveSection('workflows');
-  };
-
   const handleDeleteProject = (): void => {
     if (!projectName.trim()) {
       toast.error("Select a valid project to delete.");
@@ -1112,41 +1191,45 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     setIsDeleteModalOpen(true);
   };
 
-  const handleConfirmDeleteProject = async (deleteGitHubResources: boolean, deleteDeploymentEnvironments: boolean = true): Promise<void> => {
+  const handleConfirmDeleteProject = async (options: DeleteProjectOptions): Promise<void> => {
     if (!user) {
       console.error("❌ Error: GitHub user is missing!");
       return;
     }
-
+    setIsDeleteModalOpen(false);
+    let result: EnhancedDeletionResult;
     try {
-      setIsDeleteModalOpen(false);
-
-      // Use the enhanced deletion API
-      const result = await deleteProjectEnhanced(user, projectName, deleteGitHubResources, deleteDeploymentEnvironments);
-      
-      // Show detailed results
-      let message = "✅ Project deleted successfully!";
-      if (result.details) {
-        const { github_resources_deleted, errors } = result.details;
-        if (github_resources_deleted.length > 0) {
-          message += `\n\nGitHub resources deleted:\n${github_resources_deleted.join('\n')}`;
-        }
-        if (errors.length > 0) {
-          message += `\n\nSome errors occurred:\n${errors.join('\n')}`;
-        }
-      }
-      
-      toast.success(message);
-      resetProjectState();
-      fetchProjects(user).then(setProjects);
+      result = await deleteProjectEnhanced(projectName, options);
     } catch (error) {
       console.error("❌ Error deleting project:", error);
-      toast.error("Error deleting project. Please try again.");
+      toast.error(deletionErrorMessage(error));
+      return;
+    }
+    const message = deletionOutcomeMessage(result);
+    if (result.project_deleted) {
+      toast.success(message);
+      handleProjectGone();
+      return;
+    }
+    // Its removal pull requests are open: the project stays, read-only, until they merge.
+    toast.info(message);
+    setProjectPRState(normalizeProjectPRState(result.pr_state));
+    handleSectionChange('pr-history');
+    try {
+      await refreshProjectCampaignState(false);
+    } catch (error) {
+      console.error("❌ Error reloading the project after starting its deletion:", error);
     }
   };
 
-  const handleDriftLoaded = useCallback((details: WorkflowDriftDetail[]) => {
+  const handleDriftLoaded = useCallback((
+    details: WorkflowDriftDetail[],
+    codeownersDetails: CodeownersDriftDetail[] = [],
+    customFileDetails: CustomFileDriftDetail[] = [],
+  ) => {
     setDriftDetails(details);
+    setCodeownersDrift(codeownersDetails);
+    setCustomFileDrift(customFileDetails);
     // The drift check that produced `details` already persisted a fresh
     // drift_status on the project row server-side (see get_project_drift /
     // _cache_project_drift_summary in backend/workflows.py) - refresh the
@@ -1201,33 +1284,29 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
 
   // Helper function to collect and validate workflow names
   const validateWorkflowNames = (): string | null => {
-    const allWorkflowNames: string[] = [];
-    
-    // Collect workflow names from regular workflows
-    workflows.forEach(workflow => {
-      if (workflow.name?.trim()) {
-        allWorkflowNames.push(workflow.name.trim());
-      }
-    });
-    
-    // Collect workflow names from reusable workflows (RWX projects)
-    rxworkflows.forEach(workflow => {
-      if (workflow.name?.trim()) {
-        allWorkflowNames.push(workflow.name.trim());
-      }
-    });
-    
-    // Check for duplicates
-    const duplicateNames = allWorkflowNames.filter((name, index) => 
-      allWorkflowNames.indexOf(name) !== index
+    // The server refuses these too, but part-way through the save, after the
+    // workflows ahead of the clash are already written.
+    const uniqueDuplicates = duplicateWorkflowNames(
+      [...workflows, ...rxworkflows].map(workflow => workflow.name ?? '')
     );
-    
-    if (duplicateNames.length > 0) {
-      const uniqueDuplicates = [...new Set(duplicateNames)];
+
+    if (uniqueDuplicates.length > 0) {
       return `❌ Duplicate workflow names found: "${uniqueDuplicates.join('", "')}".\n\nPlease ensure all workflow names are unique within this project before saving.`;
     }
     
     return null;
+  };
+
+  // A workflow this save gave the other kind (#2318) moves to that section now,
+  // not on the next load. Applied by name on top of the re-baseline queued
+  // before it.
+  const moveReKindedWorkflows = (changes: WorkflowKindChange[]): void => {
+    const latest = workflowListsRef.current;
+    const moves = planWorkflowKindMoves<ProjectRXWorkflow>(latest.workflows, latest.rxworkflows, changes, null);
+    if (!moves) return;
+    followKindChangesFn?.(changes);
+    setWorkflows(prev => moves.nextRegular(prev) as ProjectWorkflow[]);
+    setRXWorkflows(prev => moves.nextReusable(prev));
   };
 
   // Post-save state for the workflows save, split out of doSaveProject to keep
@@ -1256,6 +1335,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
       list.map(w => ({ ...w, savedName: w.name }));
     setWorkflows(prev => rebaseline(prev));
     setRXWorkflows(prev => rebaseline(prev));
+    moveReKindedWorkflows(result.kindChanges ?? []);
 
     // Immediately reflect the updated PR state so the button re-enables without a page refresh
     if (result.prState) {
@@ -1276,6 +1356,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     // would deliver nothing while still clearing every reminder.
     setPendingDeliveryRepos(pushedToGitHub ? [] : (result.pendingDeliveryRepos ?? []));
     setRepoConfigRefreshSignal((prev) => prev + 1);
+    // Saving an edited workflow resolved its stored drift.
+    refreshDrift();
   };
 
   const doSaveProject = async (): Promise<void> => {
@@ -1430,6 +1512,13 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     setClearWorkflowModifiedStatesFn(() => clearFn);
   }, []);
 
+  const handleRegisterSelectionFollowerCallback = useCallback(
+    (followFn: ((changes: WorkflowKindChange[]) => void) | null) => {
+      setFollowKindChangesFn(() => followFn);
+    },
+    [],
+  );
+
   const handleFocusAddEnvironmentCallback = useCallback((focusFn: () => void) => {
     setFocusAddEnvironmentFn(() => focusFn);
   }, []);
@@ -1514,16 +1603,20 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     setPrModalRepoScope(null);
   };
 
+  // A repo an open PR now carries the project's workflows to stops "waiting for
+  // delivery" (the server applies the same rule).
+  const clearDeliveredRepos = useCallback((repos: string[]): void => {
+    const delivered = new Set(repos);
+    setPendingDeliveryRepos((prev) => prev.filter((repo) => !delivered.has(repo)));
+  }, []);
+
   // Function to handle successful PR creation
-  const handlePRCreationSuccess = (selectedWorkflowNames: string[], selectedReusableWorkflowNames: string[], selectedCustomFileIds: number[], selectedCodeownersRepos: string[] = [], targetedRepos: string[] = []): void => {
+  const handlePRCreationSuccess = (selectedWorkflowNames: string[], selectedReusableWorkflowNames: string[], selectedCustomFileIds: number[], includedCodeowners: boolean = false, targetedRepos: string[] = []): void => {
     console.log("✅ PRs created successfully");
-    // The campaign now has an open PR for every repo it targeted, so those stop
-    // being "waiting for delivery" (the server applies the same rule). Keyed on
-    // what the user left ticked, not on what the modal was offered: a repo they
-    // unticked gets no PR, and clearing it would drop its badge and count while
-    // it is genuinely still waiting.
-    const campaignRepos = new Set(targetedRepos);
-    setPendingDeliveryRepos((prev) => prev.filter((repo) => !campaignRepos.has(repo)));
+    // Keyed on what the user left ticked, not on what the modal was offered: a
+    // repo they unticked gets no PR, and clearing it would drop its badge and
+    // count while it is genuinely still waiting.
+    clearDeliveredRepos(targetedRepos);
     // Belt-and-braces alongside closeCreatePRModal: the campaign is delivered,
     // so nothing downstream should still be narrowed to one repo. Safe while the
     // modal is open — it shows results, not the repo picker, from here on.
@@ -1562,8 +1655,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         selectedCFSet.has(f.id) ? { ...f, file_status: 'under_review' } : f
       ));
     }
-    // Bump refresh counter so CodeownersManager reloads and shows under_review status
-    if (selectedCodeownersRepos.length > 0) {
+    // The server locks the file under review once a PR carries it; reload it to show that.
+    if (includedCodeowners) {
       setCodeownersRefreshCounter(prev => prev + 1);
     }
   };
@@ -1714,15 +1807,14 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             selectedRepos={selectedRepos}
             regexPattern={regexPattern}
             accountType={accountType ?? undefined}
-            projectPRState={projectPRState}
             usePrefix={usePrefix}
             isReadOnly={isProjectReadOnly}
-            branchOption={branchOption}
             workflows={workflows as any}
             setWorkflows={setWorkflows as any}
             onRefreshStatus={handleRefreshStatusCallback}
             onAddWorkflow={handleAddWorkflowCallback}
             onClearModifiedStates={handleClearWorkflowModifiedStatesCallback}
+            onRegisterSelectionFollower={handleRegisterSelectionFollowerCallback}
             rxworkflows={rxworkflows as any}
             setRXWorkflows={setRXWorkflows as any}
             addWorkflowToMain={addWorkflowToMain}
@@ -1738,13 +1830,19 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             onImportExisting={!isProjectReadOnly && selectedRepos.length > 0 ? () => setShowWorkflowImport(true) : undefined}
             refreshProjectsList={refreshProjectsList}
             refreshProjectData={refreshProjectCampaignState}
+            refreshDrift={refreshDrift}
             onProjectStateChange={handleProjectStateChange}
+            onReposDelivered={clearDeliveredRepos}
             driftedWorkflowNames={driftedWorkflowNames}
             customFiles={customFiles as any}
             setCustomFiles={setCustomFiles as any}
             projectId={typeof projectId === 'number' ? projectId : (projectId ? Number(projectId) : 0)}
             onCustomFilesChange={(updated) => {
               setCustomFiles(updated as any);
+              // Called once the save, removal or restore has resolved, which can
+              // resolve or drop a file's stored drift: re-read it so the list,
+              // the editor and the banner stop reporting it now.
+              refreshDrift();
               const hasLocalChanges = (updated as any[]).some(
                 (f: any) => f.file_status !== "synced_with_github" || f.pending_delete
               );
@@ -1752,9 +1850,26 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
                 setProjectPRState('draft');
               }
             }}
-            codeownersRefreshCounter={codeownersRefreshCounter}
-            codeownersAggregateStatus={codeownersAggregateStatus ?? undefined}
-            onCodeownersSaved={() => setCodeownersRefreshCounter(prev => prev + 1)}
+            customFileDrift={customFileDrift ?? []}
+            driftedCustomFileIds={driftedCustomFileIds}
+            codeowners={codeowners}
+            codeownersDrift={codeownersDrift}
+            codeownersOpenRequested={codeownersOpenRequested}
+            onCodeownersOpened={() => setCodeownersOpenRequested(false)}
+            onCodeownersSaved={(record, prState) => {
+              setCodeowners(record);
+              // Saving resolved the file's stored drift: re-read it so the banner,
+              // the row and the Projects list stop reporting it now.
+              setDriftRefreshSignal(prev => prev + 1);
+              // A save promotes the project to draft so a CODEOWNERS-only change
+              // can open a campaign; take the server's answer, not a guess.
+              if (prState) {
+                const next = normalizeProjectPRState(prState);
+                setProjectPRState(next);
+                // The projects list shows each project's state too.
+                if (next !== projectPRState) refreshProjectsList();
+              }
+            }}
             importedActions={importedActions}
             actionGroups={actionGroups}
             secrets={secrets}
@@ -2060,7 +2175,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           <select
             id="project-drift-interval"
             data-testid="project-drift-interval"
-            className="flex h-9 w-full max-w-sm rounded-md border px-3 py-1 text-sm shadow-sm transition-colors border-input-border bg-input-background-color text-text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-input-focus dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+            className="flex h-9 w-full max-w-sm rounded-md border px-3 py-1 text-sm shadow-sm transition-colors border-input-border bg-input-background-color text-text-primary focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-input-focus dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
             value={driftInterval === null ? "inherit" : String(driftInterval)}
             disabled={isProjectReadOnly}
             onChange={(e) =>
@@ -2179,6 +2294,14 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     return <BuildMetricsPanel projectId={numericProjectId} user={user} />;
   };
 
+  const renderDangerZone = (name: string): React.ReactElement => (
+    <DangerZone
+      projectName={name}
+      onDeleteProject={handleDeleteProject}
+      disabledReason={isProjectDeleting ? "This project is already being deleted." : null}
+    />
+  );
+
   // Main section content renderer with reduced complexity
   const renderSectionContent = (): React.ReactElement => {
     if (!projectName) {
@@ -2209,6 +2332,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             user={user}
             projectName={projectName}
             onCampaignStateRefresh={refreshProjectCampaignState}
+            onProjectDeleted={() => handleProjectGone(PROJECT_DELETED_NOTICE)}
           />
         ) : renderWorkflows();
       case 'build-metrics':
@@ -2228,12 +2352,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
       case 'backup-export':
         return renderBackupExport();
       case 'danger-zone':
-        return (
-          <DangerZone
-            projectName={projectName}
-            onDeleteProject={handleDeleteProject}
-          />
-        );
+        return renderDangerZone(projectName);
       case 'project-members': {
         const numericProjectId = typeof projectId === 'number' ? projectId : (projectId ? Number(projectId) : undefined);
         return (
@@ -2319,6 +2438,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     // manual refresh. The server recomputes it, so this cannot drift from what
     // the next load will say.
     setPendingDeliveryRepos(result.pendingDeliveryRepos ?? []);
+    // This save posts every workflow too, so it can change one's kind.
+    moveReKindedWorkflows(result.kindChanges ?? []);
     // The repos are persisted now, so the branch-override panel can finally see
     // them — its own refetch already ran, too early, when they were ticked.
     setRepoConfigRefreshSignal((prev) => prev + 1);
@@ -2512,8 +2633,9 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           </div>
         ) : (
           <>
-            {/* Read-only banner for project_viewer users */}
-            {isProjectReadOnly && (
+            {/* Read-only banner for project_viewer users. A project being deleted
+                is read-only to everyone, and its own banner below says why. */}
+            {isProjectReadOnly && !isProjectDeleting && (
               <div className="mb-2 px-4 py-2 rounded-lg text-sm font-medium bg-yellow-50 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300 border border-yellow-200 dark:border-yellow-800">
                 👁️ You have <strong>viewer</strong> access to this project. Editing is disabled.
               </div>
@@ -2758,6 +2880,27 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
               </div>
             )}
             
+            {projectId && isProjectDeleting && (
+              <div className="project-pr-status-banner" role="alert" aria-live="polite" data-testid="project-deleting-banner">
+                <div className="pr-banner-content">
+                  <div className="pr-banner-icon" aria-hidden="true">🗑️</div>
+                  <div className="pr-banner-text">
+                    <strong>Deleting this project</strong>
+                    <span className="pr-banner-subtitle">
+                      This project is being deleted. It is read-only until its removal pull requests merge; closing one calls the deletion off.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="pr-banner-button"
+                    onClick={() => handleSectionChange('pr-history')}
+                  >
+                    <span aria-hidden="true">📊</span> Open PR Campaigns
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Drift Detection Component */}
             <DriftDetection
               user={user!}
@@ -2767,7 +2910,13 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
               onDriftLoaded={handleDriftLoaded}
               refreshSignal={driftRefreshSignal}
               seededDriftNames={seededDriftNames}
+              seededCodeownersDrift={seededCodeownersDrift}
+              seededCustomFileDriftCount={seededCustomFileDriftIds.length}
               onWorkflowStatusesChanged={handleDriftWorkflowStatusesChanged}
+              onOpenCodeowners={() => {
+                handleSectionChange('codeowners');
+                setCodeownersOpenRequested(true);
+              }}
             />
 
             {/* Repositories that joined the project but have no workflows yet */}
@@ -2872,8 +3021,6 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         onConfirmDelete={handleConfirmDeleteProject}
         projectName={projectName}
         githubUser={user!}
-        projectCode={projectCode}
-        usePrefix={usePrefix}
       />
       
       {/* Legacy PR status drawer (campaign page is the primary entry point) */}
@@ -2884,6 +3031,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           onClose={() => setShowPRStatusPanel(false)}
           refreshProjectsList={refreshProjectsList}
           onProjectStateChange={handleProjectStateChange}
+          onProjectDeleted={() => handleProjectGone(PROJECT_DELETED_NOTICE)}
           key={prStatusRefreshKey}
         />
       )}
@@ -2914,9 +3062,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           preflightError={lastPreflightError}
           preflightPrUrl={lastPreflightPrUrl}
           onPreflightStatusChange={handlePreflightStatusChange}
-          codeownersRepos={prModalRepoScope
-            ? codeownersWithChanges.filter((r) => prModalRepoScope.includes(r))
-            : codeownersWithChanges}
+          codeowners={codeowners?.content ? { filePath: codeowners.file_path, status: codeowners.status } : null}
           onClose={closeCreatePRModal}
           onSuccess={handlePRCreationSuccess}
         />
@@ -2937,6 +3083,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             }
             // Reload the full project so imported workflows appear immediately
             loadProjectFromAPI(projectName);
+            // Importing GitHub's copy over a drifted workflow resolves its drift.
+            refreshDrift();
           }}
           onClose={() => setShowWorkflowImport(false)}
         />

@@ -52,7 +52,7 @@ vi.mock("./api/pullRequests", () => ({ getProjectPRStatus: vi.fn() }));
 vi.mock("./api/actionsProjects", () => ({ listActionsProjects: vi.fn().mockResolvedValue([]) }));
 vi.mock("./api/actionGroups", () => ({ listActionGroups: vi.fn().mockResolvedValue([]) }));
 vi.mock("./api/codeowners", () => ({
-  getProjectCodeownersStatuses: vi.fn().mockResolvedValue({ statuses: [] }),
+  getProjectCodeowners: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("./components/ProjectList", () => ({

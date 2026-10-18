@@ -62,7 +62,7 @@ const OpenInGitHubModal: React.FC<OpenInGitHubModalProps> = ({
       {/* Backdrop */}
       <button
         type="button"
-        className="fixed inset-0 bg-black bg-opacity-50 z-40 transition-opacity cursor-default"
+        className="fixed inset-0 bg-black/50 z-40 transition-opacity cursor-default"
         onClick={onClose}
         aria-label="Dismiss dialog"
       />
@@ -97,7 +97,7 @@ const OpenInGitHubModal: React.FC<OpenInGitHubModalProps> = ({
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search repositories..."
-                className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
             </div>
           )}
@@ -125,11 +125,11 @@ const OpenInGitHubModal: React.FC<OpenInGitHubModalProps> = ({
                             {repo}
                           </h3>
                         </div>
-                        <div className="flex gap-2 flex-shrink-0">
+                        <div className="flex gap-2 shrink-0">
                           {workflowUrl ? (
                             <button
                               onClick={() => handleOpenWorkflow(repo)}
-                              className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900 transition-colors"
+                              className="px-3 py-1.5 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900 transition-colors"
                             >
                               Open Workflow
                             </button>
@@ -145,7 +145,7 @@ const OpenInGitHubModal: React.FC<OpenInGitHubModalProps> = ({
                           {repoUrl ? (
                             <button
                               onClick={() => handleOpenRepository(repo)}
-                              className="px-3 py-1.5 bg-gray-700 text-white text-sm rounded-lg hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 focus:ring-offset-gray-900 transition-colors"
+                              className="px-3 py-1.5 bg-gray-700 text-white text-sm rounded-lg hover:bg-gray-600 focus:outline-hidden focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 focus:ring-offset-gray-900 transition-colors"
                             >
                               Open Repository
                             </button>
@@ -171,7 +171,7 @@ const OpenInGitHubModal: React.FC<OpenInGitHubModalProps> = ({
           <div className="border-t border-gray-700 p-4">
             <button
               onClick={onClose}
-              className="w-full px-4 py-2 bg-gray-800 text-gray-300 rounded-lg hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 focus:ring-offset-gray-900 transition-colors"
+              className="w-full px-4 py-2 bg-gray-800 text-gray-300 rounded-lg hover:bg-gray-700 focus:outline-hidden focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 focus:ring-offset-gray-900 transition-colors"
             >
               Close
             </button>

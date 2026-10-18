@@ -67,7 +67,7 @@ const ProjectColorSelector: React.FC<ProjectColorSelectorProps> = ({
               <span
                 aria-hidden="true"
                 className={cn(
-                  "relative h-6 w-6 rounded-full ring-1 ring-black/10 dark:ring-white/10 ring-offset-2 ring-offset-white dark:ring-offset-slate-950 peer-focus-visible:outline-none peer-focus-visible:ring-2",
+                  "relative h-6 w-6 rounded-full ring-1 ring-black/10 dark:ring-white/10 ring-offset-2 ring-offset-white dark:ring-offset-slate-950 peer-focus-visible:outline-hidden peer-focus-visible:ring-2",
                   styles.swatch,
                   styles.focusRing,
                   isSelected ? cn("ring-2", styles.selectedRing) : null,

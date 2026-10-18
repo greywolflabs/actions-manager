@@ -45,8 +45,9 @@ from sqlalchemy import BigInteger, Integer, func, select, text
 from sqlalchemy.orm import Session
 
 from authorization import workspace_is_uninitialized
+from error_detail import failure_kind
 from database import Base, DATABASE_URL
-from run_migrations import MIGRATION_SCRIPTS
+from run_migrations import MIGRATION_SCRIPTS, RETIRED_MIGRATIONS
 
 # Bumped when the archive layout changes in a way an older reader cannot parse.
 # Independent of the project-scoped export version in projects.py: that one
@@ -322,7 +323,7 @@ def _check_schema_version(manifest: dict) -> tuple[list[str], list[str]]:
     backup_migrations = manifest.get("migrations") or []
     errors, warnings = [], []
 
-    newer = [m for m in backup_migrations if m not in MIGRATION_SCRIPTS]
+    newer = [m for m in backup_migrations if m not in MIGRATION_SCRIPTS and m not in RETIRED_MIGRATIONS]
     if newer:
         errors.append(
             "Backup came from a newer schema; this installation is missing "
@@ -482,7 +483,10 @@ def restore_backup(
             db.commit()
         except Exception as exc:
             db.rollback()
-            raise BackupError(f"Restore failed and was rolled back: {exc}") from exc
+            # The first-boot restore is anonymous, so the database's own text
+            # (SQL, parameters, host) goes to the server's output, not the caller.
+            print(f"❌ Restore failed and was rolled back: {exc}")
+            raise BackupError(f"Restore failed and was rolled back: {failure_kind(exc, (BackupError,))}") from exc
 
     # Outside the transaction on purpose, and deliberately not fatal. The rows
     # are committed by now, so raising here would report a failure for a restore
@@ -494,9 +498,10 @@ def restore_backup(
         _resync_sequences(db, say)
     except Exception as exc:  # noqa: BLE001 - the restore itself already succeeded
         db.rollback()
+        print(f"⚠️ Identity sequences could not be reset: {exc}")
         resync_warnings.append(
             "Data restored, but identity sequences could not be reset, so creating new rows "
-            f"will fail until they are: {exc}. Re-run `backup_cli.py restore --in <archive> "
+            f"will fail until they are ({failure_kind(exc)}). Re-run `backup_cli.py restore --in <archive> "
             "--force` once the cause is fixed."
         )
         say(resync_warnings[-1])

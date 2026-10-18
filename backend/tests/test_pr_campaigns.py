@@ -44,7 +44,9 @@ from workflows import (
     get_db, _save_prs_and_update_status, _fetch_branch_protection,
     _campaign_pr_body, _finalize_pr_result, CreatePullRequestsRequest,
     _includes_regular_workflows, _build_campaign_snapshot, _build_policy_version,
+    _build_codeowners_for_delivery, _process_regular_workflows_update,
 )
+from deliveries import blob_sha as _git_blob_sha  # noqa: E402
 
 TEST_USER = "campaignuser"
 TEST_PROJECT = "campaign_project"
@@ -451,10 +453,11 @@ class TestCampaignEndpointGrouping:
         assert campaign_b_resp["merged_count"] == 0
 
 
-class TestCodeownersMergedIntoRepoPR:
+class TestCodeownersInCampaigns:
     """
-    CODEOWNERS must join the same per-repo PR as workflows/custom files
-    instead of opening a second PR for a repo already getting one (PR #1506).
+    The project's CODEOWNERS rides the campaign's per-repo PR on every repo,
+    as custom files do, and a commit makes its blob the file's git_hash, as
+    _update_workflow_git_hash does for a workflow.
     """
 
     def _add_repo(self, db, project, repo_name):
@@ -466,103 +469,125 @@ class TestCodeownersMergedIntoRepoPR:
         db.commit()
         return repo
 
-    def test_build_codeowners_for_delivery_only_includes_repos_in_scope(self, db_session):
-        from workflows import _build_codeowners_for_delivery, CreatePullRequestsRequest
-        db = db_session
-        _, project = _create_account_and_project(db)
-        repo_a = self._add_repo(db, project, "whatsupdawg/repo-a")
-        repo_b = self._add_repo(db, project, "whatsupdawg/repo-b")
-        db.add(Codeowners(project_id=project.project_id, repo_id=repo_a.repo_id, content="* @a"))
-        db.add(Codeowners(project_id=project.project_id, repo_id=repo_b.repo_id, content="* @b"))
+    def _add_codeowners(self, db, project, content="* @a", git_hash=None, status="committed_locally"):
+        record = Codeowners(project_id=project.project_id, content=content, git_hash=git_hash, status=status)
+        db.add(record)
         db.commit()
+        db.refresh(record)
+        return record
 
-        payload = CreatePullRequestsRequest(
-            project_name=TEST_PROJECT,
-            selected_codeowners_repos=["whatsupdawg/repo-a", "whatsupdawg/repo-b"],
-        )
-        # repo-b is deselected from the caller-repo scope for this run, so it
-        # must be left for the standalone CODEOWNERS-only deploy path.
-        result = _build_codeowners_for_delivery(project, payload, ["whatsupdawg/repo-a"], db)
-
-        assert set(result.keys()) == {"whatsupdawg/repo-a"}
-        assert result["whatsupdawg/repo-a"]["content"] == "* @a"
-        assert result["whatsupdawg/repo-a"]["repo_id"] == repo_a.repo_id
-
-    def test_build_codeowners_for_delivery_empty_when_none_selected(self, db_session):
-        from workflows import _build_codeowners_for_delivery, CreatePullRequestsRequest
-        db = db_session
-        _, project = _create_account_and_project(db)
-        payload = CreatePullRequestsRequest(project_name=TEST_PROJECT)
-        assert _build_codeowners_for_delivery(project, payload, ["whatsupdawg/repo-a"], db) == {}
-
-    def test_codeowners_merged_repos_only_counts_successful_merges(self):
-        from workflows import _codeowners_merged_repos
-        results = {
-            "whatsupdawg/repo-a on main": {"status": "pr_created", "codeowners_committed": True},
-            "whatsupdawg/repo-b on main": {"status": "pr_updated", "codeowners_committed": False},
-            "whatsupdawg/repo-c on main": {"status": "error", "codeowners_committed": True},
-        }
-        assert _codeowners_merged_repos(results) == ["whatsupdawg/repo-a"]
-
-    def test_codeowners_only_repo_still_gets_one_pr_on_shared_branch(self, db_session):
-        """A repo with CODEOWNERS as its only selected change (but still in the
-        caller-repo scope) must land on the same AM branch/PR the regular
-        workflow path would create — not a second, CODEOWNERS-only branch."""
-        from unittest.mock import MagicMock
-        from workflows import _process_regular_workflows_update
-
-        db = db_session
-        _, project = _create_account_and_project(db)
-        repo = self._add_repo(db, project, "whatsupdawg/repo-a")
-        db.add(Codeowners(project_id=project.project_id, repo_id=repo.repo_id, content="* @a"))
-        db.commit()
-
-        codeowners_files = {
-            "whatsupdawg/repo-a": {
-                "file_path": ".github/CODEOWNERS",
-                "content": "* @a",
-                "repo_id": repo.repo_id,
-                "project_id": project.project_id,
-            }
-        }
-
-        not_found = MagicMock()
-        not_found.status_code = 404
+    def _update(self, db, project, repo_names, codeowners, existing_sha=None):
+        existing = MagicMock()
+        existing.status_code = 200 if existing_sha else 404
+        existing.json.return_value = {"sha": existing_sha}
         put_ok = MagicMock()
         put_ok.status_code = 201
         put_ok.json.return_value = {"content": {"sha": "newsha"}}
         new_pr = {
-            "number": 42, "html_url": "https://github.com/whatsupdawg/repo-a/pull/42",
+            "number": 42, "html_url": "https://github.com/org/repo/pull/42",
             "title": "t", "user": {"login": TEST_USER}, "body": "b",
         }
-
         with patch("workflows._resolve_branches_for_repo", return_value=["main"]), \
              patch("workflows._create_or_get_am_branch", return_value=("actions-manager/cmp-main", True, None)), \
-             patch("workflows.github_get", return_value=not_found), \
-             patch("workflows.requests.put", return_value=put_ok), \
+             patch("workflows._delete_actions_manager_branch"), \
+             patch("workflows.github_get", return_value=existing), \
+             patch("workflows.requests.put", return_value=put_ok) as put, \
              patch("workflows._check_existing_pr", return_value=None), \
              patch("workflows._create_pull_request", return_value=(new_pr, None)):
             results = _process_regular_workflows_update(
-                repo_names=["whatsupdawg/repo-a"],
-                workflows=[],
-                project_code="CMP",
-                branch_option="default",
-                regex_pattern="",
-                branch_max_age_days=30,
-                headers={},
-                db=db,
-                user=TEST_USER,
-                project=project,
-                codeowners_files=codeowners_files,
+                repo_names=repo_names, workflows=[], project_code="CMP", branch_option="default",
+                regex_pattern="", branch_max_age_days=30, headers={}, db=db, user=TEST_USER,
+                project=project, codeowners=codeowners,
             )
+        return results, put
 
-        key = "whatsupdawg/repo-a on main"
-        assert results[key]["status"] == "pr_created"
-        assert results[key]["codeowners_committed"] == ".github/CODEOWNERS"
+    def test_the_project_file_is_delivered_only_when_the_campaign_includes_it(self, db_session):
+        db = db_session
+        _, project = _create_account_and_project(db)
+        record = self._add_codeowners(db, project, status="synced_with_github", git_hash="sha")
 
-        record = db.query(Codeowners).filter_by(repo_id=repo.repo_id).first()
-        assert record.status == "under_review"
+        assert _build_codeowners_for_delivery(project, CreatePullRequestsRequest(project_name=TEST_PROJECT), db) is None
+        # Whatever its status: a campaign can also put it back where it drifted.
+        included = CreatePullRequestsRequest(project_name=TEST_PROJECT, include_codeowners=True)
+        assert _build_codeowners_for_delivery(project, included, db) == {
+            "id": record.id, "file_path": ".github/CODEOWNERS", "content": "* @a",
+        }
+
+    def test_nothing_to_deliver_without_a_codeowners_file(self, db_session):
+        db = db_session
+        _, project = _create_account_and_project(db)
+        included = CreatePullRequestsRequest(project_name=TEST_PROJECT, include_codeowners=True)
+        assert _build_codeowners_for_delivery(project, included, db) is None
+
+    def test_codeowners_goes_to_every_repo_and_its_blob_becomes_the_hash(self, db_session):
+        db = db_session
+        _, project = _create_account_and_project(db)
+        self._add_repo(db, project, "whatsupdawg/repo-a")
+        self._add_repo(db, project, "whatsupdawg/repo-b")
+        record = self._add_codeowners(db, project)
+        codeowners = _build_codeowners_for_delivery(
+            project, CreatePullRequestsRequest(project_name=TEST_PROJECT, include_codeowners=True), db
+        )
+
+        results, _ = self._update(db, project, ["whatsupdawg/repo-a", "whatsupdawg/repo-b"], codeowners)
+
+        for repo_name in ("whatsupdawg/repo-a", "whatsupdawg/repo-b"):
+            assert results[f"{repo_name} on main"]["status"] == "pr_created"
+            assert results[f"{repo_name} on main"]["codeowners_committed"] == ".github/CODEOWNERS"
+        db.refresh(record)
         assert record.git_hash == "newsha"
+        # Locked when the campaign records its PRs, so a run failing before then locks nothing.
+        assert record.status == "committed_locally"
+
+    def test_a_branch_already_holding_the_file_gets_no_commit(self, db_session):
+        db = db_session
+        _, project = _create_account_and_project(db)
+        self._add_repo(db, project, "whatsupdawg/repo-a")
+        record = self._add_codeowners(db, project)
+        codeowners = {"id": record.id, "file_path": ".github/CODEOWNERS", "content": "* @a"}
+
+        results, put = self._update(db, project, ["whatsupdawg/repo-a"], codeowners,
+                                    existing_sha=_git_blob_sha("* @a"))
+
+        put.assert_not_called()
+        assert results["whatsupdawg/repo-a on main"]["nothing_to_deliver"] is True
+
+    def test_a_copy_saved_again_during_the_campaign_keeps_its_cleared_hash(self, db_session):
+        db = db_session
+        _, project = _create_account_and_project(db)
+        self._add_repo(db, project, "whatsupdawg/repo-a")
+        record = self._add_codeowners(db, project, content="* @newer")
+        # What the campaign read before the save.
+        codeowners = {"id": record.id, "file_path": ".github/CODEOWNERS", "content": "* @a"}
+
+        self._update(db, project, ["whatsupdawg/repo-a"], codeowners)
+
+        db.refresh(record)
+        assert record.git_hash is None
+
+    def test_recording_the_prs_locks_the_file_they_carry(self, db_session):
+        db = db_session
+        _, project = _create_account_and_project(db)
+        record = self._add_codeowners(db, project, git_hash=_git_blob_sha("* @a"))
+        result = {**_pr_result(1, "actions-manager/cmp-main"), "codeowners_committed": ".github/CODEOWNERS"}
+
+        _save_prs_and_update_status({"org/repo on main": result}, project, [], [], db, github_user=TEST_USER)
+
+        db.refresh(record)
+        assert record.status == "under_review"
+        pr = db.query(ProjectPullRequest).one()
+        assert pr.file_names == ".github/CODEOWNERS"
+
+    def test_a_copy_saved_since_its_commit_is_not_locked(self, db_session):
+        db = db_session
+        _, project = _create_account_and_project(db)
+        record = self._add_codeowners(db, project)  # zeroed: saved after the commit
+        result = {**_pr_result(1, "actions-manager/cmp-main"), "codeowners_committed": ".github/CODEOWNERS"}
+
+        _save_prs_and_update_status({"org/repo on main": result}, project, [], [], db, github_user=TEST_USER)
+
+        db.refresh(record)
+        assert record.status == "committed_locally"
 
 
 class TestSchemaSafety:
@@ -596,6 +621,30 @@ class TestSchemaSafety:
             )
         assert exc_info.value.status_code == 500
         assert "could not be recorded" in exc_info.value.detail
+
+    def test_unrecorded_pr_keeps_the_remedy_but_not_the_database_error(self, db_session, monkeypatch):
+        """The SQL and its parameters go to the server log, not the response (#2295)."""
+        from fastapi import HTTPException
+        from sqlalchemy.exc import OperationalError
+        import workflows
+
+        marker = "secret-marker-2295"
+
+        def fail(**_kwargs):
+            raise OperationalError(f"INSERT {marker}", {"param": marker}, Exception(marker))
+
+        monkeypatch.setattr(workflows, "_save_pr_to_database", fail)
+        _, project = _create_account_and_project(db_session)
+
+        results = {"org/repo-a on main": _pr_result(10, "actions-manager/cmp/a/111-main")}
+        with pytest.raises(HTTPException) as exc_info:
+            _save_prs_and_update_status(
+                results, project, ["wf222.yml"], [], db_session, github_user=TEST_USER
+            )
+        assert exc_info.value.status_code == 500
+        assert "could not be recorded" in exc_info.value.detail
+        assert "run_migrations.py" in exc_info.value.detail
+        assert marker not in exc_info.value.detail
 
     def test_sqlite_migration_adds_column_to_runtime_database(self, tmp_path, monkeypatch):
         """The SQLite migration must target the application's resolved database
@@ -1182,7 +1231,8 @@ class TestBranchProtectionSnapshot:
             summary = _fetch_branch_protection("org", "repo-a", "main", {})
 
         assert summary["status"] == "unknown"
-        assert "socket exploded" in summary["error"]
+        # Named by kind: the exception's own text stays in the server log (#2297).
+        assert summary["error"] == "unexpected error"
 
 
 class TestCampaignPRUrlAndProtectionSnapshot:

@@ -79,6 +79,24 @@ export const deleteCustomFile = (
 export const restoreCustomFile = (projectId: number, id: number): Promise<{ custom_file: CustomFile }> =>
   apiClient.post(`/api/projects/${projectId}/custom-files/${id}/restore`).then((r) => r.data);
 
+export interface CustomFileOnGitHub {
+  repo_id: number;
+  repo_name: string;
+  branch: string;
+  github: { exists: boolean; content: string | null; sha: string | null; path: string };
+}
+
+/** The file's copy on one of the project's (repo, branch), read where its drift check reads it. */
+export const getCustomFileOnGitHub = (
+  projectId: number,
+  id: number,
+  repo: string,
+  branch: string
+): Promise<CustomFileOnGitHub> =>
+  apiClient
+    .get(`/api/projects/${projectId}/custom-files/${id}/github`, { params: { repo, branch } })
+    .then((r) => r.data);
+
 /** Client-side path validation (mirrors server-side rules). Returns error string or null. */
 export const validateFilePath = (path: string): string | null => {
   if (!path?.trim()) return "File path is required";

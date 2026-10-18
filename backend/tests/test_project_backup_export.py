@@ -28,6 +28,7 @@ from models import (  # noqa: E402
 )
 import projects  # noqa: E402
 from projects import get_db as projects_get_db  # noqa: E402
+from auth import create_auth_session  # noqa: E402
 
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -47,6 +48,16 @@ def override_get_db():
         yield db
     finally:
         db.close()
+
+
+def _signed_in(github_user):
+    """Headers for a real server-side session as ``github_user`` (#2241)."""
+    db = TestingSessionLocal()
+    try:
+        token = create_auth_session(github_user, db)
+    finally:
+        db.close()
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture(autouse=True)
@@ -184,7 +195,6 @@ def setup_database():
         db.add(
             Codeowners(
                 project_id=standard_project.project_id,
-                repo_id=repo_a.repo_id,
                 content="* @octo-org/platform",
                 file_path=".github/CODEOWNERS",
                 git_hash="codeownershash",
@@ -236,7 +246,7 @@ def test_export_project_backup_success_includes_expected_shape(setup_database):
     project_id = setup_database["project_id"]
     resp = client.get(
         f"/api/projects/{project_id}/backup-export",
-        headers={"X-GitHub-User": "owner-user"},
+        headers=_signed_in("owner-user"),
     )
     assert resp.status_code == 200, resp.text
     assert "attachment; filename=" in resp.headers.get("content-disposition", "")
@@ -267,6 +277,11 @@ def test_export_project_backup_success_includes_expected_shape(setup_database):
     assert ci_workflow["source_metadata"]["workflow_git_hash"] == "abc123"
     assert len(ci_workflow["content_sha256"]) == 64
     assert [v["version_number"] for v in ci_workflow["version_history"]] == [1, 2]
+    # One CODEOWNERS file per project, so it names no repository.
+    assert [(c["file_path"], c["content"], c["git_hash"]) for c in payload["codeowners"]] == [
+        (".github/CODEOWNERS", "* @octo-org/platform", "codeownershash"),
+    ]
+    assert "repo_name" not in payload["codeowners"][0]
     assert ci_workflow["version_history"][0]["metadata"] == {"source": "create"}
     assert ci_workflow["version_history"][1]["metadata"] == {"source": "edit"}
     assert payload["integrity"]["algorithm"] == "sha256"
@@ -277,7 +292,7 @@ def test_export_project_backup_blocks_unauthorized_user(setup_database):
     project_id = setup_database["project_id"]
     resp = client.get(
         f"/api/projects/{project_id}/backup-export",
-        headers={"X-GitHub-User": "outsider-user"},
+        headers=_signed_in("outsider-user"),
     )
     assert resp.status_code in (403, 404)
 
@@ -292,7 +307,7 @@ def test_export_project_backup_excludes_sensitive_tokens_and_credentials(setup_d
     project_id = setup_database["project_id"]
     resp = client.get(
         f"/api/projects/{project_id}/backup-export",
-        headers={"X-GitHub-User": "owner-user"},
+        headers=_signed_in("owner-user"),
     )
     assert resp.status_code == 200
     serialized = json.dumps(resp.json()).lower()
@@ -307,7 +322,7 @@ def test_export_project_backup_includes_repo_overrides_and_linked_workflows(setu
     project_id = setup_database["project_id"]
     resp = client.get(
         f"/api/projects/{project_id}/backup-export",
-        headers={"X-GitHub-User": "owner-user"},
+        headers=_signed_in("owner-user"),
     )
     assert resp.status_code == 200
     payload = resp.json()
@@ -330,7 +345,7 @@ def test_export_rwx_project_backup_scopes_linked_standard_projects_to_owner(setu
     rwx_project_id = setup_database["rwx_project_id"]
     resp = client.get(
         f"/api/projects/{rwx_project_id}/backup-export",
-        headers={"X-GitHub-User": "owner-user"},
+        headers=_signed_in("owner-user"),
     )
     assert resp.status_code == 200
     payload = resp.json()

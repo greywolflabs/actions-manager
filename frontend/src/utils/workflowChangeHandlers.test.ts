@@ -1,6 +1,5 @@
 import { handleWorkflowChange } from './workflowOperations';
 import { Workflow, RXWorkflow, UnifiedWorkflowItem } from '../types/workflow';
-import { WorkflowGUI, DEFAULT_WORKFLOW_GUI, DEFAULT_REUSABLE_WORKFLOW_GUI } from './workflowGuiConversion';
 
 import type { Mock } from 'vitest';
 describe('workflowChangeHandlers', () => {
@@ -9,11 +8,7 @@ describe('workflowChangeHandlers', () => {
     let mockRXWorkflows: RXWorkflow[];
     let mockSetWorkflows: Mock;
     let mockSetRXWorkflows: Mock;
-    let mockSetRegularGuiWorkflow: Mock;
-    let mockSetGuiWorkflow: Mock;
     let mockMarkWorkflowAsModified: Mock;
-    let mockRegularGuiWorkflow: WorkflowGUI;
-    let mockGuiWorkflow: WorkflowGUI;
 
     beforeEach(() => {
       mockWorkflows = [
@@ -29,14 +24,10 @@ describe('workflowChangeHandlers', () => {
         }
       });
       mockSetRXWorkflows = vi.fn();
-      mockSetRegularGuiWorkflow = vi.fn();
-      mockSetGuiWorkflow = vi.fn();
       mockMarkWorkflowAsModified = vi.fn();
-      mockRegularGuiWorkflow = { ...DEFAULT_WORKFLOW_GUI, name: 'test' };
-      mockGuiWorkflow = { ...DEFAULT_REUSABLE_WORKFLOW_GUI, name: 'reusable' };
     });
 
-    test('updates regular workflow name in YAML mode using functional updater', () => {
+    test('updates regular workflow name using functional updater', () => {
       const selectedWorkflow: UnifiedWorkflowItem = {
         id: 'regular-0',
         name: 'test-workflow',
@@ -54,11 +45,6 @@ describe('workflowChangeHandlers', () => {
         workflows: mockWorkflows,
         setWorkflows: mockSetWorkflows,
         setRXWorkflows: mockSetRXWorkflows,
-        editMode: 'yaml',
-        regularGuiWorkflow: mockRegularGuiWorkflow,
-        guiWorkflow: mockGuiWorkflow,
-        setRegularGuiWorkflow: mockSetRegularGuiWorkflow,
-        setGuiWorkflow: mockSetGuiWorkflow,
         markWorkflowAsModified: mockMarkWorkflowAsModified,
       });
 
@@ -69,47 +55,6 @@ describe('workflowChangeHandlers', () => {
       const result = updater(mockWorkflows);
       expect(result[0].name).toBe('new-name');
       expect(result[0].isModified).toBe(true);
-      // In YAML mode, GUI name should also be updated
-      expect(mockSetRegularGuiWorkflow).toHaveBeenCalledWith({
-        ...mockRegularGuiWorkflow,
-        name: 'new-name'
-      });
-      expect(mockMarkWorkflowAsModified).toHaveBeenCalledWith(0, 'regular');
-    });
-
-    test('does NOT update GUI state when name changes in GUI mode (avoids redundant updates)', () => {
-      const selectedWorkflow: UnifiedWorkflowItem = {
-        id: 'regular-0',
-        name: 'test-workflow',
-        content: 'name: test\non: [push]',
-        type: 'regular',
-        isReusable: false,
-        originalIndex: 0,
-        isModified: false
-      };
-
-      handleWorkflowChange({
-        field: 'name',
-        value: 'new-name',
-        selectedWorkflow,
-        workflows: mockWorkflows,
-        setWorkflows: mockSetWorkflows,
-        setRXWorkflows: mockSetRXWorkflows,
-        editMode: 'gui',
-        regularGuiWorkflow: mockRegularGuiWorkflow,
-        guiWorkflow: mockGuiWorkflow,
-        setRegularGuiWorkflow: mockSetRegularGuiWorkflow,
-        setGuiWorkflow: mockSetGuiWorkflow,
-        markWorkflowAsModified: mockMarkWorkflowAsModified,
-      });
-
-      // setWorkflows should be called with a functional updater
-      expect(mockSetWorkflows).toHaveBeenCalledWith(expect.any(Function));
-      const updater = mockSetWorkflows.mock.calls[0][0];
-      const result = updater(mockWorkflows);
-      expect(result[0].name).toBe('new-name');
-      // In GUI mode, we should NOT update the GUI workflow name here
-      expect(mockSetRegularGuiWorkflow).not.toHaveBeenCalled();
       expect(mockMarkWorkflowAsModified).toHaveBeenCalledWith(0, 'regular');
     });
 
@@ -144,11 +89,6 @@ describe('workflowChangeHandlers', () => {
         workflows: staleWorkflows,  // stale closure value
         setWorkflows: mockSetWorkflows,
         setRXWorkflows: mockSetRXWorkflows,
-        editMode: 'yaml',
-        regularGuiWorkflow: mockRegularGuiWorkflow,
-        guiWorkflow: mockGuiWorkflow,
-        setRegularGuiWorkflow: mockSetRegularGuiWorkflow,
-        setGuiWorkflow: mockSetGuiWorkflow,
         markWorkflowAsModified: mockMarkWorkflowAsModified,
       });
 
@@ -163,73 +103,7 @@ describe('workflowChangeHandlers', () => {
       expect(result[0].isModified).toBe(true);
     });
 
-    test('does NOT re-parse content when in GUI mode for regular workflows', () => {
-      const selectedWorkflow: UnifiedWorkflowItem = {
-        id: 'regular-0',
-        name: 'test-workflow',
-        content: '',
-        type: 'regular',
-        isReusable: false,
-        originalIndex: 0,
-        isModified: false
-      };
-
-      handleWorkflowChange({
-        field: 'content',
-        value: 'name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest',
-        selectedWorkflow,
-        workflows: mockWorkflows,
-        setWorkflows: mockSetWorkflows,
-        setRXWorkflows: mockSetRXWorkflows,
-        editMode: 'gui',
-        regularGuiWorkflow: mockRegularGuiWorkflow,
-        guiWorkflow: mockGuiWorkflow,
-        setRegularGuiWorkflow: mockSetRegularGuiWorkflow,
-        setGuiWorkflow: mockSetGuiWorkflow,
-        markWorkflowAsModified: mockMarkWorkflowAsModified,
-      });
-
-      // Should update workflow content via functional updater
-      expect(mockSetWorkflows).toHaveBeenCalledWith(expect.any(Function));
-
-      // Should NOT re-parse and overwrite GUI state
-      expect(mockSetRegularGuiWorkflow).not.toHaveBeenCalled();
-    });
-
-    test('does NOT re-parse content when in GUI mode for reusable workflows', () => {
-      const selectedWorkflow: UnifiedWorkflowItem = {
-        id: 'reusable-0',
-        name: 'reusable-workflow',
-        content: '',
-        type: 'reusable',
-        isReusable: true,
-        originalIndex: 0,
-        isModified: false
-      };
-
-      handleWorkflowChange({
-        field: 'content',
-        value: 'name: Reusable\non: [workflow_call]',
-        selectedWorkflow,
-        workflows: mockWorkflows,
-        setWorkflows: mockSetWorkflows,
-        setRXWorkflows: mockSetRXWorkflows,
-        editMode: 'gui',
-        regularGuiWorkflow: mockRegularGuiWorkflow,
-        guiWorkflow: mockGuiWorkflow,
-        setRegularGuiWorkflow: mockSetRegularGuiWorkflow,
-        setGuiWorkflow: mockSetGuiWorkflow,
-        markWorkflowAsModified: mockMarkWorkflowAsModified,
-      });
-
-      // Should update workflow content
-      expect(mockSetRXWorkflows).toHaveBeenCalled();
-
-      // Should NOT re-parse and overwrite GUI state
-      expect(mockSetGuiWorkflow).not.toHaveBeenCalled();
-    });
-
-    test('updates reusable workflow name and syncs GUI state', () => {
+    test('updates reusable workflow name', () => {
       const selectedWorkflow: UnifiedWorkflowItem = {
         id: 'reusable-0',
         name: 'reusable-workflow',
@@ -254,58 +128,10 @@ describe('workflowChangeHandlers', () => {
         workflows: mockWorkflows,
         setWorkflows: mockSetWorkflows,
         setRXWorkflows: mockSetRXWorkflowsWithCallback,
-        editMode: 'yaml',
-        regularGuiWorkflow: mockRegularGuiWorkflow,
-        guiWorkflow: mockGuiWorkflow,
-        setRegularGuiWorkflow: mockSetRegularGuiWorkflow,
-        setGuiWorkflow: mockSetGuiWorkflow,
         markWorkflowAsModified: mockMarkWorkflowAsModified,
       });
 
       expect(mockSetRXWorkflowsWithCallback).toHaveBeenCalled();
-      expect(mockSetGuiWorkflow).toHaveBeenCalledWith({
-        ...mockGuiWorkflow,
-        name: 'new-reusable-name'
-      });
-      expect(mockMarkWorkflowAsModified).toHaveBeenCalledWith(0, 'reusable');
-    });
-
-    test('does NOT update GUI state when reusable workflow name changes in GUI mode (avoids redundant updates)', () => {
-      const selectedWorkflow: UnifiedWorkflowItem = {
-        id: 'reusable-0',
-        name: 'reusable-workflow',
-        content: 'name: reusable\non: [workflow_call]',
-        type: 'reusable',
-        isReusable: true,
-        originalIndex: 0,
-        isModified: false
-      };
-
-      // Mock setRXWorkflows to execute the callback function
-      const mockSetRXWorkflowsWithCallback = vi.fn((callback) => {
-        if (typeof callback === 'function') {
-          callback(mockRXWorkflows);
-        }
-      });
-
-      handleWorkflowChange({
-        field: 'name',
-        value: 'new-reusable-name',
-        selectedWorkflow,
-        workflows: mockWorkflows,
-        setWorkflows: mockSetWorkflows,
-        setRXWorkflows: mockSetRXWorkflowsWithCallback,
-        editMode: 'gui',
-        regularGuiWorkflow: mockRegularGuiWorkflow,
-        guiWorkflow: mockGuiWorkflow,
-        setRegularGuiWorkflow: mockSetRegularGuiWorkflow,
-        setGuiWorkflow: mockSetGuiWorkflow,
-        markWorkflowAsModified: mockMarkWorkflowAsModified,
-      });
-
-      expect(mockSetRXWorkflowsWithCallback).toHaveBeenCalled();
-      // In GUI mode, we should NOT update the GUI workflow name here
-      expect(mockSetGuiWorkflow).not.toHaveBeenCalled();
       expect(mockMarkWorkflowAsModified).toHaveBeenCalledWith(0, 'reusable');
     });
 
@@ -317,18 +143,11 @@ describe('workflowChangeHandlers', () => {
         workflows: mockWorkflows,
         setWorkflows: mockSetWorkflows,
         setRXWorkflows: mockSetRXWorkflows,
-        editMode: 'yaml',
-        regularGuiWorkflow: mockRegularGuiWorkflow,
-        guiWorkflow: mockGuiWorkflow,
-        setRegularGuiWorkflow: mockSetRegularGuiWorkflow,
-        setGuiWorkflow: mockSetGuiWorkflow,
         markWorkflowAsModified: mockMarkWorkflowAsModified,
       });
 
       expect(mockSetWorkflows).not.toHaveBeenCalled();
       expect(mockSetRXWorkflows).not.toHaveBeenCalled();
-      expect(mockSetRegularGuiWorkflow).not.toHaveBeenCalled();
-      expect(mockSetGuiWorkflow).not.toHaveBeenCalled();
       expect(mockMarkWorkflowAsModified).not.toHaveBeenCalled();
     });
   });

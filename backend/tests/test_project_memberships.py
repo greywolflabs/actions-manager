@@ -412,7 +412,7 @@ class TestProjectAccessFiltering:
 
     def test_second_admin_sees_all_projects(self, admin_user, second_admin_user, sample_project, second_project):
         resp = client.get(
-            f"/api/projects/?github_user={admin_user.github_user}",
+            "/api/projects/",
             headers=_auth_headers(second_admin_user),
         )
         assert resp.status_code == 200
@@ -429,7 +429,7 @@ class TestProjectAccessFiltering:
         test_db.commit()
 
         resp = client.get(
-            f"/api/projects/?github_user={admin_user.github_user}",
+            "/api/projects/",
             headers=_auth_headers(readonly_user),
         )
         assert resp.status_code == 200
@@ -439,7 +439,7 @@ class TestProjectAccessFiltering:
 
     def test_readonly_with_no_assignments_sees_nothing(self, admin_user, readonly_user, sample_project, second_project):
         resp = client.get(
-            f"/api/projects/?github_user={admin_user.github_user}",
+            "/api/projects/",
             headers=_auth_headers(readonly_user),
         )
         assert resp.status_code == 200
@@ -517,14 +517,16 @@ class TestSingleProjectAccess:
             headers=_auth_headers(readonly_user),
         )
         assert resp.status_code == 200
-        assert resp.json()["caller_project_role"] == "project_editor"
+        # read_only never edits, whatever the grant says (authorization.project_role).
+        assert resp.json()["caller_project_role"] == "project_viewer"
 
     def test_readonly_without_assignment_denied(self, admin_user, readonly_user, sample_project):
         resp = client.get(
             f"/api/projects/{sample_project.project_name}?github_user={admin_user.github_user}",
             headers=_auth_headers(readonly_user),
         )
-        assert resp.status_code == 403
+        # A project the caller may not see is not found, as on the by-id routes.
+        assert resp.status_code == 404
 
     def test_readonly_own_url_with_assignment_can_access(self, admin_user, readonly_user, sample_project, test_db):
         """Read-only user can load a project via their own URL when they have membership."""
@@ -542,7 +544,8 @@ class TestSingleProjectAccess:
             headers=_auth_headers(readonly_user),
         )
         assert resp.status_code == 200
-        assert resp.json()["caller_project_role"] == "project_editor"
+        # read_only never edits, whatever the grant says (authorization.project_role).
+        assert resp.json()["caller_project_role"] == "project_viewer"
         assert resp.json()["project_name"] == "Test Project"
 
     def test_readonly_own_url_without_assignment_not_found(self, admin_user, readonly_user, sample_project):
@@ -654,7 +657,7 @@ class TestMemberRole:
         test_db.commit()
 
         resp = client.get(
-            f"/api/projects/?github_user={admin_user.github_user}",
+            "/api/projects/",
             headers=_auth_headers(member_user),
         )
         assert resp.status_code == 200
@@ -672,7 +675,7 @@ class TestMemberRole:
         Workspace Members page.
         """
         resp = client.get(
-            f"/api/projects/?github_user={admin_user.github_user}",
+            "/api/projects/",
             headers=_auth_headers(member_user),
         )
         assert resp.status_code == 200

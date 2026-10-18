@@ -78,14 +78,18 @@ After signing in, open the user menu to:
 - **Replace token** — swap to a new token
 - **Remove token** — delete the saved token
 
-The UI never displays the raw token value after saving; it shows only masked status such as **Configured**, **Invalid or expired**, or **Missing required permissions**.
+The UI never displays the raw token value after saving; it shows only masked status such as **Configured**, **Invalid or expired**, **Missing required permissions**, **No repository access**, **Blocked by organization policy**, **Not verified**, or **Saved but unreadable**.
 
 ## Troubleshooting PAT Issues
 
 **Invalid token:** The token may be mistyped, revoked, or expired. Generate a new one.
 
-**Missing repositories:** Check that the fine-grained PAT was created with repository access to the correct repositories.
+**Saved but unreadable:** The saved token can no longer be decrypted, which usually means `SECRET_KEY` changed since it was saved. Make sure `SECRET_KEY` survives container updates, then save the token again to re-encrypt it under the current key.
+
+**Not verified:** The token was saved, but its permissions could not be checked with GitHub. They are checked again each time you sign in or reopen ActionsManager.
+
+**Missing repositories (No repository access):** Check that the fine-grained PAT was created with repository access to the correct repositories.
 
 **Missing write permissions:** Verify that **Contents**, **Actions**, and **Pull requests** permissions are set to read and write.
 
-**Organization restrictions:** Some organizations block fine-grained PATs or require approval. Check your organization's token policy in GitHub settings.
+**Organization restrictions (Blocked by organization policy):** Some organizations block fine-grained PATs or require approval. Check your organization's token policy in GitHub settings.

@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from fastapi import HTTPException
 
+import deliveries
 from models import (
     Account,
     LinkedReusableWorkflow,
@@ -31,9 +32,9 @@ from models import (
     ProjectWorkflow,
     Repo,
     Workflow,
-    WorkflowDriftState,
 )
 from tests.conftest import TestingSessionLocal
+from tests.delivery_records import record_delivered, record_pr_carries  # noqa: E402
 from workflows import WorkflowSchema, create_or_update_workflow
 
 OWNER = "rename-guard-owner"
@@ -141,14 +142,15 @@ def test_an_open_pr_carrying_the_workflow_blocks_the_rename():
     db = TestingSessionLocal()
     try:
         proj = _project(db, code="GRD2")
-        _workflow(db, proj, "ci")
-        db.add(ProjectPullRequest(
+        wf = _workflow(db, proj, "ci")
+        pr = ProjectPullRequest(
             project_id=proj.project_id, repo_name=REPO, pr_number=11,
             pr_url=f"https://github.com/{REPO}/pull/11", pr_state="open",
             branch_name="AM_GRD2_update", target_branch="main",
             workflow_names="ci, other",
-        ))
-        db.commit()
+        )
+        db.add(pr)
+        record_pr_carries(db, pr, wf)
 
         with pytest.raises(HTTPException) as excinfo:
             _rename(db, proj, "ci", "ci-v2")
@@ -228,13 +230,7 @@ def test_a_confirmed_delivery_counts_even_after_a_local_edit():
         # Zeroed hash: edited in ActionsManager since it was last pushed.
         shared = _workflow(db, rwx, "shared", reusable=True,
                            status="committed_locally", git_hash=LOCAL_ONLY_SHA)
-        repo = db.query(Repo).filter(Repo.repo_name == REPO).first()
-        db.add(WorkflowDriftState(
-            project_id=rwx.project_id, workflow_id=shared.workflow_id,
-            repo_id=repo.repo_id, branch="main", has_drift=False,
-            confirmed_present_at=__import__("datetime").datetime(2026, 9, 1, 12, 0, 0),
-        ))
-        db.commit()
+        record_delivered(db, shared, REPO, "main", at=__import__("datetime").datetime(2026, 9, 1, 12, 0, 0))
 
         caller = _project(db, code="GRD8", with_repo=False)
         db.add(LinkedReusableWorkflow(
@@ -278,16 +274,19 @@ def test_a_capitalisation_only_rename_keeps_the_stored_casing_without_failing_th
 
 
 def test_a_capitalisation_only_rename_does_not_strand_a_deletion():
-    """Keeping the old casing must not leave a renamed_from pointing at it."""
+    """Keeping the old casing leaves the delivered file the one the next campaign writes."""
     db = TestingSessionLocal()
     try:
         proj = _project(db, code="GRDB")
         wf = _workflow(db, proj, "Build")
+        path = ".github/workflows/AM_GRDB_Build.yml"
+        record_delivered(db, wf, REPO, "main", sha=DELIVERED_SHA, path=path)
 
         _rename(db, proj, "Build", "build")
         db.refresh(wf)
 
-        assert wf.renamed_from is None
+        assert deliveries.superseded_path(db, deliveries.WORKFLOW, wf.workflow_id, REPO, "main",
+                                          f".github/workflows/AM_GRDB_{wf.workflow_name}.yml") is None
     finally:
         db.close()
 

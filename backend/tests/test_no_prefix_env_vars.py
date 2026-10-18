@@ -10,6 +10,7 @@ Validates that when a project has use_prefix=False:
 import pytest
 import sys
 import os
+from types import SimpleNamespace
 from unittest.mock import patch, Mock, AsyncMock, MagicMock
 from sqlalchemy.orm import Session
 
@@ -24,6 +25,10 @@ from github_env_vars import (
     sync_env_var,
 )
 from models import Project, ProjectEnvVar
+
+# The routes take the caller from the session (#2241); called directly, they
+# are handed the account auth.current_account would have resolved.
+CALLER = SimpleNamespace(github_user="testuser")
 
 
 class TestFormatEnvVarKeyNoPrefix:
@@ -90,7 +95,7 @@ class TestUpdateEnvVarsNoPrefix:
         with patch('github_env_vars._check_free_account_limits', new_callable=AsyncMock, return_value={}):
             with patch('github_env_vars._update_or_create_variable', new_callable=AsyncMock, return_value=201) as mock_create:
                 with patch('github_env_vars._store_env_var_names_in_db') as mock_store:
-                    result = await update_env_vars(mock_request, mock_db)
+                    result = await update_env_vars(mock_request, mock_db, CALLER)
 
                     # Verify variable was created with raw key (no prefix)
                     mock_create.assert_called_once_with(
@@ -141,7 +146,7 @@ class TestUpdateEnvVarsNoPrefix:
 
         with patch('github_env_vars._check_free_account_limits', new_callable=AsyncMock, return_value={}):
             with patch('github_env_vars._update_or_create_variable', new_callable=AsyncMock, return_value=201) as mock_create:
-                result = await update_env_vars(mock_request, mock_db)
+                result = await update_env_vars(mock_request, mock_db, CALLER)
 
                 mock_create.assert_called_once_with(
                     "owner/repo1", "AM_MYPROJ_API_URL", "https://api.example.com",
@@ -187,7 +192,7 @@ class TestDeleteEnvVarsNoPrefix:
             mock_delete_response.status_code = 204
             mock_client.delete = AsyncMock(return_value=mock_delete_response)
 
-            result = await delete_env_vars(mock_request, mock_db)
+            result = await delete_env_vars(mock_request, mock_db, CALLER)
 
             # Verify delete URL uses raw key (no prefix)
             mock_client.delete.assert_called_once()
@@ -226,7 +231,7 @@ class TestDeleteEnvVarsNoPrefix:
             mock_delete_response.status_code = 204
             mock_client.delete = AsyncMock(return_value=mock_delete_response)
 
-            result = await delete_env_vars(mock_request, mock_db)
+            result = await delete_env_vars(mock_request, mock_db, CALLER)
 
             call_url = mock_client.delete.call_args[0][0]
             assert call_url.endswith("/actions/variables/AM_MYPROJ_API_URL")
@@ -260,7 +265,7 @@ class TestDeleteEnvVarsNoPrefix:
             mock_delete_response.status_code = 204
             mock_client.delete = AsyncMock(return_value=mock_delete_response)
 
-            result = await delete_env_vars(mock_request, mock_db)
+            result = await delete_env_vars(mock_request, mock_db, CALLER)
 
             # Verify DB commit was called (for removing the ProjectEnvVar record)
             mock_db.commit.assert_called()
@@ -301,7 +306,7 @@ class TestSyncEnvVarNoPrefix:
             mock_client.get = AsyncMock(return_value=mock_get_response)
 
             with patch('github_env_vars._sync_env_var_to_repo', new_callable=AsyncMock, return_value=201) as mock_sync:
-                result = await sync_env_var(mock_request, mock_db)
+                result = await sync_env_var(mock_request, mock_db, CALLER)
 
                 # Verify the GET check uses raw key (no prefix)
                 get_call_url = mock_client.get.call_args[0][0]
@@ -343,7 +348,7 @@ class TestSyncEnvVarNoPrefix:
             mock_client.get = AsyncMock(return_value=mock_get_response)
 
             with patch('github_env_vars._sync_env_var_to_repo', new_callable=AsyncMock, return_value=201) as mock_sync:
-                result = await sync_env_var(mock_request, mock_db)
+                result = await sync_env_var(mock_request, mock_db, CALLER)
 
                 get_call_url = mock_client.get.call_args[0][0]
                 assert "/actions/variables/AM_MYPROJ_API_URL" in get_call_url

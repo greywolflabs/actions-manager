@@ -59,7 +59,21 @@ describe('ProjectList', () => {
     const alphaRow = screen.getByTestId('project-row-Alpha');
     await user.click(within(alphaRow).getByRole('button', { name: /open project alpha/i }));
 
-    expect(mockNavigate).toHaveBeenCalledWith('/project/alice/Alpha');
+    expect(mockNavigate).toHaveBeenCalledWith('/project/alice/Alpha', { state: { projectId: 1 } });
+  });
+
+  test('opening a project hands its id to the page, which another owner may share the name with (#2240)', async () => {
+    renderProjectList({
+      projects: [
+        { id: 7, project_id: 7, project_name: 'Infra', project_code: 'INFA', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-06-01T00:00:00Z', pr_state: 'draft' },
+        { id: 9, project_id: 9, project_name: 'Infra', project_code: 'INFB', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-05-01T00:00:00Z', pr_state: 'draft' },
+      ],
+    });
+
+    const buttons = screen.getAllByRole('button', { name: /open project infra/i });
+    await user.click(buttons[1]);
+
+    expect(mockNavigate).toHaveBeenCalledWith('/project/alice/Infra', { state: { projectId: 9 } });
   });
 
   test('does not render a redundant Open button in the actions column', () => {
@@ -190,6 +204,35 @@ describe('ProjectList', () => {
 
       expect(within(screen.getByTestId('project-status-pill-synced')).getByText('1')).toBeInTheDocument();
       expect(within(screen.getByTestId('project-status-1')).getByText('Synced')).toBeInTheDocument();
+    });
+  });
+
+  describe('A project being deleted', () => {
+    const deleting = {
+      id: 1, project_name: 'Doomed', project_code: 'DMD', updated_at: '2024-01-01T00:00:00Z',
+      pr_state: 'deleting' as const,
+      // Drift a sweep found before the deletion began: nothing checks it now.
+      drift_status: 'drifted' as const, drift_count: 1,
+    };
+
+    test('shows a Deleting badge, ahead of any drift', () => {
+      renderProjectList({ projects: [deleting] });
+
+      expect(within(screen.getByTestId('project-status-1')).getByText('Deleting')).toBeInTheDocument();
+    });
+
+    test('is listed under Under Review, waiting on its removal pull requests', async () => {
+      renderProjectList({
+        projects: [
+          { ...deleting, drift_status: 'clean' as const, drift_count: 0 },
+          { id: 2, project_name: 'Drafty', project_code: 'D1', updated_at: '2024-01-01T00:00:00Z', pr_state: 'draft' },
+        ],
+      });
+
+      await user.click(screen.getByTestId('project-status-pill-review'));
+
+      expect(screen.getByTestId('project-row-Doomed')).toBeInTheDocument();
+      expect(screen.queryByTestId('project-row-Drafty')).not.toBeInTheDocument();
     });
   });
 
@@ -776,7 +819,7 @@ describe('ProjectList', () => {
 
       await user.click(screen.getByRole('button', { name: 'Open project Project03' }));
 
-      expect(mockNavigate).toHaveBeenCalledWith('/project/alice/Project03');
+      expect(mockNavigate).toHaveBeenCalledWith('/project/alice/Project03', expect.anything());
     });
 
     test('the three-dot menu still opens alongside the drag handle', async () => {

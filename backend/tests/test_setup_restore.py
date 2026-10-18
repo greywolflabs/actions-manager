@@ -244,6 +244,26 @@ class TestApplyRestore:
         assert db_session.query(Account).one().github_user == SEED_ACCOUNT_GITHUB_USER
         assert client.get("/api/setup/status").json() == {"uninitialized": True}
 
+    def test_a_failed_restore_tells_the_caller_the_kind_and_logs_the_cause(
+        self, db_session, tmp_path, monkeypatch, capsys
+    ):
+        """The caller is anonymous: the database's text stays in the server log (#2297)."""
+        from sqlalchemy.exc import OperationalError
+
+        _add_account(db_session, "alice", role="admin")
+        token = self._stage(db_session, tmp_path)
+
+        def fail(*_args, **_kwargs):
+            raise OperationalError("INSERT INTO accounts secret-marker-2297", {}, Exception("db.internal:5432"))
+
+        monkeypatch.setattr(backup_engine, "_apply_archive", fail)
+
+        response = client.post("/api/setup/restore/apply", data={"upload_token": token})
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Restore failed and was rolled back: unexpected error"
+        assert "secret-marker-2297" in capsys.readouterr().out
+
     def test_the_staged_archive_is_discarded_after_applying(self, db_session, tmp_path):
         _add_account(db_session, "alice", role="admin")
         token = self._stage(db_session, tmp_path)

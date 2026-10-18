@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from main import app  # noqa: E402
 from workflows import get_db as real_get_db, resolve_branch_config_for_repo  # noqa: E402
 from projects import get_db as projects_get_db  # noqa: E402
+from auth import create_auth_session  # noqa: E402
 from models import (  # noqa: E402
     Base, Account, Project, Repo, ProjectRepo,
 )
@@ -51,8 +52,18 @@ def override_get_db():
 client = TestClient(app)
 
 
+def _signed_in(github_user):
+    """Per-request headers for a real session as ``github_user`` (#2241)."""
+    db = TestingSessionLocal()
+    try:
+        token = create_auth_session(github_user, db)
+    finally:
+        db.close()
+    return {"X-GitHub-User": github_user, "Authorization": f"Bearer {token}"}
+
+
 @pytest.fixture(autouse=True)
-def db_state():
+def db_state(authenticate_client):
     prev_override = app.dependency_overrides.get(real_get_db)
     prev_proj_override = app.dependency_overrides.get(projects_get_db)
     app.dependency_overrides[real_get_db] = override_get_db
@@ -66,6 +77,7 @@ def db_state():
         db.commit()
         db.refresh(owner)
         db.refresh(other)
+        authenticate_client(client, "alice", TestingSessionLocal)
 
         project = Project(
             project_name="proj1",
@@ -331,12 +343,14 @@ def test_non_owner_cannot_read_or_modify(db_state):
     resp = client.get(
         f"/api/projects/{pid}/repo-branch-configs",
         params={"github_user": "mallory"},
+        headers=_signed_in("mallory"),
     )
     assert resp.status_code in (403, 404)
 
     resp = client.patch(
         f"/api/projects/{pid}/repos/{rid1}/branch-config",
         params={"github_user": "mallory"},
+        headers=_signed_in("mallory"),
         json={"branch_config_mode": "inherit"},
     )
     assert resp.status_code in (403, 404)
@@ -367,7 +381,7 @@ def test_project_viewer_cannot_modify_branch_config(db_state):
     resp = client.get(
         f"/api/projects/{pid}/repo-branch-configs",
         params={"github_user": "mallory"},
-        headers={"X-GitHub-User": "mallory"},
+        headers=_signed_in("mallory"),
     )
     assert resp.status_code == 200
 
@@ -375,7 +389,7 @@ def test_project_viewer_cannot_modify_branch_config(db_state):
     resp = client.patch(
         f"/api/projects/{pid}/repos/{rid1}/branch-config",
         params={"github_user": "mallory"},
-        headers={"X-GitHub-User": "mallory"},
+        headers=_signed_in("mallory"),
         json={"branch_config_mode": "override", "branch_option": "default"},
     )
     assert resp.status_code == 403
@@ -384,7 +398,7 @@ def test_project_viewer_cannot_modify_branch_config(db_state):
     resp = client.delete(
         f"/api/projects/{pid}/repos/{rid1}/branch-config",
         params={"github_user": "mallory"},
-        headers={"X-GitHub-User": "mallory"},
+        headers=_signed_in("mallory"),
     )
     assert resp.status_code == 403
 

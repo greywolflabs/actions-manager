@@ -31,6 +31,7 @@ from models import (  # noqa: E402
     RepoWorkflowOverride, ProjectPullRequest,
 )
 from auth import user_tokens  # noqa: E402
+from tests.delivery_records import record_delivered  # noqa: E402
 
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -91,6 +92,9 @@ def db_state(authenticate_client):
         db.add(wf); db.commit(); db.refresh(wf)
         db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=wf.workflow_id))
         db.commit()
+        # Synced to both: what those deliveries recorded.
+        for repo_name in ("whatsupdawg/test1", "whatsupdawg/test2"):
+            record_delivered(db, wf, repo_name, "main", sha="sha-old")
 
         user_tokens["alice"] = "test-token"
         authenticate_client(client, "alice", TestingSessionLocal)
@@ -157,6 +161,7 @@ def test_adopt_github_create_repo_override(_g, db_state):
             "github_user": "alice",
             "project_id": db_state["project_id"],
             "repo_id": db_state["repo1_id"],
+            "branch": "main",
             "workflow_id": db_state["workflow_id"],
             "resolution_mode": "create_repo_override",
         },
@@ -236,6 +241,7 @@ def test_adopt_github_local_only_updates_project_only(_g, db_state):
             "github_user": "alice",
             "project_id": db_state["project_id"],
             "repo_id": db_state["repo1_id"],
+            "branch": "main",
             "workflow_id": db_state["workflow_id"],
             "resolution_mode": "adopt_local_only",
         },
@@ -276,6 +282,7 @@ def test_adopt_project_and_sync_pr_mode(_g, mock_create, db_state):
             "github_user": "alice",
             "project_id": db_state["project_id"],
             "repo_id": db_state["repo1_id"],
+            "branch": "main",
             "workflow_id": db_state["workflow_id"],
             "resolution_mode": "adopt_project_and_sync",
             "delivery_mode": "pr",
@@ -322,6 +329,7 @@ def test_adopt_project_and_sync_pr_mode_runs_real_pipeline(_g, mock_regular, _mo
             "github_user": "alice",
             "project_id": db_state["project_id"],
             "repo_id": db_state["repo1_id"],
+            "branch": "main",
             "workflow_id": db_state["workflow_id"],
             "resolution_mode": "adopt_project_and_sync",
             "delivery_mode": "pr",
@@ -375,6 +383,7 @@ def test_project_sync_does_not_overwrite_overrides(_g, mock_create, db_state):
             "github_user": "alice",
             "project_id": db_state["project_id"],
             "repo_id": db_state["repo1_id"],
+            "branch": "main",
             "workflow_id": db_state["workflow_id"],
             "resolution_mode": "adopt_project_and_sync",
             "delivery_mode": "pr",
@@ -399,6 +408,7 @@ def test_adopt_github_invalid_mode(db_state):
             "github_user": "alice",
             "project_id": db_state["project_id"],
             "repo_id": db_state["repo1_id"],
+            "branch": "main",
             "workflow_id": db_state["workflow_id"],
             "resolution_mode": "bogus_mode",
         },
@@ -414,6 +424,7 @@ def test_adopt_github_unauthenticated(db_state):
             "github_user": "alice",
             "project_id": db_state["project_id"],
             "repo_id": db_state["repo1_id"],
+            "branch": "main",
             "workflow_id": db_state["workflow_id"],
             "resolution_mode": "create_repo_override",
         },

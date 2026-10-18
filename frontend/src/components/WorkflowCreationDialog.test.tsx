@@ -56,7 +56,6 @@ describe('WorkflowCreationDialog', () => {
       <WorkflowCreationDialog
         {...defaultProps}
         onAddCustomFile={onAddCustomFile}
-        codeownersRepos={['owner/repo']}
         onSelectCodeowners={onSelectCodeowners}
       />
     );
@@ -69,19 +68,25 @@ describe('WorkflowCreationDialog', () => {
     expect(onAddCustomFile).toHaveBeenCalledTimes(1);
   });
 
-  test('clicking CODEOWNERS closes dialog and selects the first codeowners repo', async () => {
+  test('clicking CODEOWNERS closes dialog and opens the project\'s CODEOWNERS file', async () => {
     const onSelectCodeowners = vi.fn();
     render(
       <WorkflowCreationDialog
         {...defaultProps}
-        codeownersRepos={['owner/repo-a', 'owner/repo-b']}
+        selectedRepos={['owner/repo-a', 'owner/repo-b']}
         onSelectCodeowners={onSelectCodeowners}
       />
     );
 
     await user.click(screen.getByText('CODEOWNERS').closest('button') as HTMLElement);
     expect(defaultProps.setShowWorkflowCreationDialog).toHaveBeenCalledWith(false);
-    expect(onSelectCodeowners).toHaveBeenCalledWith('owner/repo-a');
+    expect(onSelectCodeowners).toHaveBeenCalledWith();
+  });
+
+  test('offers no CODEOWNERS card before the project has a repository', () => {
+    render(<WorkflowCreationDialog {...defaultProps} selectedRepos={[]} onSelectCodeowners={vi.fn()} />);
+
+    expect(screen.queryByText('CODEOWNERS')).not.toBeInTheDocument();
   });
 
   test('should not render custom file or codeowners options when not provided', () => {

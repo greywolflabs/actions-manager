@@ -864,8 +864,7 @@ async def test_pr_lifecycle():
 
 ## Next Steps
 
-- **User Guide:** See [WORKFLOW_DELIVERY_MODES.md](../guides/WORKFLOW_DELIVERY_MODES.md)
-- **Migration Guide:** See [MIGRATION_DIRECT_TO_PR.md](../guides/MIGRATION_DIRECT_TO_PR.md)
+- **User Guide:** See [PR Campaigns](https://actionsmanager.io/features/pr-campaigns.html)
 - **API Reference:** See [ARCHITECTURE.md](../ARCHITECTURE.md)
 
 ---

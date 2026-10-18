@@ -13,8 +13,9 @@ This test suite provides comprehensive coverage for:
 import pytest
 import sys
 import os
+from types import SimpleNamespace
 from unittest.mock import patch, Mock, AsyncMock, MagicMock
-from fastapi import Request
+from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
 
 # Add the backend directory to the Python path
@@ -29,12 +30,17 @@ from github_env_vars import (
     _format_env_var_key,
     _check_variable_exists_in_repos,
     _validate_sync_environment_request,
-    _check_free_account_environment_limits,
     _find_existing_environments,
     _create_missing_environments,
     _get_truly_new_variables,
-    _update_or_create_variable
+    _update_or_create_variable,
+    _repo_url,
+    _require_valid_key,
 )
+
+# The routes take the caller from the session (#2241); called directly, they
+# are handed the account auth.current_account would have resolved.
+CALLER = SimpleNamespace(github_user="testuser", user_id=1)
 
 
 class TestEnvVarsCRUD:
@@ -79,7 +85,7 @@ class TestEnvVarsCRUD:
             mock_client.return_value.__aenter__.return_value.post = mock_post
             
             from github_env_vars import update_env_vars
-            result = await update_env_vars(mock_request, mock_db)
+            result = await update_env_vars(mock_request, mock_db, CALLER)
             
             assert "message" in result
             assert result["message"] == "✅ GitHub Repository Variables updated!"
@@ -87,13 +93,14 @@ class TestEnvVarsCRUD:
     
     @pytest.mark.asyncio
     @patch('github_env_vars.user_tokens', {'testuser': 'fake_token'})
-    async def test_get_env_vars_success(self):
+    @patch('github_env_vars._find_project_by_name')
+    async def test_get_env_vars_success(self, mock_find):
         """Test successful retrieval of environment variables"""
         # Mock database
         mock_db = MagicMock()
         mock_project = Mock()
         mock_project.project_code = "TEST"
-        mock_db.query.return_value.filter.return_value.first.return_value = mock_project
+        mock_find.return_value = mock_project
         
         with patch('github_env_vars.httpx.AsyncClient') as mock_client:
             # Mock list variables response (first page)
@@ -126,7 +133,7 @@ class TestEnvVarsCRUD:
             mock_client.return_value.__aenter__.return_value.get = mock_get
             
             from github_env_vars import get_env_vars
-            result = await get_env_vars("testuser", "test/repo1", "TestProject", mock_db)
+            result = await get_env_vars("test/repo1", "TestProject", mock_db, CALLER)
             
             assert "env_vars" in result
             assert len(result["env_vars"]) == 2  # Only AM_TEST_* variables
@@ -158,7 +165,7 @@ class TestEnvVarsCRUD:
             mock_client.return_value.__aenter__.return_value.delete = mock_delete
             
             from github_env_vars import delete_env_vars
-            result = await delete_env_vars(mock_request, mock_db)
+            result = await delete_env_vars(mock_request, mock_db, CALLER)
             
             assert "message" in result
             assert "deleted" in result["message"]
@@ -199,15 +206,14 @@ class TestVariableValidation:
         """Test request data validation with complete data"""
         data = {
             "user": "testuser",
-            "repo_names": ["repo1", "repo2"],
+            "repo_names": ["owner/repo1", "owner/repo2"],
             "env": [{"key": "VAR1", "value": "value1"}],
             "project_name": "  TEST_PROJECT  "
         }
         
-        user, repo_names, env_vars, project_name = _validate_request_data(data)
+        repo_names, env_vars, project_name = _validate_request_data(data)
         
-        assert user == "testuser"
-        assert repo_names == ["repo1", "repo2"]
+        assert repo_names == ["owner/repo1", "owner/repo2"]
         assert len(env_vars) == 1
         assert project_name == "TEST_PROJECT"
     
@@ -215,12 +221,56 @@ class TestVariableValidation:
         """Test request data validation with missing env"""
         data = {
             "user": "testuser",
-            "repo_names": ["repo1"],
+            "repo_names": ["owner/repo1"],
             "project_name": "TEST"
         }
         
-        user, repo_names, env_vars, project_name = _validate_request_data(data)
+        repo_names, env_vars, project_name = _validate_request_data(data)
         assert env_vars == []
+
+    @pytest.mark.parametrize("repo_names", [None, "owner/repo", [123], ["no-slash"]])
+    def test_validate_request_data_refuses_malformed_repo_names(self, repo_names):
+        """Malformed names reached the loops: None and a number were 500s, and a
+        string was walked letter by letter."""
+        with pytest.raises(HTTPException) as refused:
+            _validate_request_data({"repo_names": repo_names, "project_name": "P"})
+        assert refused.value.status_code == 400
+
+    def test_valid_key_accepts_ascii_letters_digits_and_underscores(self):
+        assert _require_valid_key(" Api_Key_9 ") == "Api_Key_9"
+
+    @pytest.mark.parametrize("key", ["ÄPI_KEY", "KEY_٣", "KEY-1", "KEY.1", "", None])
+    def test_valid_key_refuses_anything_else(self, key):
+        """GitHub variable names are ASCII. A bare \\w would also let Unicode
+        letters and digits through, which GitHub then refuses."""
+        with pytest.raises(HTTPException) as refused:
+            _require_valid_key(key)
+        assert refused.value.status_code == 400
+
+
+class TestGitHubUrls:
+    """Every GitHub URL the module calls is built by _repo_url."""
+
+    def test_each_part_stays_in_its_segment(self):
+        """'?' and '#' ended the path, so the rest of it never reached GitHub."""
+        assert _repo_url("o/r", "environments", "qa?x#y") == "https://api.github.com/repos/o/r/environments/qa%3Fx%23y"
+        assert _repo_url("o/r", "environments", "team/prod") == "https://api.github.com/repos/o/r/environments/team%2Fprod"
+
+    @pytest.mark.parametrize("repo_name, segments", [
+        ("o/r", ("environments", "..")),
+        ("o/r", ("environments", "../../other")),
+        ("o/r", ("environments", "prod/")),
+        ("o/..", ("environments",)),
+        ("a/b/../../../user", ("environments",)),
+        ("o", ("environments",)),
+        ("o/r", ("actions", "variables", "")),
+    ])
+    def test_refuses_a_part_that_would_leave_its_segment(self, repo_name, segments):
+        """httpx resolves '..': DELETE .../environments/.. was DELETE /repos/o/r,
+        which deletes the repository."""
+        with pytest.raises(HTTPException) as refused:
+            _repo_url(repo_name, *segments)
+        assert refused.value.status_code == 400
 
 
 class TestBatchOperations:
@@ -266,7 +316,7 @@ class TestBatchOperations:
             mock_client.return_value.__aenter__.return_value.post = mock_post
             
             from github_env_vars import update_env_vars
-            result = await update_env_vars(mock_request, mock_db)
+            result = await update_env_vars(mock_request, mock_db, CALLER)
             
             assert "results" in result
             # Should have 4 results (2 vars × 2 repos)
@@ -318,20 +368,21 @@ class TestErrorHandling:
         mock_db = MagicMock()
         
         from github_env_vars import update_env_vars
-        result = await update_env_vars(mock_request, mock_db)
+        result = await update_env_vars(mock_request, mock_db, SimpleNamespace(github_user="nonexistent_user"))
         
         assert "error" in result
         assert result["status"] == 401
     
     @pytest.mark.asyncio
     @patch('github_env_vars.user_tokens', {'testuser': 'fake_token'})
-    async def test_get_env_vars_project_not_found(self):
+    @patch('github_env_vars._find_project_by_name')
+    async def test_get_env_vars_project_not_found(self, mock_find):
         """Test get env vars fails with invalid project"""
         mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_find.return_value = None
         
         from github_env_vars import get_env_vars
-        result = await get_env_vars("testuser", "test/repo1", "NonexistentProject", mock_db)
+        result = await get_env_vars("test/repo1", "NonexistentProject", mock_db, CALLER)
         
         assert "error" in result
         assert result["status"] == 404
@@ -353,7 +404,7 @@ class TestErrorHandling:
             mock_client.return_value.__aenter__.return_value.get = mock_get
             
             from github_env_vars import get_env_vars
-            result = await get_env_vars("testuser", "test/repo1", "TestProject", mock_db)
+            result = await get_env_vars("test/repo1", "TestProject", mock_db, CALLER)
             
             assert "error" in result
 
@@ -399,7 +450,7 @@ class TestSyncOperations:
             mock_client.return_value.__aenter__.return_value.post = mock_post
             
             from github_env_vars import sync_env_var
-            result = await sync_env_var(mock_request, mock_db)
+            result = await sync_env_var(mock_request, mock_db, CALLER)
             
             assert "message" in result
             assert "synced" in result["message"]
@@ -438,7 +489,7 @@ class TestEnvironmentManagement:
             mock_client.return_value.__aenter__.return_value.put = mock_put
             
             from github_env_vars import create_environment
-            result = await create_environment(mock_request, mock_db)
+            result = await create_environment(mock_request, mock_db, CALLER)
             
             assert "message" in result
             assert "created successfully" in result["message"]
@@ -463,10 +514,22 @@ class TestEnvironmentManagement:
             mock_client.return_value.__aenter__.return_value.get = mock_get
             
             from github_env_vars import get_environments
-            result = await get_environments("testuser", "test/repo1", mock_db)
+            result = await get_environments("test/repo1", mock_db, CALLER)
             
             assert "environments" in result
             assert len(result["environments"]) == 2
+
+    @pytest.mark.asyncio
+    @patch('github_env_vars.user_tokens', {'testuser': 'fake_token'})
+    async def test_get_environments_passes_githubs_status_through(self):
+        """A missing repository and a token without access stay distinguishable."""
+        with patch('github_env_vars.httpx.AsyncClient') as mock_client:
+            mock_client.return_value.__aenter__.return_value.get = AsyncMock(return_value=Mock(status_code=404))
+
+            from github_env_vars import get_environments
+            result = await get_environments("test/gone", MagicMock(), CALLER)
+
+        assert result["status"] == 404
     
     @pytest.mark.asyncio
     @patch('github_env_vars.user_tokens', {'testuser': 'fake_token'})
@@ -490,7 +553,7 @@ class TestEnvironmentManagement:
             mock_client.return_value.__aenter__.return_value.delete = mock_delete
             
             from github_env_vars import delete_environment
-            result = await delete_environment(mock_request, mock_db)
+            result = await delete_environment(mock_request, mock_db, CALLER)
             
             assert "message" in result
             assert "deleted" in result["message"]
@@ -538,7 +601,7 @@ class TestEnvironmentManagement:
             mock_client.return_value.__aenter__.return_value.put = mock_put
             
             from github_env_vars import sync_environment
-            result = await sync_environment(mock_request, mock_db)
+            result = await sync_environment(mock_request, mock_db, CALLER)
             
             assert "message" in result
             assert "synced" in result["message"]
@@ -599,6 +662,72 @@ class TestCountingFunctions:
         
         count = await count_project_environments("testuser", ["test/repo"])
         assert count == 2
+
+    @pytest.mark.asyncio
+    @patch('github_env_vars.user_tokens', {'testuser': 'fake_token'})
+    @patch('httpx.AsyncClient')
+    async def test_counts_read_every_page(self, mock_client):
+        """Counts page until total_count. The variables listing caps a page at 30
+        whatever per_page asks, so a short page is not the last one: 45
+        variables were counted as 30, and 140 environments as GitHub's default
+        page of 30."""
+        def page(key, prefix, start, size, total):
+            response = Mock(status_code=200)
+            response.json.return_value = {
+                "total_count": total,
+                key: [{"name": f"{prefix}{i}"} for i in range(start, start + size)],
+            }
+            return response
+
+        client = mock_client.return_value.__aenter__.return_value
+        client.get = AsyncMock(side_effect=[
+            page("variables", "AM_TEST_V", 0, 30, 45), page("variables", "AM_TEST_V", 30, 15, 45),
+        ])
+        assert await count_project_env_vars("testuser", "TEST", ["test/repo"]) == 45
+        assert client.get.await_args.args[0].endswith("/actions/variables?per_page=30&page=2")
+
+        client.get = AsyncMock(side_effect=[
+            page("environments", "env", 0, 100, 140), page("environments", "env", 100, 40, 140),
+        ])
+        assert await count_project_environments("testuser", ["test/repo"]) == 140
+        assert client.get.await_args.args[0].endswith("/environments?per_page=100&page=2")
+
+    @pytest.mark.asyncio
+    async def test_sync_asks_for_the_environment_by_name(self):
+        """One page of the listing missed an environment past it, which was then
+        PUT again with an empty configuration, clearing its reviewers and
+        branch policy. Asking by name needs no paging."""
+        client = AsyncMock()
+        client.get.side_effect = [Mock(status_code=200), Mock(status_code=404)]
+
+        assert await _find_existing_environments(["o/a", "o/b"], "qa?x", client, {}) == {"o/a": True}
+        assert client.get.await_args_list[0].args[0].endswith("/repos/o/a/environments/qa%3Fx")
+
+    @pytest.mark.asyncio
+    async def test_sync_leaves_a_repository_github_cannot_answer_for(self):
+        """A failed answer is not "missing": creating it would overwrite one that
+        is there. That repository is left alone, and the rest still sync."""
+        client = AsyncMock()
+        client.get.side_effect = [Mock(status_code=200), Mock(status_code=502), Mock(status_code=404)]
+        client.put.return_value = Mock(status_code=201)
+        repos = ["o/has", "o/unreachable", "o/missing"]
+
+        existing = await _find_existing_environments(repos, "production", client, {})
+        results, created = await _create_missing_environments(repos, "production", existing, client, {})
+
+        assert results == {"o/has": "already exists", "o/unreachable": "could not check (502)", "o/missing": "created"}
+        assert created == 1
+        client.put.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sync_encodes_the_environment_name(self):
+        """'qa?x' was cut at the '?', so the PUT created 'qa'."""
+        client = AsyncMock()
+        client.put.return_value = Mock(status_code=201)
+
+        await _create_missing_environments(["o/r"], "qa?x", {}, client, {})
+
+        assert client.put.await_args.args[0].endswith("/environments/qa%3Fx")
 
 
 if __name__ == "__main__":

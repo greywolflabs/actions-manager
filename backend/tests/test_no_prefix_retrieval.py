@@ -13,7 +13,7 @@ from unittest.mock import patch, AsyncMock, MagicMock
 # Add the backend directory to the Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from models import Base, Account, Project, ProjectSecret, ProjectEnvVar
+from models import Base, Account, Project, ProjectEnvVar, ProjectRepo, ProjectSecret, Repo
 from main import app
 from projects import get_db
 import github_secrets
@@ -73,6 +73,11 @@ class TestNoPrefixRetrieval:
             # Store the project_id for tests
             self.project_id = no_prefix_project.project_id
 
+            repo = Repo(repo_name="testuser/test-repo")
+            db.add(repo)
+            db.flush()
+            db.add(ProjectRepo(project_id=self.project_id, repo_id=repo.repo_id))
+
             # Add test secrets to database
             test_secrets = [
                 ProjectSecret(project_id=self.project_id, secret_name="DATABASE_PASSWORD"),
@@ -111,7 +116,7 @@ class TestNoPrefixRetrieval:
 
     @patch('github_secrets.user_tokens', {'testuser': 'mock_token'})
     @patch('github_secrets.httpx.AsyncClient')
-    def test_get_secrets_no_prefix_mode(self, mock_async_client):
+    def test_get_secrets_no_prefix_mode(self, mock_async_client, authenticate_client):
         """Test that get_secrets retrieves secrets from database for no_prefix projects."""
         # Mock GitHub API response with all secrets (including ones not in DB)
         mock_response = MagicMock()
@@ -131,7 +136,8 @@ class TestNoPrefixRetrieval:
         mock_client_instance.get.return_value = mock_response
         mock_async_client.return_value.__aenter__.return_value = mock_client_instance
 
-        # Call the endpoint
+        # Call the endpoint, signed in: the caller comes from the session (#2241)
+        authenticate_client(self.client, "testuser", TestingSessionLocal)
         response = self.client.get(
             "/api/get-secrets",
             params={
@@ -158,66 +164,25 @@ class TestNoPrefixRetrieval:
 
     @patch('github_env_vars.user_tokens', {'testuser': 'mock_token'})
     @patch('github_env_vars.httpx.AsyncClient')
-    def test_get_env_vars_no_prefix_mode(self, mock_async_client):
+    def test_get_env_vars_no_prefix_mode(self, mock_async_client, authenticate_client):
         """Test that get_env_vars retrieves env vars from database for no_prefix projects."""
-        # Track pagination calls to prevent infinite loop
-        page_calls = 0
-
-        # Mock individual variable value responses
-        async def async_mock_get_response(*args, **kwargs):
-            nonlocal page_calls
-            url = args[0] if args else kwargs.get('url', '')
-
-            if 'variables?' in url:
-                # Track pagination - return empty on page 2 to exit the loop
-                page_calls += 1
-                if page_calls == 1:
-                    # First page returns the variables
-                    mock_response = MagicMock()
-                    mock_response.status_code = 200
-                    mock_response.json.return_value = {
-                        "variables": [
-                            {"name": "DEBUG_MODE"},
-                            {"name": "LOG_LEVEL"},
-                            {"name": "ENVIRONMENT"},
-                            {"name": "OTHER_VAR"},  # Not in database
-                            {"name": "AM_NPTP_PREFIXED_VAR"}  # Has prefix but shouldn't be returned
-                        ]
-                    }
-                    return mock_response
-                else:
-                    # Subsequent pages return empty to exit the pagination loop
-                    mock_response = MagicMock()
-                    mock_response.status_code = 200
-                    mock_response.json.return_value = {"variables": []}
-                    return mock_response
-            elif 'variables/DEBUG_MODE' in url:
-                value_response = MagicMock()
-                value_response.status_code = 200
-                value_response.json.return_value = {"value": "true"}
-                return value_response
-            elif 'variables/LOG_LEVEL' in url:
-                value_response = MagicMock()
-                value_response.status_code = 200
-                value_response.json.return_value = {"value": "info"}
-                return value_response
-            elif 'variables/ENVIRONMENT' in url:
-                value_response = MagicMock()
-                value_response.status_code = 200
-                value_response.json.return_value = {"value": "production"}
-                return value_response
-            else:
-                # For any other variable
-                value_response = MagicMock()
-                value_response.status_code = 404
-                return value_response
-
-        # Set up async client mock
+        # GitHub's listing carries each variable's value, so one call is enough.
+        listing = MagicMock(status_code=200)
+        listing.json.return_value = {
+            "variables": [
+                {"name": "DEBUG_MODE", "value": "true"},
+                {"name": "LOG_LEVEL", "value": "info"},
+                {"name": "ENVIRONMENT", "value": "production"},
+                {"name": "OTHER_VAR", "value": "x"},  # Not in database
+                {"name": "AM_NPTP_PREFIXED_VAR", "value": "y"},  # Has prefix but shouldn't be returned
+            ]
+        }
         mock_client_instance = AsyncMock()
-        mock_client_instance.get.side_effect = async_mock_get_response
+        mock_client_instance.get.return_value = listing
         mock_async_client.return_value.__aenter__.return_value = mock_client_instance
 
-        # Call the endpoint
+        # Call the endpoint, signed in: the caller comes from the session (#2241)
+        authenticate_client(self.client, "testuser", TestingSessionLocal)
         response = self.client.get(
             "/api/get-env-vars",
             params={
@@ -247,10 +212,11 @@ class TestNoPrefixRetrieval:
         assert env_var_values["DEBUG_MODE"] == "true"
         assert env_var_values["LOG_LEVEL"] == "info"
         assert env_var_values["ENVIRONMENT"] == "production"
+        mock_client_instance.get.assert_awaited_once()
 
     @patch('github_secrets.user_tokens', {'testuser': 'mock_token'})
     @patch('github_secrets.httpx.AsyncClient')
-    def test_get_secrets_prefix_mode_still_works(self, mock_async_client):
+    def test_get_secrets_prefix_mode_still_works(self, mock_async_client, authenticate_client):
         """Verify that prefix mode still works correctly (regression test)."""
         # Create a prefix-mode project
         db = TestingSessionLocal()
@@ -284,7 +250,8 @@ class TestNoPrefixRetrieval:
         mock_client_instance.get.return_value = mock_response
         mock_async_client.return_value.__aenter__.return_value = mock_client_instance
 
-        # Call the endpoint
+        # Call the endpoint, signed in: the caller comes from the session (#2241)
+        authenticate_client(self.client, "testuser", TestingSessionLocal)
         response = self.client.get(
             "/api/get-secrets",
             params={

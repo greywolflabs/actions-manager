@@ -22,6 +22,8 @@ interface PRCampaignsPanelProps {
   user: string;
   projectName: string;
   onCampaignStateRefresh?: (refreshFromGitHub?: boolean) => Promise<void>;
+  /** A merge finished the project's deletion: its last removal pull request merged. */
+  onProjectDeleted?: () => void;
 }
 
 type CampaignTab = "active" | "completed" | "activity";
@@ -187,7 +189,7 @@ const PRRow: React.FC<PRRowProps> = ({ pr, includeActions, processingKey, setPen
   );
 };
 
-const PRHistoryPanel: React.FC<PRCampaignsPanelProps> = ({ user, projectName, onCampaignStateRefresh }) => {
+const PRHistoryPanel: React.FC<PRCampaignsPanelProps> = ({ user, projectName, onCampaignStateRefresh, onProjectDeleted }) => {
   const [data, setData] = useState<PRCampaignsResponse | null>(null);
   const [activeTab, setActiveTab] = useState<CampaignTab>("active");
   const [loading, setLoading] = useState<boolean>(true);
@@ -358,34 +360,48 @@ const PRHistoryPanel: React.FC<PRCampaignsPanelProps> = ({ user, projectName, on
   const mergeableOpenPRsForCampaign = (campaign: PRCampaign) =>
     openPRsForCampaign(campaign).filter((pr) => pr.can_merge !== false);
 
+  // Merges or closes *pr*; true when the merge was the last removal pull
+  // request of a project being deleted, which is gone with it.
+  const resolvePR = async (pr: PRCampaignPRItem, merge: boolean): Promise<boolean> => {
+    if (!merge) {
+      await closePullRequest(user, projectName, pr.repo_name, pr.pr_number);
+      return false;
+    }
+    const result = await mergePullRequest(user, projectName, pr.repo_name, pr.pr_number);
+    return Boolean(result?.project_deleted);
+  };
+
   const runPRAction = async (action: Exclude<PendingAction, null>) => {
     const prs =
       action.type === "mergeCampaign" || action.type === "closeCampaign"
         ? openPRsForCampaign(action.campaign)
         : [action.pr];
-    const actionablePRs =
-      action.type === "merge" || action.type === "mergeCampaign"
-        ? prs.filter((pr) => pr.can_merge !== false)
-        : prs.filter((pr) => pr.can_close !== false);
+    const merging = action.type === "merge" || action.type === "mergeCampaign";
+    const actionablePRs = merging
+      ? prs.filter((pr) => pr.can_merge !== false)
+      : prs.filter((pr) => pr.can_close !== false);
     if (actionablePRs.length === 0) return;
 
     setError(null);
     setSuccess(null);
     try {
+      let projectDeleted = false;
       for (const pr of actionablePRs) {
         const key = `${pr.repo_name}#${pr.pr_number}`;
         setProcessingKey(key);
-        if (action.type === "merge" || action.type === "mergeCampaign") {
-          await mergePullRequest(user, projectName, pr.repo_name, pr.pr_number);
-        } else {
-          await closePullRequest(user, projectName, pr.repo_name, pr.pr_number);
-        }
+        projectDeleted = await resolvePR(pr, merging);
+        if (projectDeleted) break;
       }
       // Every route to resolving a PR — merge, close, and the whole-campaign
       // variants — comes through this loop, so this is the one honest place to
       // report the step done.
       tour.completed("resolve-pr");
-      const verb = action.type === "merge" || action.type === "mergeCampaign" ? "merged" : "closed";
+      if (projectDeleted && onProjectDeleted) {
+        // Nothing is left to refresh: leave the project instead.
+        onProjectDeleted();
+        return;
+      }
+      const verb = merging ? "merged" : "closed";
       try {
         await refreshProjectCampaignState(false);
         const message = `${actionablePRs.length} pull request${actionablePRs.length === 1 ? "" : "s"} ${verb}.`;

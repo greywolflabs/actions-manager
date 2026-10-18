@@ -32,9 +32,9 @@ from main import app  # noqa: E402
 from workflows import get_db as real_get_db  # noqa: E402
 from models import (  # noqa: E402
     Base, Account, Project, Repo, ProjectRepo, Workflow, ProjectWorkflow,
-    WorkflowDriftState,
 )
 from auth import user_tokens  # noqa: E402
+from tests.delivery_records import record_delivered, record_drift  # noqa: E402
 
 engine = create_engine(
     "sqlite:///:memory:",
@@ -78,7 +78,7 @@ def state(authenticate_client):
         user_tokens["alice"] = "tok"
         authenticate_client(client, "alice", TestingSessionLocal)
         yield {"project_id": project.project_id, "workflow_id": wf.workflow_id,
-               "repo_id": repo.repo_id, "db": db, "project": project}
+               "repo_id": repo.repo_id, "db": db, "project": project, "workflow": wf}
     finally:
         db.close()
         Base.metadata.drop_all(bind=engine)
@@ -90,15 +90,10 @@ def state(authenticate_client):
 
 
 def _drifted(state, *, branch="main", github_sha="sha-remote", deleted=False, checked_at=None):
-    db = state["db"]
-    db.add(WorkflowDriftState(
-        project_id=state["project_id"], workflow_id=state["workflow_id"],
-        repo_id=state["repo_id"], branch=branch, has_drift=True,
-        content_hash="h", drift_cycle_count=1, github_sha=github_sha,
-        deleted_in_github=deleted,
-        last_checked_at=checked_at or datetime.now(timezone.utc),
-    ))
-    db.commit()
+    """A delivery to acme/api@*branch*, and the check that found it drifted."""
+    record_delivered(state["db"], state["workflow"], "acme/api", branch, sha="sha-delivered")
+    record_drift(state["db"], state["workflow"], "acme/api", branch, github_sha=github_sha, deleted=deleted,
+                 at=checked_at)
 
 
 def _get(project_id, refresh=None):
@@ -143,12 +138,7 @@ class TestOpeningAProjectIsFree:
         assert {r["branch"] for r in body["drifted_workflows"]} == {"release/2.0", "release/2.1"}
 
     def test_resolved_rows_are_not_listed(self, state):
-        db = state["db"]
-        db.add(WorkflowDriftState(
-            project_id=state["project_id"], workflow_id=state["workflow_id"],
-            repo_id=state["repo_id"], branch="main", has_drift=False,
-        ))
-        db.commit()
+        record_drift(state["db"], state["workflow"], "acme/api", "main", has_drift=False)
 
         body = _get(state["project_id"]).json()
 
@@ -187,13 +177,14 @@ class TestCachedRowsDoNotFakeGithubContent:
         assert row["github_yaml"] is None
 
     def test_the_managed_side_is_present(self, state):
-        """It is local, so there is no reason to withhold it."""
+        """It is local, so there is no reason to withhold it: the managed YAML,
+        and the blob the record says ActionsManager delivered there."""
         _drifted(state)
 
         row = _get(state["project_id"]).json()["drifted_workflows"][0]
 
         assert row["actionsmanager_yaml"] == "name: ci\non: push\n"
-        assert row["actionsmanager_sha"] == "sha-local"
+        assert row["actionsmanager_sha"] == "sha-delivered"
 
     def test_github_sha_survives_for_grouping(self, state):
         _drifted(state, github_sha="sha-remote-1")

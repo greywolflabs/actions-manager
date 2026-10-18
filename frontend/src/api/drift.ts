@@ -47,11 +47,37 @@ export interface WorkflowDriftDetail {
   deleted_in_github?: boolean;
 }
 
+/** The project's CODEOWNERS on one (repo, branch) where it drifted. */
+export interface CodeownersDriftDetail {
+  file_path: string;
+  repo: string;
+  repo_id?: number | null;
+  branch: string;
+  has_drift: boolean;
+  actionsmanager_sha: string | null;
+  github_sha: string | null;
+  last_checked: string;
+  message: string;
+  check_failed?: boolean;
+  /** The file is absent from GitHub, so there is no GitHub version to load. */
+  deleted_in_github?: boolean;
+}
+
+/** One of the project's custom files on one (repo, branch) where it drifted, checked as CODEOWNERS is. */
+export interface CustomFileDriftDetail extends CodeownersDriftDetail {
+  custom_file_id: number;
+}
+
 export interface ProjectDriftSummary {
   project_id: number;
   project_name: string;
+  /** Drifted workflows, CODEOWNERS and custom files together. */
   drift_count: number;
   drifted_workflows: WorkflowDriftDetail[];
+  /** The project's CODEOWNERS on each (repo, branch) where it drifted. */
+  drifted_codeowners?: CodeownersDriftDetail[];
+  /** Each of the project's custom files on each (repo, branch) where it drifted. */
+  drifted_custom_files?: CustomFileDriftDetail[];
   /**
    * When the reported state was established — null when no check has ever run.
    * Not the time of the request: an empty list from a check that never
@@ -116,9 +142,9 @@ export interface AdoptGithubVersionRequest {
   workflow_id: number;
   repo_id?: number;
   repo_name?: string;
-  // The branch whose drift is being resolved — without it the backend adopts
-  // from the repo's default branch, which may not be the file the user saw.
-  branch?: string;
+  // The branch whose drift is being resolved. Required: the backend returns 400
+  // rather than adopting the repo's default branch, a file the user didn't see.
+  branch: string;
   resolution_mode: AdoptResolutionMode;
   delivery_mode?: DriftDeliveryMode;
   target_repo_ids?: number[];

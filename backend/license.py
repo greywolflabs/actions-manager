@@ -137,8 +137,8 @@ def get_installation_tier() -> str:
     - Returns tier from valid license
     - Falls back to "free" tier if license is invalid, expired, or absent
 
-    Only the self-hosted rules read it; the cloud tier comes from the
-    Marketplace plan instead (cloud/entitlements.py).
+    Only the self-hosted rules read it; the cloud build sets the tier its
+    own way.
 
     Returns:
         str: The installation tier ("free", "professional", or "enterprise")

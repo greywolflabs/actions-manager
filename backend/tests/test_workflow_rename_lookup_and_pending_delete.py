@@ -263,8 +263,9 @@ def test_drift_skips_pending_delete_workflows(project):
         db.close()
 
 
-def test_project_load_omits_pending_delete_workflows(project):
+def test_project_load_omits_pending_delete_workflows(project, authenticate_client):
     """A workflow the user already asked to delete should leave the list."""
+    authenticate_client(client, OWNER, TestingSessionLocal)
     db = TestingSessionLocal()
     try:
         _workflow(db, project, "live")
@@ -327,7 +328,8 @@ def test_delivery_still_receives_pending_delete_workflows(project):
 # tombstone's YAML while leaving the flag set.
 
 
-def test_save_workflows_refuses_a_name_a_tombstone_still_owns(project):
+def test_save_workflows_refuses_a_name_a_tombstone_still_owns(project, authenticate_client):
+    authenticate_client(client, OWNER, TestingSessionLocal)
     db = TestingSessionLocal()
     try:
         _workflow(db, project, "ci", pending_delete=True)
@@ -363,8 +365,9 @@ def test_save_workflows_refuses_a_name_a_tombstone_still_owns(project):
         db.close()
 
 
-def test_project_update_also_refuses_a_tombstone_name(project):
+def test_project_update_also_refuses_a_tombstone_name(project, authenticate_client):
     """The projects.py copy of create_or_update_workflow, which was missed."""
+    authenticate_client(client, OWNER, TestingSessionLocal)
     db = TestingSessionLocal()
     try:
         _workflow(db, project, "ci", pending_delete=True)
@@ -470,7 +473,7 @@ def test_renaming_onto_a_tombstone_name_is_refused(project):
         db.close()
 
 
-def test_the_project_save_endpoint_renames_instead_of_duplicating(project):
+def test_the_project_save_endpoint_renames_instead_of_duplicating(project, authenticate_client):
     """Saving a project used to turn a rename into a second workflow.
 
     Three layers each dropped it: handleSaveProject sent only {name, content},
@@ -478,6 +481,7 @@ def test_the_project_save_endpoint_renames_instead_of_duplicating(project):
     original_name, and projects.py kept its own create_or_update_workflow with
     no rename branch. The old workflow stayed and a new one appeared beside it.
     """
+    authenticate_client(client, OWNER, TestingSessionLocal)
     db = TestingSessionLocal()
     try:
         _workflow(db, project, "ci", content="name: old\non: push")

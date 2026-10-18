@@ -1,8 +1,9 @@
 import { AxiosResponse } from "axios";
 import apiClient from "./apiClient";
+import { projectHintHeaders } from "./projectHint";
 import config from "../config";
 import { Repository } from "./handlers";
-import { toast } from "../utils/toast";
+import { apiErrorMessage } from "../utils/apiErrorMessage";
 
 const BACKEND_URL = config.BACKEND_URL;
 
@@ -74,7 +75,7 @@ export const updateEnvVars = async (
     return response.data;
   } catch (error) {
     console.error("❌ Error updating env vars:", error);
-    return { error: (error as Error).message };
+    return { error: apiErrorMessage(error, (error as Error).message) };
   }
 };
 
@@ -87,7 +88,7 @@ export const getEnvVars = async (
   try {
     const response = await fetch(
       `${BACKEND_URL}/api/get-env-vars?user=${user}&repo_name=${encodeURIComponent(repoName)}&project_name=${encodeURIComponent(projectName)}`,
-      { credentials: "include" }
+      { credentials: "include", headers: projectHintHeaders() }
     );
     
     if (!response.ok) {
@@ -115,6 +116,11 @@ export const getEnvVars = async (
   }
 };
 
+// The server's reason for a failed request, so the panel says why instead of
+// "Request failed with status code 400".
+const failure = (error: unknown, fallback: string): Error =>
+  new Error(apiErrorMessage(error, error instanceof Error ? error.message : fallback));
+
 export const handleDeleteEnvVars = async (
   user: string,
   projectName: string,
@@ -122,8 +128,7 @@ export const handleDeleteEnvVars = async (
   envVars: Array<{ env_key: string; value?: string }>
 ): Promise<void> => {  
   if (!user || !projectName || selectedRepos.length === 0 || envVars.length === 0) {
-    toast.error("Missing required fields. Please check your inputs.");
-    return;
+    throw new Error("Missing required fields. Please check your inputs.");
   }
 
   console.log("📌 Debug: Sending Delete Request with:", {
@@ -160,8 +165,9 @@ export const handleDeleteEnvVars = async (
     }
 
   } catch (error) {
+    // Rethrown: the panel reported "Deleted" for a delete that never happened.
     console.error("❌ Error making delete request:", error);
-    toast.error("Failed to delete environment variables. Please try again.");
+    throw failure(error, "Failed to delete environment variables.");
   }
 };
 
@@ -191,7 +197,7 @@ export const syncEnvVar = async (
     return response.data;
   } catch (error) {
     console.error("❌ Error syncing environment variable:", error);
-    throw error;
+    throw failure(error, "Failed to sync the environment variable.");
   }
 };
 
@@ -210,7 +216,7 @@ export const getEnvVarsCount = async (
     
     const response = await fetch(
       `${BACKEND_URL}/api/env-vars-count?user=${user}&project_name=${encodeURIComponent(projectName)}&repo_names=${encodeURIComponent(repoNamesString)}`,
-      { credentials: "include" }
+      { credentials: "include", headers: projectHintHeaders() }
     );
     
     if (!response.ok) {

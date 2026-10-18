@@ -393,7 +393,10 @@ jobs:
           for tag in "${tags[@]}"; do
             docker buildx imagetools create --tag "$IMAGE:$tag" "$IMAGE@$DIGEST"
             # The tag must name the digest that was tested, scanned and attested.
-            tagged="$(docker buildx imagetools inspect "$IMAGE:$tag" | awk '/^Digest:/{print $2; exit}')"
+            # awk reads to EOF: exiting at the first match could close the pipe
+            # while inspect is still printing, and pipefail turns its SIGPIPE
+            # into a failed step (1.13.0-beta.1's :latest check died that way).
+            tagged="$(docker buildx imagetools inspect "$IMAGE:$tag" | awk '/^Digest:/ && !seen {print $2; seen=1}')"
             if [[ "$tagged" != "$DIGEST" ]]; then
               echo "::error::$IMAGE:$tag is $tagged, expected the verified $DIGEST."
               exit 1

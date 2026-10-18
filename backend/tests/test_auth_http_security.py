@@ -10,47 +10,7 @@ from fastapi.testclient import TestClient
 from github_permissions import PermissionStatus
 
 # Import the functions we need to test
-from auth import _is_localhost, _validate_secure_connection
-
-
-class TestLocalhostDetection:
-    """Test cases for localhost detection"""
-
-    def test_is_localhost_with_localhost(self):
-        """Test that localhost is correctly identified"""
-        assert _is_localhost("localhost") is True
-        assert _is_localhost("LOCALHOST") is True  # Case insensitive
-        
-    def test_is_localhost_with_127_0_0_1(self):
-        """Test that 127.0.0.1 is correctly identified"""
-        assert _is_localhost("127.0.0.1") is True
-        
-    def test_is_localhost_with_ipv6_loopback(self):
-        """Test that ::1 is correctly identified"""
-        assert _is_localhost("::1") is True
-        
-    def test_is_localhost_with_0_0_0_0(self):
-        """Test that 0.0.0.0 is correctly identified"""
-        assert _is_localhost("0.0.0.0") is True
-        
-    def test_is_localhost_with_port(self):
-        """Test that localhost with port is correctly identified"""
-        assert _is_localhost("localhost:8080") is True
-        assert _is_localhost("127.0.0.1:8080") is True
-        
-    def test_is_localhost_with_remote_ip(self):
-        """Test that remote IPs are not identified as localhost"""
-        assert _is_localhost("192.168.1.100") is False
-        assert _is_localhost("10.0.0.5") is False
-        assert _is_localhost("example.com") is False
-        
-    def test_is_localhost_with_empty_string(self):
-        """Test that empty string is not identified as localhost"""
-        assert _is_localhost("") is False
-        
-    def test_is_localhost_with_none(self):
-        """Test that None is not identified as localhost"""
-        assert _is_localhost(None) is False
+from auth import _validate_secure_connection
 
 
 class TestSecureConnectionValidation:

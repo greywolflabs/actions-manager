@@ -546,7 +546,7 @@ const Secrets: React.FC<SecretsProps> = ({
               <button
                 type="button"
                 onClick={() => setRevealValue((v) => !v)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-700 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring dark:text-slate-500 dark:hover:text-slate-200 disabled:opacity-50"
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-700 focus:outline-hidden focus-visible:ring-1 focus-visible:ring-ring dark:text-slate-500 dark:hover:text-slate-200 disabled:opacity-50"
                 aria-label={revealValue ? "Hide secret value" : "Show secret value"}
                 aria-pressed={revealValue}
                 title={

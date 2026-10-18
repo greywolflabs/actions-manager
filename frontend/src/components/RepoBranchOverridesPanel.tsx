@@ -111,7 +111,7 @@ const RepoBranchOverridesPanel: React.FC<RepoBranchOverridesPanelProps> = ({
     setLoading(true);
     setLoadError(null);
     try {
-      const result = await fetchProjectRepoBranchConfigs(user, projectId);
+      const result = await fetchProjectRepoBranchConfigs(projectId);
       setData(result);
     } catch (err) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
@@ -201,7 +201,6 @@ const RepoBranchOverridesPanel: React.FC<RepoBranchOverridesPanelProps> = ({
                 draft.branch_option === "pattern" ? draft.branch_max_age_days : null,
             };
       const updated = await updateProjectRepoBranchConfig(
-        user,
         projectId,
         activeRepo.repo_id,
         payload,
@@ -235,7 +234,7 @@ const RepoBranchOverridesPanel: React.FC<RepoBranchOverridesPanelProps> = ({
     setSaveError(null);
     setSaveSuccess(null);
     try {
-      const updated = await resetProjectRepoBranchConfig(user, projectId, activeRepo.repo_id);
+      const updated = await resetProjectRepoBranchConfig(projectId, activeRepo.repo_id);
       setData((prev) =>
         prev
           ? {
@@ -455,7 +454,7 @@ const RepoBranchOverridesPanel: React.FC<RepoBranchOverridesPanelProps> = ({
                             placeholder="e.g., main, release-.*, feature/auth"
                             value={draft.branch_regex}
                             onChange={(e) => updateDraft({ branch_regex: e.target.value })}
-                            className="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-2 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                            className="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-2 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-hidden focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
                             data-testid="input-regex"
                           />
                         </div>
@@ -480,7 +479,7 @@ const RepoBranchOverridesPanel: React.FC<RepoBranchOverridesPanelProps> = ({
                                 });
                               }
                             }}
-                            className="w-24 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-2 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            className="w-24 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-2 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
                             data-testid="input-max-age"
                           />
                           <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
@@ -514,7 +513,7 @@ const RepoBranchOverridesPanel: React.FC<RepoBranchOverridesPanelProps> = ({
                       type="button"
                       onClick={handleSave}
                       disabled={saving || !isDirty}
-                      className="inline-flex items-center rounded-md bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 dark:disabled:bg-slate-600 disabled:cursor-not-allowed text-white text-sm font-medium px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      className="inline-flex items-center rounded-md bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 dark:disabled:bg-slate-600 disabled:cursor-not-allowed text-white text-sm font-medium px-3 py-1.5 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
                       data-testid="save-btn"
                     >
                       {saving ? "Saving…" : "Save"}
@@ -523,7 +522,7 @@ const RepoBranchOverridesPanel: React.FC<RepoBranchOverridesPanelProps> = ({
                       type="button"
                       onClick={handleReset}
                       disabled={saving || repo.branch_config_mode === "inherit"}
-                      className="inline-flex items-center rounded-md border border-slate-300 dark:border-slate-600 hover:bg-slate-50 dark:hover:bg-slate-700/40 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium text-slate-700 dark:text-slate-200 px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      className="inline-flex items-center rounded-md border border-slate-300 dark:border-slate-600 hover:bg-slate-50 dark:hover:bg-slate-700/40 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium text-slate-700 dark:text-slate-200 px-3 py-1.5 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
                       data-testid="reset-btn"
                     >
                       Reset to project default

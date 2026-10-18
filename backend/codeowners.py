@@ -1,39 +1,40 @@
 """
 CODEOWNERS Management API for ActionsManager
 
-Manages the GitHub ``CODEOWNERS`` file for repositories within a project.
-Mirrors the conventions used by ``rulesets`` and ``workflows``:
+A project owns one CODEOWNERS file, delivered to every repository and branch the
+project delivers to by its PR campaigns, the way its workflows and custom files
+are. Drift is checked with the project's workflows (``workflows.run_project_drift_check``)
+and follows the same rules.
 
-* GET    /api/repos/{repo_id}/codeowners            – fetch current GitHub copy
-* POST   /api/repos/{repo_id}/codeowners            – save local draft
-* POST   /api/repos/{repo_id}/codeowners/deploy     – commit to GitHub (direct or PR)
-* GET    /api/repos/{repo_id}/codeowners/drift      – compare local vs GitHub
+* GET  /api/projects/{project_id}/codeowners   – the project's CODEOWNERS
+* PUT  /api/projects/{project_id}/codeowners   – save it locally (Commit Locally)
+* GET  /api/repos/{repo_ref}/codeowners        – a repository's copy on GitHub, to import or load
 
-All endpoints require ``github_user`` and ``project_name`` query parameters
-(or body fields) so that ownership and RBAC checks can be performed using
-the same helpers as the rest of the application.
+Callers come from the session (#2241), and ownership and RBAC checks run for
+the signed-in user with the same helpers as the rest of the application.
 """
 
 import base64
-import json
 from typing import Annotated, Optional
 
 import requests
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+import auth as auth_module
 from auth import user_tokens
+from config import GITHUB_TIMEOUT_SECONDS
+from custom_files import _get_project_for_user, _mark_project_draft
 from database import get_db
-from models import (
-    Codeowners,
-    Project,
-    ProjectPRCampaign,
-    ProjectPullRequest,
-    ProjectRepo,
-    Repo,
+import deliveries
+from drift_notifications import resolve_drift_for_local_edit
+from models import Codeowners, Project, ProjectRepo, Repo
+from workflows import (
+    _find_project_by_name,
+    _project_codeowners,
+    _require_project_editor,
 )
-from workflows import _find_project_by_name, _fetch_branch_protection, _require_project_editor
 
 
 router = APIRouter()
@@ -48,31 +49,15 @@ X_API_VERSION = "2022-11-28"
 ALLOWED_PATHS = (".github/CODEOWNERS", "CODEOWNERS")
 
 
-
-
 # --------------------------------------------------------------------------- #
 # Pydantic models                                                             #
 # --------------------------------------------------------------------------- #
 
 
 class CodeownersSaveRequest(BaseModel):
-    """Body for saving a CODEOWNERS draft."""
-    github_user: str
-    project_name: str
+    """Body for saving the project's CODEOWNERS."""
     content: str
     file_path: Optional[str] = ALLOWED_PATHS[0]
-
-
-class CodeownersDeployRequest(BaseModel):
-    """Body for deploying a CODEOWNERS file to GitHub."""
-    github_user: str
-    project_name: str
-    content: Optional[str] = None  # if omitted, the stored draft is used
-    file_path: Optional[str] = None  # if omitted, the stored or default path is used
-    branch: Optional[str] = None  # target branch; defaults to the repo default branch
-    mode: str = "direct"  # "direct" → commit to branch, "pr" → branch + PR
-    commit_message: Optional[str] = None
-    campaign_id: Optional[int] = None  # attach this PR to an existing campaign
 
 
 # --------------------------------------------------------------------------- #
@@ -117,23 +102,8 @@ def _resolve_repo_in_project(db: Session, project: Project, repo_ref: str) -> Re
     return repo
 
 
-def _resolve_caller_and_project(
-    db: Session,
-    github_user: str,
-    project_name: str,
-    x_github_user: Optional[str] = None,
-):
-    """Resolve token + project, raising HTTPException on failure.
-
-    When ``x_github_user`` (the authenticated header user) is provided, it
-    must match ``github_user`` so a caller cannot use another user's token by
-    passing a different username in the query/body.
-    """
-    if x_github_user is not None and x_github_user != github_user:
-        raise HTTPException(
-            status_code=403,
-            detail="github_user does not match authenticated X-GitHub-User",
-        )
+def _resolve_caller_and_project(db: Session, github_user: str, project_name: str):
+    """Resolve the session caller's token and the project, raising HTTPException on failure."""
     if github_user not in user_tokens:
         raise HTTPException(status_code=401, detail="User not authenticated")
     token = user_tokens[github_user]
@@ -159,23 +129,17 @@ def _split_repo(repo_name: str):
     return owner.strip(), repo.strip()
 
 
-def _get_default_branch(owner: str, repo: str, headers: dict) -> str:
-    resp = requests.get(f"{GITHUB_API_URL}/repos/{owner}/{repo}", headers=headers, timeout=15)
-    if resp.status_code == 200:
-        return resp.json().get("default_branch", "main")
-    return "main"
-
-
-def _fetch_github_codeowners(owner: str, repo: str, headers: dict, branch: Optional[str] = None):
+def _fetch_github_codeowners(owner: str, repo: str, headers: dict, branch: Optional[str] = None,
+                             paths: tuple = ALLOWED_PATHS):
     """
-    Fetch CODEOWNERS from GitHub.  Tries the standard locations in priority
-    order and returns ``(content, sha, path)`` when found, or
-    ``(None, None, None)`` if no CODEOWNERS file exists.
+    Fetch CODEOWNERS from GitHub.  Tries *paths* in priority order and returns
+    ``(content, sha, path)`` when found, or ``(None, None, None)`` if no
+    CODEOWNERS file exists.
     """
-    ref_qs = f"?ref={branch}" if branch else ""
-    for path in ALLOWED_PATHS:
-        url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{path}{ref_qs}"
-        resp = requests.get(url, headers=headers, timeout=15)
+    params = {"ref": branch} if branch else None
+    for path in paths:
+        url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{path}"
+        resp = requests.get(url, headers=headers, params=params, timeout=GITHUB_TIMEOUT_SECONDS)
         if resp.status_code == 200:
             data = resp.json()
             try:
@@ -207,7 +171,6 @@ def _serialize_codeowners(record: Optional[Codeowners]) -> Optional[dict]:
     return {
         "id": record.id,
         "project_id": record.project_id,
-        "repo_id": record.repo_id,
         "content": record.content,
         "file_path": record.file_path,
         "git_hash": record.git_hash,
@@ -245,545 +208,128 @@ def _validate_codeowners_syntax(content: str) -> list:
     return warnings
 
 
+def _save(db: Session, project: Project, payload: CodeownersSaveRequest, file_path: str, user: str) -> tuple:
+    """Write the save to the project's record; returns (record, whether it changed)."""
+    record = _project_codeowners(db, project.project_id)
+    if record is None:
+        record = Codeowners(project_id=project.project_id, status="new")
+        db.add(record)
+    elif (record.content, record.file_path) == (payload.content, file_path):
+        return record, False
+    else:
+        # Under review too: the editor unlocks it, and Commit and Update PR
+        # then adds this save to the open pull request.
+        record.status = "committed_locally"
+    record.content = payload.content
+    record.file_path = file_path
+    # As for a workflow: no blob SHA for content GitHub has not been given.
+    record.git_hash = None
+    record.last_modified_by = user
+    db.commit()
+    return record, True
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints                                                                   #
 # --------------------------------------------------------------------------- #
 
 
-@router.get("/api/repos/{repo_ref:path}/codeowners")
+@router.get("/api/projects/{project_id}/codeowners", responses={
+    401: {"description": "Not authenticated"},
+    403: {"description": "No access to this project"},
+    404: {"description": "Project not found"},
+})
+def get_project_codeowners(
+    project_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
+):
+    """The project's CODEOWNERS file, or null when it has none (database only, no GitHub calls)."""
+    _get_project_for_user(db, project_id, account.github_user)
+    return {"codeowners": _serialize_codeowners(_project_codeowners(db, project_id))}
+
+
+@router.put("/api/projects/{project_id}/codeowners", responses={
+    400: {"description": "Invalid file path"},
+    401: {"description": "Not authenticated"},
+    403: {"description": "Not a project editor"},
+    404: {"description": "Project not found"},
+})
+def save_project_codeowners(
+    project_id: int,
+    payload: CodeownersSaveRequest,
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
+):
+    """Save the project's CODEOWNERS locally; a PR campaign delivers it.
+
+    A change is a local edit, exactly as for a workflow: the file is
+    committed_locally with its hash cleared. Drift the last check recorded
+    stays, unless the edit makes the file exactly GitHub's copy there.
+    """
+    user = account.github_user
+    project = _get_project_for_user(db, project_id, user)
+    _require_project_editor(db, user, project)
+    file_path = _validate_file_path(payload.file_path)
+
+    record, changed = _save(db, project, payload, file_path, user)
+    if changed:
+        resolve_drift_for_local_edit(db, project, deliveries.CODEOWNERS, record.id, record.content)
+        # Create Pull Requests needs a draft project; without this a
+        # CODEOWNERS-only edit could not be delivered until a workflow changed.
+        _mark_project_draft(db, project.project_id)
+    db.refresh(record)
+    db.refresh(project)
+
+    return {
+        "success": True,
+        "message": "CODEOWNERS saved" if changed else "No changes to save",
+        "codeowners": _serialize_codeowners(record),
+        "validation_warnings": _validate_codeowners_syntax(payload.content),
+        "pr_state": project.pr_state,
+    }
+
+
+@router.get("/api/repos/{repo_ref:path}/codeowners", responses={
+    400: {"description": "Invalid file path or repository name"},
+    409: {"description": "More than one project has this name"},
+    502: {"description": "GitHub could not be read"},
+})
 def get_codeowners(
     repo_ref: str,
-    github_user: str,
     project_name: str,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
+    branch: Optional[str] = None,
+    path: Optional[str] = None,
 ):
     """
-    Fetch the CODEOWNERS file from GitHub (trying both standard locations)
-    and return it alongside any locally-stored draft.
+    A repository's CODEOWNERS on GitHub, alongside the project's own: to import
+    a repository's file into the project, or to load the version a branch drifted to.
 
-    ``repo_ref`` is either the integer ``repo_id`` or the full
-    ``owner/repo`` name.
+    ``branch`` defaults to the repository's default branch, and ``path`` to
+    the first of the standard locations that exists.
+    ``repo_ref`` is either the integer ``repo_id`` or the full ``owner/repo`` name.
     """
-    token, project = _resolve_caller_and_project(db, github_user, project_name, x_github_user)
+    token, project = _resolve_caller_and_project(db, account.github_user, project_name)
     repo = _resolve_repo_in_project(db, project, repo_ref)
     owner, repo_short = _split_repo(repo.repo_name)
-    headers = _gh_headers(token)
+    paths = (_validate_file_path(path),) if path else ALLOWED_PATHS
 
-    github_content, github_sha, github_path = _fetch_github_codeowners(owner, repo_short, headers)
-
-    record = (
-        db.query(Codeowners)
-        .filter(Codeowners.project_id == project.project_id, Codeowners.repo_id == repo.repo_id)
-        .first()
+    github_content, github_sha, github_path = _fetch_github_codeowners(
+        owner, repo_short, _gh_headers(token), branch, paths
     )
 
     return {
         "success": True,
         "repo_id": repo.repo_id,
         "repo_name": repo.repo_name,
+        "branch": branch,
         "github": {
             "exists": github_content is not None,
             "content": github_content,
             "sha": github_sha,
             "path": github_path,
         },
-        "local": _serialize_codeowners(record),
-    }
-
-
-@router.post("/api/repos/{repo_ref:path}/codeowners")
-def save_codeowners_draft(
-    repo_ref: str,
-    payload: CodeownersSaveRequest,
-    db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-):
-    """Save a CODEOWNERS draft to the database."""
-    _, project = _resolve_caller_and_project(db, payload.github_user, payload.project_name, x_github_user)
-    # _resolve_caller_and_project proves who the caller is and that they can see
-    # the project; it never reads ProjectMembership.project_role. Saving the
-    # draft overwrites this project's stored CODEOWNERS content.
-    _require_project_editor(db, payload.github_user, project)
-    repo = _resolve_repo_in_project(db, project, repo_ref)
-    file_path = _validate_file_path(payload.file_path)
-
-    record = (
-        db.query(Codeowners)
-        .filter(Codeowners.project_id == project.project_id, Codeowners.repo_id == repo.repo_id)
-        .first()
-    )
-
-    if record is None:
-        record = Codeowners(
-            project_id=project.project_id,
-            repo_id=repo.repo_id,
-            content=payload.content,
-            file_path=file_path,
-            status="committed_locally",
-            last_modified_by=payload.github_user,
-        )
-        db.add(record)
-    else:
-        record.content = payload.content
-        record.file_path = file_path
-        # Once edited locally, status becomes committed_locally until deployed.
-        record.status = "committed_locally"
-        record.last_modified_by = payload.github_user
-
-    db.commit()
-    db.refresh(record)
-
-    warnings = _validate_codeowners_syntax(payload.content)
-
-    return {
-        "success": True,
-        "message": "CODEOWNERS draft saved",
-        "codeowners": _serialize_codeowners(record),
-        "validation_warnings": warnings,
-    }
-
-
-@router.get("/api/repos/{repo_ref:path}/codeowners/drift")
-def get_codeowners_drift(
-    repo_ref: str,
-    github_user: str,
-    project_name: str,
-    db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-):
-    """
-    Compare the locally-stored CODEOWNERS content against the live GitHub
-    copy and return a structured drift report.
-
-    Note: when the local content matches GitHub but the stored ``git_hash``
-    is stale (e.g. file was previously committed outside the platform),
-    this endpoint opportunistically refreshes the local ``git_hash`` and
-    flips the status to ``synced_with_github`` so subsequent drift checks
-    can short-circuit on SHA equality.  This is the only side effect.
-    """
-    token, project = _resolve_caller_and_project(db, github_user, project_name, x_github_user)
-    repo = _resolve_repo_in_project(db, project, repo_ref)
-    owner, repo_short = _split_repo(repo.repo_name)
-    headers = _gh_headers(token)
-
-    github_content, github_sha, github_path = _fetch_github_codeowners(owner, repo_short, headers)
-    record = (
-        db.query(Codeowners)
-        .filter(Codeowners.project_id == project.project_id, Codeowners.repo_id == repo.repo_id)
-        .first()
-    )
-
-    local_content = record.content if record else None
-    local_sha = record.git_hash if record else None
-
-    if record is None and github_content is None:
-        drift_status = "absent"
-        has_drift = False
-        reason = "No CODEOWNERS file managed locally or on GitHub"
-    elif record is None and github_content is not None:
-        drift_status = "missing_locally"
-        has_drift = True
-        reason = "CODEOWNERS exists on GitHub but is not managed locally"
-    elif record is not None and github_content is None:
-        drift_status = "missing_on_github"
-        has_drift = True
-        reason = "Local CODEOWNERS draft has not been deployed to GitHub"
-    elif local_content == github_content:
-        drift_status = "synced"
-        has_drift = False
-        reason = "Local content matches GitHub"
-        # Opportunistically refresh the stored git_hash so future drift checks
-        # short-circuit on SHA equality.
-        if record and github_sha and record.git_hash != github_sha:
-            record.git_hash = github_sha
-            record.status = "synced_with_github"
-            db.commit()
-    else:
-        drift_status = "content_mismatch"
-        has_drift = True
-        reason = "Local CODEOWNERS content differs from GitHub"
-
-    return {
-        "success": True,
-        "repo_id": repo.repo_id,
-        "repo_name": repo.repo_name,
-        "drift_status": drift_status,
-        "has_drift": has_drift,
-        "reason": reason,
-        "local_sha": local_sha,
-        "github_sha": github_sha,
-        "github_path": github_path,
-    }
-
-
-def _create_branch(owner: str, repo: str, new_branch: str, base_branch: str, headers: dict):
-    """Create *new_branch* off the head of *base_branch* if it doesn't exist.
-
-    Returns the commit the new branch was cut from, for the campaign snapshot,
-    or None when the branch already existed — it has since drifted from the base
-    branch, so today's base head is not what that branch is based on, and
-    recording it would put a SHA in the snapshot the PR is not built on.
-    Most callers ignore the return value.
-    """
-    # Look up base SHA
-    base_resp = requests.get(
-        f"{GITHUB_API_URL}/repos/{owner}/{repo}/git/refs/heads/{base_branch}",
-        headers=headers,
-        timeout=15,
-    )
-    if base_resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not look up base branch '{base_branch}' ({base_resp.status_code})",
-        )
-    base_sha = base_resp.json()["object"]["sha"]
-
-    # Check if branch already exists
-    head_resp = requests.get(
-        f"{GITHUB_API_URL}/repos/{owner}/{repo}/git/refs/heads/{new_branch}",
-        headers=headers,
-        timeout=15,
-    )
-    if head_resp.status_code == 200:
-        return None  # already exists — its true base is not knowable from here
-
-    create_resp = requests.post(
-        f"{GITHUB_API_URL}/repos/{owner}/{repo}/git/refs",
-        headers=headers,
-        json={"ref": f"refs/heads/{new_branch}", "sha": base_sha},
-        timeout=15,
-    )
-    if create_resp.status_code not in (200, 201):
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not create branch '{new_branch}' ({create_resp.status_code}): {create_resp.text[:200]}",
-        )
-    return base_sha
-
-
-@router.post("/api/repos/{repo_ref:path}/codeowners/deploy")
-def deploy_codeowners(
-    repo_ref: str,
-    payload: CodeownersDeployRequest,
-    db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-):
-    """
-    Commit the CODEOWNERS file to GitHub, either directly to a branch or via
-    a pull request.
-
-    * ``mode = "direct"`` (default) — commits to ``branch`` (or the repository
-      default branch) and updates the local record's ``git_hash``.
-    * ``mode = "pr"`` — creates a dedicated branch
-      ``actions-manager/codeowners-{project_code}`` from the target branch,
-      commits there, and opens a PR back to the target branch.
-    """
-    if payload.mode not in ("direct", "pr"):
-        raise HTTPException(status_code=400, detail="mode must be 'direct' or 'pr'")
-
-    token, project = _resolve_caller_and_project(db, payload.github_user, payload.project_name, x_github_user)
-    # Deploying commits CODEOWNERS to the project's repositories, directly on a
-    # branch or through a pull request, so it needs write access to the project
-    # rather than only the ability to see it.
-    _require_project_editor(db, payload.github_user, project)
-    repo = _resolve_repo_in_project(db, project, repo_ref)
-    owner, repo_short = _split_repo(repo.repo_name)
-    headers = _gh_headers(token)
-
-    record = (
-        db.query(Codeowners)
-        .filter(Codeowners.project_id == project.project_id, Codeowners.repo_id == repo.repo_id)
-        .first()
-    )
-
-    # Resolve content + path from payload, falling back to the saved draft.
-    content = payload.content if payload.content is not None else (record.content if record else None)
-    if content is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No CODEOWNERS content provided and no draft has been saved",
-        )
-    file_path = _validate_file_path(payload.file_path or (record.file_path if record else None))
-
-    target_branch = payload.branch or _get_default_branch(owner, repo_short, headers)
-
-    # Determine the branch we will actually commit to.
-    # For PR mode, resolve (or create) the campaign this PR belongs to.
-    pr_campaign_id: Optional[int] = None
-    # Set only for a campaign this request created, so the PR URL fill below never
-    # touches a campaign that belongs to a previous run.
-    pr_url_campaign: Optional[ProjectPRCampaign] = None
-    snapshot_key = f"{repo.repo_name} on {target_branch}"
-    if payload.mode == "pr":
-        commit_branch = f"actions-manager/codeowners-{project.project_code}"
-        base_sha = _create_branch(owner, repo_short, commit_branch, target_branch, headers)
-
-        if payload.campaign_id is not None:
-            pr_campaign_id = payload.campaign_id
-            # The campaign was created by the PR-campaign run that sent us here,
-            # so its PR URL slot for this target is still empty — record_pr_url
-            # is append-only and refuses to touch one already filled.
-            pr_url_campaign = db.query(ProjectPRCampaign).filter(
-                ProjectPRCampaign.campaign_id == payload.campaign_id
-            ).first()
-        else:
-            # Standalone deploy: create a dedicated campaign record.
-            # policy_version stays null — CODEOWNERS is not a workflow template.
-            campaign = ProjectPRCampaign(
-                project_id=project.project_id,
-                created_by=payload.github_user,
-                target_repos=json.dumps([repo.repo_name]),
-                base_commits=json.dumps({snapshot_key: base_sha}),
-                branch_protection=json.dumps({
-                    snapshot_key: _fetch_branch_protection(owner, repo_short, target_branch, headers)
-                }),
-            )
-            db.add(campaign)
-            db.commit()
-            db.refresh(campaign)
-            pr_campaign_id = campaign.campaign_id
-            pr_url_campaign = campaign
-    else:
-        commit_branch = target_branch
-
-    # Look up the file SHA on the commit branch (required for updates).
-    contents_url = f"{GITHUB_API_URL}/repos/{owner}/{repo_short}/contents/{file_path}"
-    existing_resp = requests.get(
-        f"{contents_url}?ref={commit_branch}", headers=headers, timeout=15
-    )
-    existing_sha = None
-    if existing_resp.status_code == 200:
-        existing_sha = existing_resp.json().get("sha")
-    elif existing_resp.status_code not in (404,):
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not check existing CODEOWNERS ({existing_resp.status_code})",
-        )
-
-    body = {
-        "message": payload.commit_message
-        or f"Update {file_path} via Actions Manager [skip ci]",
-        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-        "branch": commit_branch,
-    }
-    if existing_sha:
-        body["sha"] = existing_sha
-
-    put_resp = requests.put(contents_url, headers=headers, json=body, timeout=30)
-    if put_resp.status_code not in (200, 201):
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to commit CODEOWNERS ({put_resp.status_code}): {put_resp.text[:200]}",
-        )
-
-    new_sha = put_resp.json().get("content", {}).get("sha")
-
-    pr_info = None
-    if payload.mode == "pr":
-        pr_resp = requests.post(
-            f"{GITHUB_API_URL}/repos/{owner}/{repo_short}/pulls",
-            headers=headers,
-            json={
-                "title": f"[Actions Manager] Update {file_path}",
-                "head": commit_branch,
-                "base": target_branch,
-                "body": (
-                    f"Automated update of `{file_path}` from project "
-                    f"**{project.project_name}** ({project.project_code})."
-                ),
-            },
-            timeout=30,
-        )
-        if pr_resp.status_code in (200, 201):
-            pr_data = pr_resp.json()
-            pr_info = {"number": pr_data.get("number"), "url": pr_data.get("html_url")}
-
-            # This path opens the PR after its campaign row exists, so the snapshot's
-            # empty PR URL slot is filled here — at the point the PR is created.
-            if pr_url_campaign is not None and pr_data.get("html_url"):
-                try:
-                    pr_url_campaign.record_pr_url(snapshot_key, pr_data["html_url"])
-                    db.commit()
-                except ValueError as exc:
-                    print(f"⚠️ Could not record campaign PR URL: {exc}")
-                    db.rollback()
-
-            # Track the PR in ProjectPullRequest table so it appears in "Opened PR's" list
-            try:
-                pr_number = pr_data.get("number")
-                pr_url = pr_data.get("html_url")
-                pr_title = pr_data.get("title", f"[Actions Manager] Update {file_path}")
-                pr_author = pr_data.get("user", {}).get("login")
-                pr_body = pr_data.get("body", "")
-
-                # Check if PR entry already exists
-                existing_pr = (
-                    db.query(ProjectPullRequest)
-                    .filter(
-                        ProjectPullRequest.project_id == project.project_id,
-                        ProjectPullRequest.repo_name == repo.repo_name,
-                        ProjectPullRequest.branch_name == commit_branch,
-                        ProjectPullRequest.target_branch == target_branch,
-                    )
-                    .first()
-                )
-
-                if existing_pr:
-                    # Update existing PR entry
-                    existing_pr.pr_number = pr_number
-                    existing_pr.pr_url = pr_url
-                    existing_pr.pr_state = "open"
-                    existing_pr.title = pr_title
-                    existing_pr.author = pr_author
-                    existing_pr.body = pr_body
-                    existing_pr.workflow_names = "CODEOWNERS"
-                    if pr_campaign_id is not None and existing_pr.campaign_id is None:
-                        existing_pr.campaign_id = pr_campaign_id
-                else:
-                    # Create new PR entry
-                    new_pr = ProjectPullRequest(
-                        project_id=project.project_id,
-                        repo_name=repo.repo_name,
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                        pr_state="open",
-                        branch_name=commit_branch,
-                        target_branch=target_branch,
-                        title=pr_title,
-                        author=pr_author,
-                        body=pr_body,
-                        workflow_names="CODEOWNERS",
-                        campaign_id=pr_campaign_id,
-                    )
-                    db.add(new_pr)
-
-                db.commit()
-            except Exception as e:
-                # Don't fail the entire operation if PR tracking fails
-                print(f"⚠️ Failed to track CODEOWNERS PR in database: {str(e)}")
-                db.rollback()
-
-        elif pr_resp.status_code == 422:
-            # PR likely already exists for this branch — look it up and upsert
-            # the tracking record so the unified PR panel stays in sync.
-            pr_info = {"warning": "Pull request already exists for this branch", "raw": pr_resp.json()}
-            try:
-                list_resp = requests.get(
-                    f"{GITHUB_API_URL}/repos/{owner}/{repo_short}/pulls",
-                    headers=headers,
-                    params={"head": f"{owner}:{commit_branch}", "state": "open"},
-                    timeout=15,
-                )
-                if list_resp.status_code == 200:
-                    open_prs = list_resp.json() or []
-                    if open_prs:
-                        pr_data = open_prs[0]
-                        pr_number = pr_data.get("number")
-                        pr_url = pr_data.get("html_url")
-                        pr_title = pr_data.get("title", f"[Actions Manager] Update {file_path}")
-                        pr_author = pr_data.get("user", {}).get("login")
-                        pr_body = pr_data.get("body", "")
-                        pr_info = {"number": pr_number, "url": pr_url, "warning": "Pull request already exists for this branch"}
-
-                        existing_pr = (
-                            db.query(ProjectPullRequest)
-                            .filter(
-                                ProjectPullRequest.project_id == project.project_id,
-                                ProjectPullRequest.repo_name == repo.repo_name,
-                                ProjectPullRequest.branch_name == commit_branch,
-                                ProjectPullRequest.target_branch == target_branch,
-                            )
-                            .first()
-                        )
-                        if existing_pr:
-                            existing_pr.pr_number = pr_number
-                            existing_pr.pr_url = pr_url
-                            existing_pr.pr_state = "open"
-                            existing_pr.title = pr_title
-                            existing_pr.author = pr_author
-                            existing_pr.body = pr_body
-                            existing_pr.workflow_names = "CODEOWNERS"
-                            if pr_campaign_id is not None and existing_pr.campaign_id is None:
-                                existing_pr.campaign_id = pr_campaign_id
-                        else:
-                            db.add(ProjectPullRequest(
-                                project_id=project.project_id,
-                                repo_name=repo.repo_name,
-                                pr_number=pr_number,
-                                pr_url=pr_url,
-                                pr_state="open",
-                                branch_name=commit_branch,
-                                target_branch=target_branch,
-                                title=pr_title,
-                                author=pr_author,
-                                body=pr_body,
-                                workflow_names="CODEOWNERS",
-                                campaign_id=pr_campaign_id,
-                            ))
-                        db.commit()
-            except Exception as e:
-                print(f"⚠️ Failed to upsert existing CODEOWNERS PR tracking: {str(e)}")
-                db.rollback()
-        else:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Commit succeeded but PR creation failed ({pr_resp.status_code}): {pr_resp.text[:200]}",
-            )
-
-    # Persist updated state locally.
-    if record is None:
-        record = Codeowners(
-            project_id=project.project_id,
-            repo_id=repo.repo_id,
-            content=content,
-            file_path=file_path,
-            git_hash=new_sha,
-            status="under_review" if payload.mode == "pr" else "synced_with_github",
-            last_modified_by=payload.github_user,
-        )
-        db.add(record)
-    else:
-        record.content = content
-        record.file_path = file_path
-        record.git_hash = new_sha
-        record.status = "under_review" if payload.mode == "pr" else "synced_with_github"
-        record.last_modified_by = payload.github_user
-    db.commit()
-    db.refresh(record)
-
-    return {
-        "success": True,
-        "message": "CODEOWNERS deployed to GitHub",
-        "mode": payload.mode,
-        "branch": commit_branch,
-        "target_branch": target_branch,
-        "file_path": file_path,
-        "git_hash": new_sha,
-        "pull_request": pr_info,
-        "campaign_id": pr_campaign_id,
-        "codeowners": _serialize_codeowners(record),
-    }
-
-
-@router.get("/api/project-codeowners-statuses")
-def get_project_codeowners_statuses(
-    project_name: str,
-    github_user: str,
-    db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-):
-    """Return the local status of every CODEOWNERS record in a project (DB only, no GitHub calls)."""
-    _, project = _resolve_caller_and_project(db, github_user, project_name, x_github_user)
-    rows = (
-        db.query(Codeowners.status, Repo.repo_name)
-        .join(Repo, Codeowners.repo_id == Repo.repo_id)
-        .filter(Codeowners.project_id == project.project_id)
-        .all()
-    )
-    return {
-        "statuses": [
-            {"repo_name": repo_name, "status": status or "new"}
-            for status, repo_name in rows
-        ]
+        "local": _serialize_codeowners(_project_codeowners(db, project.project_id)),
     }

@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from models import Base, Account, Project, Workflow, ProjectWorkflow, LinkedReusableWorkflow
 from main import app
 from projects import get_db as projects_get_db
+from auth import create_auth_session
 
 # ---------------------------------------------------------------------------
 # Test database setup
@@ -62,6 +63,16 @@ def client():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _signed_in(github_user):
+    """Headers for a real server-side session as ``github_user`` (#2241)."""
+    db = TestingSessionLocal()
+    try:
+        token = create_auth_session(github_user, db)
+    finally:
+        db.close()
+    return {"Authorization": f"Bearer {token}"}
+
 
 def _make_user(db, github_user="testuser", email="test@example.com"):
     account = Account(
@@ -132,7 +143,7 @@ def test_rwx_project_returns_linked_standard_projects(client):
     finally:
         db.close()
 
-    resp = client.get("/api/projects/My%20RWX", params={"github_user": "testuser"})
+    resp = client.get("/api/projects/My%20RWX", params={"github_user": "testuser"}, headers=_signed_in("testuser"))
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
@@ -161,7 +172,7 @@ def test_rwx_linked_standard_projects_deduplicated_across_multiple_workflows(cli
     finally:
         db.close()
 
-    resp = client.get("/api/projects/My%20RWX", params={"github_user": "testuser"})
+    resp = client.get("/api/projects/My%20RWX", params={"github_user": "testuser"}, headers=_signed_in("testuser"))
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
@@ -190,7 +201,7 @@ def test_rwx_linked_standard_projects_multiple_standard_projects(client):
     finally:
         db.close()
 
-    resp = client.get("/api/projects/My%20RWX", params={"github_user": "testuser"})
+    resp = client.get("/api/projects/My%20RWX", params={"github_user": "testuser"}, headers=_signed_in("testuser"))
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
@@ -222,7 +233,7 @@ def test_rwx_linked_standard_projects_scoped_to_owner(client):
         db.close()
 
     # Owner fetches their RWX project
-    resp = client.get("/api/projects/Owner%20RWX", params={"github_user": "owner"})
+    resp = client.get("/api/projects/Owner%20RWX", params={"github_user": "owner"}, headers=_signed_in("owner"))
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
@@ -242,7 +253,7 @@ def test_rwx_project_empty_linked_standard_projects_when_no_links(client):
     finally:
         db.close()
 
-    resp = client.get("/api/projects/Lonely%20RWX", params={"github_user": "testuser"})
+    resp = client.get("/api/projects/Lonely%20RWX", params={"github_user": "testuser"}, headers=_signed_in("testuser"))
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
@@ -260,7 +271,7 @@ def test_standard_project_returns_empty_linked_standard_projects(client):
     finally:
         db.close()
 
-    resp = client.get("/api/projects/Std%20Project", params={"github_user": "testuser"})
+    resp = client.get("/api/projects/Std%20Project", params={"github_user": "testuser"}, headers=_signed_in("testuser"))
     assert resp.status_code == 200, resp.text
     data = resp.json()
 

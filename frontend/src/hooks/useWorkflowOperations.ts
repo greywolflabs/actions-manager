@@ -5,6 +5,7 @@ import { RwxWorkflow, unlinkReusableWorkflow } from '../api/projects';
 import { saveDraftWorkflow, commitAndUpdatePRWorkflow, commitAndUpdatePRLinkedWorkflow, saveDraftLinkedWorkflow, deleteWorkflow, createBlankWorkflow } from '../utils/workflowOperations';
 import { detectBuildTypesForRepos, addWorkflowFromDetection, generateTemplates, selectTemplate } from '../utils/buildDetectionUtils';
 import type { RemovalDelivery, RemovalScope } from '../components/RemovalScopeDialog';
+import type { WorkflowKindChange } from '../utils/workflowKindChanges';
 import { tour } from '../utils/tour';
 
 export interface UseWorkflowOperationsProps {
@@ -39,8 +40,15 @@ export interface UseWorkflowOperationsProps {
   /** Reloads the project itself, so state seeded by the project-load endpoint
    *  (drift names above all) is corrected after a removal. */
   refreshProjectData?: () => Promise<void>;
+  /** Re-reads the stored drift after a save, which resolves the edited workflow's drift. */
+  refreshDrift?: () => void;
   onProjectStateChange?: (state: string) => void;
-  branchOption?: string;
+  /** Repositories a push opened or added to a pull request in, so they stop waiting for delivery. */
+  onReposDelivered?: (repos: string[]) => void;
+  /** Where a reusable workflow is removed from: a caller project's own repos, or the RWX repo. */
+  projectType?: 'standard' | 'rwx';
+  /** Moves workflows a save gave the other kind into their new section (#2318). */
+  applyKindChanges?: (changes: WorkflowKindChange[]) => void;
 }
 
 export const useWorkflowOperations = (props: UseWorkflowOperationsProps) => {
@@ -74,8 +82,11 @@ export const useWorkflowOperations = (props: UseWorkflowOperationsProps) => {
     setIsGeneratingTemplates,
     refreshProjectsList,
     refreshProjectData,
+    refreshDrift,
     onProjectStateChange,
-    branchOption = "default"
+    onReposDelivered,
+    projectType,
+    applyKindChanges,
   } = props;
 
   // Workflow count fetching for free accounts
@@ -118,28 +129,32 @@ export const useWorkflowOperations = (props: UseWorkflowOperationsProps) => {
       type === 'regular' ? applyRename(workflows) : workflows,
       type === 'reusable' ? applyRename(rxworkflows) : rxworkflows,
       user, projectName, accountType,
-      markWorkflowAsSaved, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange
+      markWorkflowAsSaved, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange,
+      applyKindChanges
     );
-  }, [workflows, rxworkflows, user, projectName, accountType, markWorkflowAsSaved, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange]);
+    refreshDrift?.();
+  }, [workflows, rxworkflows, user, projectName, accountType, markWorkflowAsSaved, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange, applyKindChanges, refreshDrift]);
 
   // Commit and Update PR functionality wrapper – used when a workflow already has an open PR
   const handleCommitAndUpdatePR = useCallback(async (index: number | null, type: 'regular' | 'reusable'): Promise<boolean> => {
-    return commitAndUpdatePRWorkflow(
-      index, type, workflows, rxworkflows, user, projectName,
-      selectedRepos, regexPattern, branchOption,
-      markWorkflowAsSaved, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange
+    const pushed = await commitAndUpdatePRWorkflow(
+      index, type, workflows, rxworkflows,
+      { user, projectName, selectedRepos, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange, onReposDelivered },
+      markWorkflowAsSaved
     );
-  }, [workflows, rxworkflows, user, projectName, selectedRepos, regexPattern, branchOption, markWorkflowAsSaved, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange]);
+    // Even when the push fails: the save before it already resolved the drift.
+    refreshDrift?.();
+    return pushed;
+  }, [workflows, rxworkflows, user, projectName, selectedRepos, markWorkflowAsSaved, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange, onReposDelivered, refreshDrift]);
 
   // Commit and Update PR for linked reusable workflows – save goes to the RWX project,
   // push uses the standard project to resolve the correct RWX repo.
   const handleCommitAndUpdatePRLinked = useCallback(async (index: number): Promise<boolean> => {
     return commitAndUpdatePRLinkedWorkflow(
-      index, linkedWorkflows, user, projectName,
-      selectedRepos, regexPattern, branchOption,
-      fetchWorkflowsCount, refreshProjectsList, onProjectStateChange
+      index, linkedWorkflows,
+      { user, projectName, selectedRepos, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange }
     );
-  }, [linkedWorkflows, user, projectName, selectedRepos, regexPattern, branchOption, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange]);
+  }, [linkedWorkflows, user, projectName, selectedRepos, fetchWorkflowsCount, refreshProjectsList, onProjectStateChange]);
 
   // Draft save for linked reusable workflows – persists content to the RWX project DB
   // without pushing to GitHub, and clears isModified on success.
@@ -157,10 +172,10 @@ export const useWorkflowOperations = (props: UseWorkflowOperationsProps) => {
   ): Promise<void> => {
     await deleteWorkflow({
       index, type, workflows, rxworkflows, user, projectName, selectedRepos,
-      regexPattern, scope, delivery, setWorkflows, setRXWorkflows, setSelectedWorkflowId,
+      regexPattern, scope, delivery, projectType, setWorkflows, setRXWorkflows, setSelectedWorkflowId,
       fetchWorkflowsCount, refreshProjectData,
     });
-  }, [workflows, rxworkflows, user, projectName, selectedRepos, regexPattern, setWorkflows, setRXWorkflows, setSelectedWorkflowId, fetchWorkflowsCount, refreshProjectData]);
+  }, [workflows, rxworkflows, user, projectName, selectedRepos, regexPattern, projectType, setWorkflows, setRXWorkflows, setSelectedWorkflowId, fetchWorkflowsCount, refreshProjectData]);
 
   // Unlink a linked reusable workflow from the current project
   const handleUnlinkWorkflow = useCallback(async (workflowId: number): Promise<void> => {

@@ -31,7 +31,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from models import (  # noqa: E402
     Base, Account, Project, ProjectWorkflow, Workflow,
 )
-from workflows import _update_workflow_git_hash  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+from workflows import _commit_workflows_to_branch, _update_workflow_git_hash  # noqa: E402
+from tests.delivery_records import record_pr_carries  # noqa: E402
 
 engine = create_engine(
     "sqlite:///:memory:",
@@ -207,3 +210,213 @@ class TestOneProjectPerWorkflow:
             text("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='project_workflows'")
         ).fetchall()
         assert "uq_project_workflows_workflow_id" in [i[0] for i in indexes]
+
+
+class TestCommitStampsTheRowItDelivered:
+    """#2085: a reusable workflow a standard project owns is delivered through
+    the regular commit path, which stamped every SHA as a regular workflow's.
+    A lone reusable row matched nothing, so its drift baseline never moved."""
+
+    def _commit(self, db, workflow_dict, new_sha):
+        with patch("workflows._update_workflow_to_github", return_value=(201, new_sha)):
+            committed, errors = _commit_workflows_to_branch(
+                [workflow_dict], "acme", "app", "OWN", "am-branch", {},
+                "acme/app", "user-OWN", db, False,
+            )
+        assert committed == [workflow_dict["name"]]
+        assert errors == []
+
+    def test_an_owned_reusable_workflow_gets_the_delivered_sha(self, db):
+        project = _project(db, "OWN")
+        reusable = _workflow(db, project, "shared", git_hash="imported", is_reusable=True)
+
+        self._commit(db, {"name": "shared", "content": "x", "is_reusable": True}, "delivered")
+
+        db.refresh(reusable)
+        assert reusable.workflow_git_hash == "delivered"
+
+    def test_it_lands_on_the_reusable_row_not_a_regular_one_of_the_same_name(self, db):
+        project = _project(db, "OWN")
+        regular = _workflow(db, project, "ci", git_hash="regular-original")
+        reusable = _workflow(db, project, "ci", git_hash="reusable-original", is_reusable=True)
+
+        self._commit(db, {"name": "ci", "content": "x", "is_reusable": True}, "reusable-new")
+
+        db.refresh(regular); db.refresh(reusable)
+        assert reusable.workflow_git_hash == "reusable-new"
+        assert regular.workflow_git_hash == "regular-original"
+
+    def test_a_dict_without_the_flag_is_still_a_regular_workflow(self, db):
+        project = _project(db, "OWN")
+        regular = _workflow(db, project, "ci", git_hash="regular-original")
+
+        self._commit(db, {"name": "ci", "content": "x"}, "regular-new")
+
+        db.refresh(regular)
+        assert regular.workflow_git_hash == "regular-new"
+
+
+class TestTheTriggerDecidesTheKind:
+    """#2309 made one name one workflow in a project; #2318 lets its trigger
+    decide its kind. A save finds the workflow by name across both kinds and,
+    when an edit adds or removes workflow_call, converts it in place."""
+
+    @staticmethod
+    def _save(db, project, name, *, listed_reusable, content):
+        from types import SimpleNamespace
+        from workflows import create_or_update_workflow
+        return create_or_update_workflow(
+            db, SimpleNamespace(name=name, content=content, original_name=None),
+            project.project_id, is_reusable=listed_reusable,
+        )
+
+    @staticmethod
+    def _rows(db, project):
+        return (
+            db.query(Workflow).join(ProjectWorkflow)
+            .filter(ProjectWorkflow.project_id == project.project_id)
+            .all()
+        )
+
+    def test_adding_workflow_call_converts_the_workflow_in_place(self, db):
+        project = _project(db, "CONV")
+        regular = _workflow(db, project, "deploy")
+
+        saved = self._save(db, project, "deploy", listed_reusable=False, content="on: workflow_call")
+
+        assert [w.workflow_id for w in self._rows(db, project)] == [regular.workflow_id]
+        assert saved.workflow_id == regular.workflow_id
+        assert saved.reusable_workflow is True
+
+    def test_removing_workflow_call_makes_it_regular(self, db):
+        project = _project(db, "BACK")
+        _workflow(db, project, "deploy", is_reusable=True)
+
+        saved = self._save(db, project, "deploy", listed_reusable=True, content="on: push")
+
+        assert saved.reusable_workflow is False
+        assert len(self._rows(db, project)) == 1
+
+    def test_a_new_workflow_takes_the_kind_its_trigger_declares(self, db):
+        project = _project(db, "NEWK")
+
+        saved = self._save(db, project, "deploy", listed_reusable=False, content="on: workflow_call")
+
+        assert saved.reusable_workflow is True
+
+    def test_a_stale_list_still_updates_the_one_workflow(self, db):
+        """Listed as the other kind, in other casing: still that workflow, and
+        its YAML, not the list, says what it is."""
+        project = _project(db, "STAL")
+        regular = _workflow(db, project, "deploy")
+
+        saved = self._save(db, project, "Deploy", listed_reusable=True, content="on: pull_request")
+
+        assert saved.workflow_id == regular.workflow_id
+        assert saved.reusable_workflow is False
+        assert len(self._rows(db, project)) == 1
+
+    def test_an_unchanged_save_keeps_the_kind(self, db):
+        """A project save posts every workflow. One nobody edited keeps its kind
+        even where its YAML and flag already disagree."""
+        project = _project(db, "SAME")
+        legacy = _workflow(db, project, "deploy")
+        legacy.workflow_yaml = "on: workflow_call"
+        db.commit()
+
+        saved = self._save(db, project, "deploy", listed_reusable=False, content="on: workflow_call")
+
+        assert saved.reusable_workflow is False
+
+    def test_yaml_that_says_nothing_keeps_the_kind(self, db):
+        """Half-typed YAML must not read as 'regular'."""
+        project = _project(db, "HALF")
+        _workflow(db, project, "deploy", is_reusable=True)
+
+        saved = self._save(db, project, "deploy", listed_reusable=True, content="jobs: [unclosed")
+
+        assert saved.reusable_workflow is True
+
+    def test_a_reusable_workflow_projects_workflows_stay_reusable(self, db):
+        project = _project(db, "RWXK")
+        project.project_type = "rwx"
+        db.commit()
+        _workflow(db, project, "deploy", is_reusable=True)
+
+        saved = self._save(db, project, "deploy", listed_reusable=True, content="on: push")
+
+        assert saved.reusable_workflow is True
+
+    def test_an_open_campaign_blocks_the_change(self, db):
+        from fastapi import HTTPException
+        from models import ProjectPullRequest, ProjectRepo, Repo
+        project = _project(db, "OPEN")
+        regular = _workflow(db, project, "deploy")
+        repo = Repo(repo_name="acme/app")
+        db.add(repo); db.commit(); db.refresh(repo)
+        db.add(ProjectRepo(project_id=project.project_id, repo_id=repo.repo_id))
+        pr = ProjectPullRequest(
+            project_id=project.project_id, repo_name="acme/app", pr_number=7,
+            pr_url="https://github.com/acme/app/pull/7", pr_state="open",
+            branch_name="am-branch", target_branch="main", workflow_names="deploy, build",
+        )
+        db.add(pr)
+        record_pr_carries(db, pr, regular)
+
+        with pytest.raises(HTTPException) as refused:
+            self._save(db, project, "deploy", listed_reusable=False, content="on: workflow_call")
+
+        assert refused.value.status_code == 409
+        assert "open PR campaign" in refused.value.detail
+        db.rollback()
+        db.refresh(regular)
+        assert regular.reusable_workflow is False
+
+    def test_a_same_name_pair_cannot_collapse_into_one_kind(self, db):
+        from fastapi import HTTPException
+        project = _project(db, "PAIR")
+        _workflow(db, project, "deploy")
+        _workflow(db, project, "deploy", is_reusable=True)
+
+        with pytest.raises(HTTPException) as refused:
+            self._save(db, project, "deploy", listed_reusable=False, content="on: workflow_call")
+
+        assert refused.value.status_code == 409
+        assert "Rename one of them first" in refused.value.detail
+
+    def test_a_pair_that_already_exists_keeps_saving(self, db):
+        project = _project(db, "KEEP")
+        regular = _workflow(db, project, "deploy")
+        _workflow(db, project, "deploy", is_reusable=True)
+
+        self._save(db, project, "deploy", listed_reusable=False, content="on: pull_request")
+
+        db.refresh(regular)
+        assert regular.workflow_yaml == "on: pull_request"
+        assert regular.reusable_workflow is False
+
+    def test_another_projects_workflow_does_not_count(self, db):
+        other = _project(db, "OTHR")
+        _workflow(db, other, "deploy")
+        project = _project(db, "MINE")
+
+        self._save(db, project, "deploy", listed_reusable=True, content="on: workflow_call")
+
+        mine = self._rows(db, project)
+        assert [(w.workflow_name, w.reusable_workflow) for w in mine] == [("deploy", True)]
+
+    def test_a_tombstone_of_the_other_kind_holds_its_name(self, db):
+        """A removal campaign deletes the file by name, so a new row of either
+        kind would be removed and upserted on one branch. The refusal names the
+        campaign, not a workflow the user can no longer see."""
+        from fastapi import HTTPException
+        project = _project(db, "TOMB")
+        tombstone = _workflow(db, project, "deploy")
+        tombstone.pending_delete = True
+        db.commit()
+
+        with pytest.raises(HTTPException) as refused:
+            self._save(db, project, "deploy", listed_reusable=True, content="on: workflow_call")
+
+        assert refused.value.status_code == 409
+        assert "queued for removal" in refused.value.detail

@@ -35,7 +35,7 @@ from models import (  # noqa: E402
     Base, Account, Project, Repo, ProjectRepo, Workflow, ProjectWorkflow,
     WorkspaceMember, ProjectMembership,
 )
-from auth import user_tokens  # noqa: E402
+from auth import create_auth_session, user_tokens  # noqa: E402
 
 engine = create_engine(
     "sqlite:///:memory:",
@@ -113,9 +113,18 @@ def db_state():
         app.dependency_overrides.pop(projects_get_db, None)
 
 
+def _as(user):
+    """Headers for a request made by *user*, signed in with a real session (#2241)."""
+    db = TestingSessionLocal()
+    try:
+        token = create_auth_session(user, db)
+    finally:
+        db.close()
+    return {"X-GitHub-User": user, "Authorization": f"Bearer {token}"}
+
+
 def _resolve(state, user, *, repo="alice/repo1", expected_sha=None, mode="direct"):
     body = {
-        "github_user": user,
         "repo": repo,
         "branch": "main",
         "resolution": "restore_actionsmanager",
@@ -125,7 +134,7 @@ def _resolve(state, user, *, repo="alice/repo1", expected_sha=None, mode="direct
         body["expected_github_sha"] = expected_sha
     return client.post(
         f"/api/workflows/{state['workflow_id']}/resolve-drift",
-        json=body, headers={"X-GitHub-User": user},
+        json=body, headers=_as(user),
     )
 
 
@@ -133,12 +142,11 @@ def _bulk(state, user, *, repo="alice/repo1"):
     return client.post(
         f"/api/projects/{state['project_id']}/drift/bulk-resolve",
         json={
-            "github_user": user,
             "resolution": "restore_actionsmanager",
             "delivery_mode": "direct",
             "items": [{"workflow_id": state["workflow_id"], "repo": repo, "branch": "main"}],
         },
-        headers={"X-GitHub-User": user},
+        headers=_as(user),
     )
 
 
@@ -175,6 +183,38 @@ class TestEditorRoleRequired:
 
         assert resp.status_code == 200, resp.text
         push.assert_called_once()
+
+
+class TestCallerComesFromTheSession:
+    """Resolving drift acts as the session's caller (#2241), never a name the request carries."""
+
+    def _post_signed_in_as(self, state, user, body_user, params=None):
+        headers = _as(user)
+        del headers["X-GitHub-User"]  # the frontend's GETs and most writes don't send it
+        return client.post(
+            f"/api/workflows/{state['workflow_id']}/resolve-drift",
+            params=params,
+            json={"github_user": body_user, "repo": "alice/repo1", "branch": "main",
+                  "resolution": "restore_actionsmanager", "delivery_mode": "direct"},
+            headers=headers,
+        )
+
+    def test_a_viewer_naming_the_owner_in_the_body_is_still_a_viewer(self, db_state):
+        with patch("workflows._direct_push_workflow_to_branch") as push:
+            resp = self._post_signed_in_as(db_state, VIEWER, body_user=OWNER)
+
+        assert resp.status_code == 403, resp.text
+        push.assert_not_called()
+
+    def test_naming_someone_else_in_the_query_is_refused(self, db_state):
+        """auth.current_account owns the legacy github_user query parameter."""
+        with patch("workflows._direct_push_workflow_to_branch") as push:
+            resp = self._post_signed_in_as(
+                db_state, OWNER, body_user=OWNER, params={"github_user": VIEWER}
+            )
+
+        assert resp.status_code == 403, resp.text
+        push.assert_not_called()
 
 
 class TestTargetRepoMustBelongToProject:
@@ -293,13 +333,12 @@ class TestAdoptingGithubVersionIsAlsoGuarded:
             resp = client.post(
                 f"/api/workflows/{db_state['workflow_id']}/resolve-drift",
                 json={
-                    "github_user": OWNER,
                     "repo": "alice/repo1",
                     "branch": "main",
                     "resolution": "use_github",
                     "expected_github_sha": "sha-A",
                 },
-                headers={"X-GitHub-User": OWNER},
+                headers=_as(OWNER),
             )
 
         assert resp.status_code == 409, resp.text
@@ -312,13 +351,12 @@ class TestAdoptingGithubVersionIsAlsoGuarded:
             resp = client.post(
                 f"/api/workflows/{db_state['workflow_id']}/resolve-drift",
                 json={
-                    "github_user": OWNER,
                     "repo": "alice/repo1",
                     "branch": "main",
                     "resolution": "use_github",
                     "expected_github_sha": "sha-A",
                 },
-                headers={"X-GitHub-User": OWNER},
+                headers=_as(OWNER),
             )
 
         assert resp.status_code == 200, resp.text
@@ -393,7 +431,6 @@ class TestStaleWriteProtection:
             resp = client.post(
                 f"/api/projects/{db_state['project_id']}/drift/bulk-resolve",
                 json={
-                    "github_user": OWNER,
                     "resolution": "restore_actionsmanager",
                     "delivery_mode": "direct",
                     "items": [{
@@ -403,7 +440,7 @@ class TestStaleWriteProtection:
                         "expected_github_sha": "sha-A",
                     }],
                 },
-                headers={"X-GitHub-User": OWNER},
+                headers=_as(OWNER),
             )
 
         assert resp.status_code == 200, resp.text
@@ -416,9 +453,9 @@ class TestSaveWorkflowsRequiresEditor:
     """A save can arm a repository file deletion, so it needs the editor role.
 
     ``_find_project_by_name`` only proves the caller can *see* the project — it
-    never reads ``ProjectMembership.project_role``. Since a save can now set
-    ``Workflow.renamed_from``, and the next campaign turns that into a DELETE of
-    the old filename in every target repository, a read-only member could arm a
+    never reads ``ProjectMembership.project_role``. A save can rename a delivered
+    workflow, and the next campaign turns that into a DELETE of the delivered
+    file in every target repository, so a read-only member could arm a
     deletion. The read-only rename *preview* was already gated at project_editor,
     so the write that performs the rename was the looser of the two.
     """
@@ -427,13 +464,12 @@ class TestSaveWorkflowsRequiresEditor:
         return client.post(
             "/api/save-workflows",
             json={
-                "github_user": user,
                 "project_name": "proj1",
                 "workflows": [{"name": name, "content": "name: ci\non: push",
                                "original_name": original}],
                 "rxworkflows": [],
             },
-            headers={"X-GitHub-User": user},
+            headers=_as(user),
         )
 
     def _workflow(self, state):
@@ -450,8 +486,7 @@ class TestSaveWorkflowsRequiresEditor:
 
         assert resp.status_code == 403, resp.text
         wf = self._workflow(db_state)
-        assert wf.workflow_name == "ci", "the rename must not have been applied"
-        assert wf.renamed_from is None, "no deletion may be armed for a viewer"
+        assert wf.workflow_name == "ci", "the rename, and the deletion it arms, must not have been applied"
 
     def test_project_editor_can_still_rename(self, db_state):
         """The gate must refuse the viewer and nobody else."""

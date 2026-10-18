@@ -1,5 +1,5 @@
 import apiClient from "./apiClient";
-import { createSecrets, getSecrets, deleteSecrets, syncSecret, getSecretsCount } from "./secrets";
+import { createSecrets, getSecrets, deleteSecrets, getSecretsCount } from "./secrets";
 
 import type { Mocked } from 'vitest';
 vi.mock("./apiClient", () => ({
@@ -145,26 +145,6 @@ describe("secrets API", () => {
         })
       );
       expect(mockSetSecrets).toHaveBeenCalledWith([]);
-    });
-  });
-
-  describe("syncSecret", () => {
-    it("posts to sync-secret endpoint", async () => {
-      mockedApiClient.post.mockResolvedValueOnce({ data: { synced: true } });
-
-      const result = await syncSecret("user", "proj", ["org/repo1"], "TOKEN");
-
-      expect(mockedApiClient.post).toHaveBeenCalledWith(
-        expect.stringContaining("/api/sync-secret"),
-        expect.objectContaining({ secret_key: "TOKEN" })
-      );
-      expect(result).toEqual({ synced: true });
-    });
-
-    it("throws on error", async () => {
-      mockedApiClient.post.mockRejectedValueOnce(new Error("failed"));
-
-      await expect(syncSecret("user", "proj", ["repo"], "KEY")).rejects.toThrow("failed");
     });
   });
 

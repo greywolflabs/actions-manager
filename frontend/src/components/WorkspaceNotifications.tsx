@@ -27,7 +27,7 @@ const tabButtonClassName = (isActive: boolean): string =>
   }`;
 
 const inputSelectClassName =
-  "flex h-9 w-full rounded-md border px-3 py-1 text-sm shadow-sm transition-colors border-input-border bg-input-background-color text-text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-input-focus dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100";
+  "flex h-9 w-full rounded-md border px-3 py-1 text-sm shadow-sm transition-colors border-input-border bg-input-background-color text-text-primary focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-input-focus dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100";
 
 const WorkspaceNotifications: React.FC<WorkspaceNotificationsProps> = ({ currentUser, currentUserRole }) => {
   const isAdmin = currentUserRole === "admin";

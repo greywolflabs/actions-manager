@@ -2,8 +2,8 @@
 Entitlements: what an account may do in ActionsManager, and its limits.
 
 Core ships the self-hosted rules: the installation's license tier plus the
-self-hosted beta limits. The cloud entrypoint installs its own rules
-(cloud.entitlements) over them at startup with use(), so nothing here knows
+self-hosted beta limits. The cloud build installs its own rules over them
+at startup with use(), so nothing here knows
 which deployment it runs in. Callers use the module-level functions, which
 answer from whichever rules are installed.
 """
@@ -95,9 +95,9 @@ def check_project_type_limit(
 class Entitlements:
     """The tier rules the functions below answer from.
 
-    SelfHostedEntitlements is core's; cloud.entitlements.CloudEntitlements is
-    the cloud's. A rule an implementation leaves out raises rather than
-    quietly applying the other deployment's limit.
+    SelfHostedEntitlements is core's; the cloud build supplies its own. A
+    rule an implementation leaves out raises rather than quietly applying
+    the other deployment's limit.
 
     A ``*_limit`` method returning ``None`` means the resource is not limited
     for that account, and the caller skips counting it.
@@ -335,23 +335,6 @@ def environment_sync_limit_message(limit: int, current: int, new: int) -> str:
 def describe_plan(account: Account) -> dict:
     """The account's plan as GET /api/user/{username} returns it for the UI."""
     return _entitlements.plan(account)
-
-
-def check_private_repo_access(account: Account) -> Tuple[bool, Optional[str]]:
-    """
-    Check if account can access private repositories.
-
-    Private repositories are part of the core product and are available on
-    every tier. This function is retained for backwards compatibility but
-    always returns ``(True, None)``.
-
-    Args:
-        account: Account object
-
-    Returns:
-        Tuple of (allowed: bool, error_message: Optional[str])
-    """
-    return True, None
 
 
 def check_repo_limit(account: Account, repo_count: int) -> Tuple[bool, Optional[str]]:

@@ -16,7 +16,7 @@ const rejectWith = (status: number, data: unknown) => {
 };
 
 const callUpdate = () =>
-  updateWorkflows("alice", ["org/repo"], [], [], "", "default", "Payments");
+  updateWorkflows("Payments", ["org/repo"], {});
 
 describe("updateWorkflows", () => {
   beforeEach(() => vi.clearAllMocks());

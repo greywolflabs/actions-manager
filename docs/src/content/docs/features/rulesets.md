@@ -20,16 +20,17 @@ Rulesets live under **🛡️ Environment Rulesets** on the project page.
 
 ## Adding a ruleset
 
-Two ways in, both storing the same thing:
+Rulesets are added by uploading a JSON file. The file must end in `.json` and contain a JSON object. Its `name` and `description` fields become the ruleset's name and description; without a `name`, the filename is used. The name must be non-blank text of at most 255 characters and the description text of at most 500. Anything else is rejected and nothing is stored, as is a file that is not valid JSON. Files saved as UTF-16, or as UTF-8 with a byte-order mark, are read like any other.
 
-- **Upload a JSON file.** The file must end in `.json` and contain a JSON object. Its `name` and `description` fields become the ruleset's name and description; without a `name`, the filename is used.
-- **Create from JSON** pasted in directly, with a name and optional description supplied alongside it.
+There is no form for pasting JSON in. The API also accepts a ruleset as JSON in the request body, with a name and optional description alongside it (`POST /api/rulesets/create`), but nothing in the interface calls it.
 
 The easiest way to get a valid file is to export an existing ruleset from a repository that already has the rules you want, through GitHub's own ruleset UI or API.
 
 A ruleset uploaded from a project page is associated with that project. That association is what later decides which repositories a GitHub-side removal reaches, so it matters more than it looks — see [Which repositories a removal reaches](#which-repositories-a-removal-reaches).
 
-The association is made only if the project name resolves to a project owned by the same account. If it does not, the ruleset is still stored and the upload still reports success — but with no project attached, so a later GitHub-side removal resolves no repositories and reports that it removed nothing.
+It is associated with the project it was uploaded to, whoever owns that project: a workspace admin, or a member with editor access, uploading to someone else's project associates the ruleset there. If the project name does not resolve to a project you can edit, nothing is stored and the upload fails.
+
+A ruleset ends up with no project in two ways: it was created through the API without a `project_name`, or the project it belonged to was deleted. Deleting a project removes its association with each ruleset but keeps the rulesets themselves.
 
 ## Applying a ruleset
 
@@ -43,13 +44,19 @@ Apply always **creates**; it never updates a copy already on the repository. Re-
 
 ### Permissions
 
-Rulesets are repository administration. Your GitHub token needs **admin access** to each repository you apply to, read or remove from. Without it GitHub returns 403 and ActionsManager reports that repository as failed rather than failing the whole operation. Rulesets need the **Administration: Read and write** permission — see [GitHub Permissions](../troubleshooting/github-permissions.html) for the full table and [GitHub PAT Setup](../getting-started/github-pat-setup.html) for creating the token.
+Who added a ruleset does not matter once it belongs to a project. Anyone who can edit the project can apply, sync and remove it, and anyone else who can see the project can check its sync status. Read Only users are the exception: the check is sent as a write request, which their role does not allow. A ruleset attached to no project can only be used by the account that added it.
+
+On GitHub's side, a ruleset is repository administration, so your GitHub token needs **admin access** to each repository you apply to, read or remove from. Without it GitHub returns 403 and ActionsManager reports that repository as failed rather than failing the whole operation. Rulesets need the **Administration: Read and write** permission — see [GitHub Permissions](../troubleshooting/github-permissions.html) for the full table and [GitHub PAT Setup](../getting-started/github-pat-setup.html) for creating the token.
 
 Apply reports a failed repository without saying why — the reason GitHub gave (permission denied, repository not found, validation error) is written to the backend log. Check there when a repository fails and the cause is not obvious. The sync panel does distinguish the cases, so it is often the quicker answer.
 
 ## Checking which repositories have it
 
 The sync panel reads each selected repository's rulesets from GitHub and matches on the ruleset's **name** — the `name` inside the stored JSON, which can differ from the name shown in ActionsManager if the JSON was edited after import.
+
+When the JSON has no `name` (or an empty one), the name shown in ActionsManager is used instead. Apply and removal use the same name, so all three find the same copy on GitHub.
+
+> **Earlier versions applied a nameless ruleset as "Imported Ruleset".** ActionsManager does not look for copies by that name, so the sync panel cannot see them and removing the ruleset from GitHub leaves them enforced. If you applied a ruleset without a `name` before this changed, delete any "Imported Ruleset" on those repositories in GitHub's own ruleset settings.
 
 Each repository comes back as one of:
 
@@ -90,7 +97,7 @@ A GitHub-side removal does not ask you which repositories to touch. It resolves 
 Two consequences worth knowing:
 
 - A repository that was never saved to the project — ticked in Repositories & Branches but not saved — is not reached, even if Apply reached it. This is a known gap, tracked in [issue #2054](https://github.com/greywolflabs/actions-manager/issues/2054): Apply trusts the current selection while removal resolves saved rows, so the two can disagree and leave a ruleset enforced with nothing in ActionsManager tracking it. **Save your repository selection before applying a ruleset you may later want to remove.**
-- A ruleset associated with no project resolves no repositories at all — including one whose upload silently failed to attach it, as above. Rather than reporting a removal that touched nothing, ActionsManager says the ruleset was not applied to any of the project's repositories.
+- A ruleset associated with no project — created through the API without a `project_name`, or left behind by a deleted project — resolves no repositories at all. Rather than reporting a removal that touched nothing, ActionsManager says the ruleset was not applied to any of the project's repositories.
 
 A repository that has no ruleset by that name is not an error — it was never applied, or was already removed by hand, and that is an acceptable end state.
 

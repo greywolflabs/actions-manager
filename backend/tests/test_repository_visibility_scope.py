@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from models import Base, Account, Project  # noqa: E402
 from main import app  # noqa: E402
 from projects import get_db  # noqa: E402
+from auth import create_auth_session  # noqa: E402
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test_project_visibility_scope.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
@@ -64,6 +65,13 @@ class TestRepositoryVisibilityScope:
     def setup_method(self):
         self.client = TestClient(app)
 
+    def _signed_in(self, github_user):
+        db = TestingSessionLocal()
+        try:
+            return {"Authorization": f"Bearer {create_auth_session(github_user, db)}"}
+        finally:
+            db.close()
+
     def _payload(self, github_user, name, scope=None):
         body = {
             "github_user": github_user,
@@ -81,7 +89,7 @@ class TestRepositoryVisibilityScope:
 
     def test_default_visibility_is_public(self):
         """Omitting repository_visibility_scope defaults to 'public' (back-compat)."""
-        resp = self.client.post("/api/projects/", json=self._payload("freevisuser", "Default Scope"))
+        resp = self.client.post("/api/projects/", headers=self._signed_in("freevisuser"), json=self._payload("freevisuser", "Default Scope"))
         assert resp.status_code == 200, resp.text
 
         db = TestingSessionLocal()
@@ -95,6 +103,7 @@ class TestRepositoryVisibilityScope:
     def test_free_user_can_create_public_project(self):
         resp = self.client.post(
             "/api/projects/",
+            headers=self._signed_in("freevisuser"),
             json=self._payload("freevisuser", "Free Public", scope="public"),
         )
         assert resp.status_code == 200, resp.text
@@ -104,6 +113,7 @@ class TestRepositoryVisibilityScope:
         """Schema validator rejects values other than 'public'/'private'."""
         resp = self.client.post(
             "/api/projects/",
+            headers=self._signed_in("provisuser"),
             json=self._payload("provisuser", "Bad Scope", scope="mixed"),
         )
         assert resp.status_code == 422, resp.text
@@ -111,6 +121,7 @@ class TestRepositoryVisibilityScope:
     def test_scope_normalized_case(self):
         resp = self.client.post(
             "/api/projects/",
+            headers=self._signed_in("provisuser"),
             json=self._payload("provisuser", "Cased Scope", scope="PRIVATE"),
         )
         assert resp.status_code == 200, resp.text
@@ -124,9 +135,10 @@ class TestRepositoryVisibilityScope:
     def test_get_projects_includes_visibility_scope(self):
         self.client.post(
             "/api/projects/",
+            headers=self._signed_in("provisuser"),
             json=self._payload("provisuser", "Listed Project", scope="private"),
         )
-        resp = self.client.get("/api/projects/?github_user=provisuser")
+        resp = self.client.get("/api/projects/?github_user=provisuser", headers=self._signed_in("provisuser"))
         assert resp.status_code == 200, resp.text
         items = resp.json()
         assert any(
@@ -139,6 +151,7 @@ class TestRepositoryVisibilityScope:
         """Legacy update callers that omit the scope must not flip private projects to public."""
         create_resp = self.client.post(
             "/api/projects/",
+            headers=self._signed_in("provisuser"),
             json=self._payload("provisuser", "Private Update Preserve", scope="private"),
         )
         assert create_resp.status_code == 200, create_resp.text
@@ -146,6 +159,7 @@ class TestRepositoryVisibilityScope:
         project_id = create_resp.json()["project_id"]
         update_resp = self.client.put(
             f"/api/projects/{project_id}/",
+            headers=self._signed_in("provisuser"),
             json=self._payload("provisuser", "Private Update Preserve"),
         )
         assert update_resp.status_code == 200, update_resp.text
@@ -222,7 +236,7 @@ class TestRepositoryVisibilityScope:
         finally:
             db.close()
 
-        resp = self.client.get("/api/projects/?github_user=provisuser")
+        resp = self.client.get("/api/projects/?github_user=provisuser", headers=self._signed_in("provisuser"))
         assert resp.status_code == 200
         items = resp.json()
         legacy = next(p for p in items if p["project_name"] == "Legacy Project")

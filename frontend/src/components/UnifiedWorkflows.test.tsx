@@ -1,18 +1,25 @@
-import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import React, { useState } from 'react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import UnifiedWorkflows from './UnifiedWorkflows';
 import { toast } from '../utils/toast';
 import { guiToYaml } from '../utils/workflowGuiConversion';
+import * as yaml from 'js-yaml';
 
 // The list only needs to let a test select a workflow.
 vi.mock('./UnifiedWorkflowList', () => ({
-  default: function UnifiedWorkflowList({ unifiedWorkflows, handleSelectWorkflow }: any) {
+  default: function UnifiedWorkflowList({ unifiedWorkflows, handleSelectWorkflow, selectedWorkflowId }: any) {
     return (
       <div>
         {unifiedWorkflows.map((w: any) => (
-          <button key={w.id} data-testid={`select-${w.id}`} onClick={() => handleSelectWorkflow(w.id)}>
+          <button
+            type="button"
+            key={w.id}
+            data-testid={`select-${w.id}`}
+            aria-pressed={w.id === selectedWorkflowId}
+            onClick={() => handleSelectWorkflow(w.id)}
+          >
             {w.name}
           </button>
         ))}
@@ -65,6 +72,21 @@ vi.mock('./UnifiedWorkflowEditor', () => ({
         >
           Edit in GUI
         </button>
+        <button
+          type="button"
+          data-testid="edit-step-in-gui"
+          onClick={() => {
+            const [job, ...otherJobs] = regularGuiWorkflow.jobs;
+            const [step, ...otherSteps] = job.steps;
+            const edited = { ...job, steps: [{ ...step, run: 'echo changed' }, ...otherSteps] };
+            handleWorkflowChange('content', guiToYaml({ ...regularGuiWorkflow, jobs: [edited, ...otherJobs] }));
+          }}
+        >
+          Edit a step in GUI
+        </button>
+        <button type="button" data-testid="rename-file" onClick={() => handleWorkflowChange('name', 'renamed')}>
+          Rename file
+        </button>
       </div>
     );
   },
@@ -79,8 +101,14 @@ vi.mock('../utils/toast', () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
 }));
 
+// Captured so a test can hand the component a save's kind changes the way the
+// editor's draft save does.
+let capturedOperationsProps: any = null;
+
 vi.mock('../hooks/useWorkflowOperations', () => ({
-  useWorkflowOperations: () => ({
+  useWorkflowOperations: (props: any) => {
+    capturedOperationsProps = props;
+    return {
     fetchWorkflowsCount: vi.fn(),
     openWorkflowCreationDialog: vi.fn(),
     selectWorkflowType: vi.fn(),
@@ -91,7 +119,8 @@ vi.mock('../hooks/useWorkflowOperations', () => ({
     handleCommitAndUpdatePRLinked: vi.fn(),
     handleDeleteWorkflow: vi.fn(),
     handleUnlinkWorkflow: vi.fn(),
-  }),
+    };
+  },
 }));
 
 const ORIGINAL_YAML =
@@ -122,6 +151,23 @@ function renderSubject(overrides: Record<string, unknown> = {}) {
 }
 
 const guiModel = () => JSON.parse(screen.getByTestId('gui-model').textContent || '{}');
+
+// The parent owns workflow state; apply the last write the way ProjectMgmt does.
+const lastWrite = (setWorkflows: ReturnType<typeof vi.fn>, previous: unknown[]) => {
+  const update = setWorkflows.mock.calls.at(-1)?.[0];
+  return typeof update === 'function' ? update(previous) : update;
+};
+
+const LABELLED_YAML =
+  'name: Build and Test\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo original\n';
+
+// The GUI model stores branch filters as a list, so a GUI edit would rewrite
+// `branches: main` as one.
+const LOSSY_YAML =
+  'name: CI\non:\n  push:\n    branches: main\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n';
+const LOSSY_REFUSAL =
+  "GUI mode can't edit this workflow without changing it (on.push.branches). Keep editing in YAML.";
+const BROKEN_YAML = 'name: [unclosed\non: push';
 
 describe('UnifiedWorkflows YAML/GUI mode switching', () => {
   beforeEach(() => {
@@ -206,6 +252,156 @@ describe('UnifiedWorkflows YAML/GUI mode switching', () => {
     expect(setWorkflows).not.toHaveBeenCalled();
   });
 
+  test('a GUI step edit keeps a name: label that differs from the filename', async () => {
+    const user = userEvent.setup();
+    const { setWorkflows, props } = renderSubject({ workflows: [{ name: 'build', content: LABELLED_YAML }] });
+
+    await user.click(screen.getByTestId('select-regular-0'));
+    await user.click(screen.getByTestId('switch-to-gui'));
+    await waitFor(() => expect(screen.getByTestId('edit-mode')).toHaveTextContent('gui'));
+
+    setWorkflows.mockClear();
+    await user.click(screen.getByTestId('edit-step-in-gui'));
+
+    const written = yaml.load(lastWrite(setWorkflows, props.workflows)[0].content) as any;
+    expect(written.name).toBe('Build and Test');
+    expect(written.jobs.build.steps[0].run).toBe('echo changed');
+  });
+
+  test('renaming the file does not rewrite the name: label', async () => {
+    const user = userEvent.setup();
+    const { rerender, setWorkflows, props } = renderSubject({
+      workflows: [{ name: 'build', content: LABELLED_YAML }],
+    });
+
+    await user.click(screen.getByTestId('select-regular-0'));
+    await user.click(screen.getByTestId('rename-file'));
+    const renamed = lastWrite(setWorkflows, props.workflows);
+    rerender(<UnifiedWorkflows {...props} workflows={renamed} />);
+
+    await user.click(screen.getByTestId('switch-to-gui'));
+    await waitFor(() => expect(screen.getByTestId('edit-mode')).toHaveTextContent('gui'));
+    expect(guiModel().name).toBe('Build and Test');
+
+    await user.click(screen.getByTestId('edit-step-in-gui'));
+    expect((yaml.load(lastWrite(setWorkflows, renamed)[0].content) as any).name).toBe('Build and Test');
+  });
+
+  test('refuses GUI mode for a workflow it cannot edit without changing it', async () => {
+    const user = userEvent.setup();
+    const { setWorkflows } = renderSubject({ workflows: [{ name: 'scalar', content: LOSSY_YAML }] });
+
+    await user.click(screen.getByTestId('select-regular-0'));
+    await user.click(screen.getByTestId('switch-to-gui'));
+
+    expect(screen.getByTestId('edit-mode')).toHaveTextContent('yaml');
+    expect(toast.error).toHaveBeenCalledWith(LOSSY_REFUSAL);
+    expect(setWorkflows).not.toHaveBeenCalled();
+  });
+
+  test('names at most three paths in the refusal', async () => {
+    const user = userEvent.setup();
+    const content =
+      'name: CI\non:\n  push:\n    branches: main\n    paths: src\n    tags: v1\n' +
+      '  pull_request:\n    branches: main\n    paths: src\n' +
+      'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n';
+    renderSubject({ workflows: [{ name: 'scalars', content }] });
+
+    await user.click(screen.getByTestId('select-regular-0'));
+    await user.click(screen.getByTestId('switch-to-gui'));
+
+    expect(toast.error).toHaveBeenCalledWith(
+      "GUI mode can't edit this workflow without changing it " +
+        '(on.push.branches, on.push.paths, on.push.tags +2 more). Keep editing in YAML.'
+    );
+  });
+
+  test('enters GUI mode for a workflow it can edit without changing it', async () => {
+    const user = userEvent.setup();
+    renderSubject();
+
+    await user.click(screen.getByTestId('select-regular-0'));
+    await user.click(screen.getByTestId('switch-to-gui'));
+
+    await waitFor(() => expect(screen.getByTestId('edit-mode')).toHaveTextContent('gui'));
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test('in GUI mode, selecting a workflow it cannot edit drops to YAML', async () => {
+    const user = userEvent.setup();
+    const { setWorkflows } = renderSubject({
+      workflows: [
+        { name: 'build', content: ORIGINAL_YAML },
+        { name: 'scalar', content: LOSSY_YAML },
+      ],
+    });
+
+    await user.click(screen.getByTestId('select-regular-0'));
+    await user.click(screen.getByTestId('switch-to-gui'));
+    await waitFor(() => expect(screen.getByTestId('edit-mode')).toHaveTextContent('gui'));
+
+    await user.click(screen.getByTestId('select-regular-1'));
+
+    expect(screen.getByTestId('edit-mode')).toHaveTextContent('yaml');
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(toast.error).toHaveBeenCalledWith(LOSSY_REFUSAL);
+    expect(setWorkflows).not.toHaveBeenCalled();
+  });
+
+  test('in GUI mode, selecting a workflow whose YAML does not parse drops to YAML', async () => {
+    const user = userEvent.setup();
+    const { setWorkflows } = renderSubject({
+      workflows: [
+        { name: 'build', content: ORIGINAL_YAML },
+        { name: 'broken', content: BROKEN_YAML },
+      ],
+    });
+
+    await user.click(screen.getByTestId('select-regular-0'));
+    await user.click(screen.getByTestId('switch-to-gui'));
+    await waitFor(() => expect(screen.getByTestId('edit-mode')).toHaveTextContent('gui'));
+
+    await user.click(screen.getByTestId('select-regular-1'));
+
+    expect(screen.getByTestId('edit-mode')).toHaveTextContent('yaml');
+    expect(toast.error).toHaveBeenCalledWith('Fix the YAML errors before switching to GUI mode.');
+    expect(setWorkflows).not.toHaveBeenCalled();
+  });
+
+  test('in GUI mode, selecting a linked workflow is left alone', async () => {
+    const user = userEvent.setup();
+    renderSubject({
+      linkedWorkflows: [{ workflow_id: 7, workflow_name: 'shared', workflow_yaml: LOSSY_YAML }],
+    });
+
+    await user.click(screen.getByTestId('select-regular-0'));
+    await user.click(screen.getByTestId('switch-to-gui'));
+    await waitFor(() => expect(screen.getByTestId('edit-mode')).toHaveTextContent('gui'));
+
+    await user.click(screen.getByTestId('select-linked-7'));
+
+    expect(screen.getByTestId('edit-mode')).toHaveTextContent('gui');
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  // Clicking GUI while already in GUI mode reloads the model from the current
+  // YAML, which may have changed (a restored version) to something it can't edit.
+  test('in GUI mode, clicking GUI for YAML it cannot edit drops to YAML', async () => {
+    const user = userEvent.setup();
+    const { rerender, setWorkflows, props } = renderSubject();
+
+    await user.click(screen.getByTestId('select-regular-0'));
+    await user.click(screen.getByTestId('switch-to-gui'));
+    await waitFor(() => expect(screen.getByTestId('edit-mode')).toHaveTextContent('gui'));
+
+    rerender(<UnifiedWorkflows {...props} workflows={[{ name: 'build', content: LOSSY_YAML }]} />);
+    await user.click(screen.getByTestId('switch-to-gui'));
+
+    expect(screen.getByTestId('edit-mode')).toHaveTextContent('yaml');
+    expect(toast.error).toHaveBeenCalledWith(LOSSY_REFUSAL);
+    expect(setWorkflows).not.toHaveBeenCalled();
+  });
+
   test('switching back to YAML is never blocked', async () => {
     const user = userEvent.setup();
     renderSubject();
@@ -251,5 +447,89 @@ describe('reusable workflows owned by a caller project', () => {
     });
 
     expect(screen.getByTestId('select-reusable-0')).toBeInTheDocument();
+  });
+});
+
+describe('a save that changes a workflow\'s kind (#2318)', () => {
+  const CHANGE = { name: 'deploy', is_reusable: true, workflow_status: 'committed_locally' };
+
+  // ProjectMgmt owns the lists; this holds them in real state so a move has
+  // to re-render to be seen, the way it must in the app. "parent-move" does
+  // what ProjectMgmt does after a project save: follower first, then the move.
+  function Harness({ onRegister }: Readonly<{ onRegister?: (fn: ((changes: any[]) => void) | null) => void }>) {
+    const [workflows, setWorkflows] = useState<any[]>([
+      { name: 'build', content: ORIGINAL_YAML },
+      { name: 'deploy', content: 'on: workflow_call' },
+    ]);
+    const [rxworkflows, setRxworkflows] = useState<any[]>([]);
+    const [follower, setFollower] = useState<((changes: any[]) => void) | null>(null);
+    const register = (fn: ((changes: any[]) => void) | null) => {
+      setFollower(() => fn);
+      onRegister?.(fn);
+    };
+    return (
+      <>
+        <button
+          type="button"
+          data-testid="parent-move"
+          onClick={() => {
+            follower?.([CHANGE]);
+            setWorkflows(prev => prev.filter(w => w.name !== 'deploy'));
+            setRxworkflows(prev => [...prev, { ...workflows[1], isReusable: true }]);
+          }}
+        />
+        <UnifiedWorkflows
+          {...({
+            user: 'test-user', projectName: 'test-project', projectCode: 'TEST',
+            selectedRepos: ['acme/web'], regexPattern: '', detectedBuildTypes: [],
+            reusableWorkflowsEnabled: false, addWorkflowToMain: vi.fn(),
+            onGenerateTemplates: vi.fn(), onAddRXWorkflow: vi.fn(),
+            workflows, setWorkflows, rxworkflows, setRXWorkflows: setRxworkflows,
+            onRegisterSelectionFollower: register,
+          } as any)}
+        />
+      </>
+    );
+  }
+
+  const expectDeployMovedAndSelected = () => {
+    expect(screen.queryByTestId('select-regular-1')).not.toBeInTheDocument();
+    expect(screen.getByTestId('select-reusable-0')).toHaveTextContent('deploy');
+    expect(screen.getByTestId('select-reusable-0')).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('select-regular-0')).toHaveTextContent('build');
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  test('the editor\'s save moves it to the other section without a reload, still selected', async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    await user.click(screen.getByTestId('select-regular-1'));
+    act(() => capturedOperationsProps.applyKindChanges([CHANGE]));
+
+    expectDeployMovedAndSelected();
+  });
+
+  test('when the project save moves it, the selection follows', async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    await user.click(screen.getByTestId('select-regular-1'));
+    await user.click(screen.getByTestId('parent-move'));
+
+    expectDeployMovedAndSelected();
+  });
+
+  test('unmounting withdraws the follower, so the parent never calls a stale one', () => {
+    const onRegister = vi.fn();
+    const { unmount } = render(<Harness onRegister={onRegister} />);
+    expect(onRegister).toHaveBeenLastCalledWith(expect.any(Function));
+
+    unmount();
+
+    expect(onRegister).toHaveBeenLastCalledWith(null);
   });
 });

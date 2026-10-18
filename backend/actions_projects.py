@@ -14,7 +14,7 @@ from typing import Annotated, List, Literal, Optional, Tuple
 
 import requests
 import yaml
-from fastapi import APIRouter, HTTPException, Depends, Query, Request
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -27,8 +27,10 @@ from workflows import (
     ACCEPT_HEADER,
     X_API_VERSION,
     GITHUB_TIMEOUT_SECONDS,
+    DriftCheckUnavailable,
     get_default_branch,
 )
+from error_detail import failure_kind
 
 router = APIRouter()
 
@@ -83,7 +85,6 @@ class PreviewResponse(BaseModel):
 
 
 class CreateActionsProjectRequest(BaseModel):
-    github_user: str
     name: str
     description: Optional[str] = None
     source_url: str
@@ -97,7 +98,6 @@ class CreateActionsProjectRequest(BaseModel):
 
 
 class UpdateActionsProjectRequest(BaseModel):
-    github_user: str
     name: str
     description: Optional[str] = None
     inputs: List[ActionInput] = []
@@ -140,7 +140,8 @@ def _resolve_marketplace_action(slug: str):
     try:
         response = requests.get(url, timeout=GITHUB_TIMEOUT_SECONDS)
     except Exception as e:
-        raise _ApiError(502, f"Failed to reach GitHub Marketplace: {str(e)}")
+        print(f"❌ Failed to reach GitHub Marketplace: {e}")
+        raise _ApiError(502, f"Failed to reach GitHub Marketplace: {failure_kind(e)}")
 
     if response.status_code == 404:
         raise _ApiError(404, f"No marketplace action found for '{slug}'")
@@ -251,7 +252,8 @@ def _fetch_repo_file(owner: str, repo: str, ref: str, path: str, token: str) -> 
     try:
         response = requests.get(file_url, headers=headers, timeout=GITHUB_TIMEOUT_SECONDS)
     except Exception as e:
-        raise _ApiError(502, f"GitHub API request failed: {str(e)}")
+        print(f"❌ GitHub API request failed: {e}")
+        raise _ApiError(502, f"GitHub API request failed: {failure_kind(e)}")
 
     if response.status_code == 404:
         raise _ApiError(404, f"File not found: {path}")
@@ -287,17 +289,11 @@ def _fetch_actions_file_in_dir(owner: str, repo: str, ref: str, search_dir: str,
     raise last_error
 
 
-def _require_token(request: Request, db: Session, github_user: str) -> str:
-    """Verify the caller's actual session belongs to github_user, then return
-    their stored GitHub token. github_user is client-supplied (query param or
-    request body), so it must never be trusted as identity on its own -
-    resolve_authenticated_user reads the server-issued session cookie instead."""
-    account = auth_module.resolve_authenticated_user(request, db)
-    if account.github_user.lower() != github_user.lower():
-        raise _ApiError(403, "Access denied")
-    if github_user not in user_tokens:
+def _require_token(account: Account) -> str:
+    """The session caller's stored GitHub token (#2241), or 401 when none is held."""
+    if account.github_user not in user_tokens:
         raise _ApiError(401, _MSG_NOT_AUTHENTICATED)
-    return user_tokens[github_user]
+    return user_tokens[account.github_user]
 
 
 def _get_project_or_404(db: Session, actions_project_id: int) -> ActionsProject:
@@ -348,14 +344,13 @@ def _to_response(project: ActionsProject) -> ActionsProjectResponse:
     },
 )
 def preview_actions_project(
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
     url: Annotated[str, Query(..., description="GitHub repo or actions.yaml file URL")],
 ):
     """Fetch and parse an action's metadata file from the pasted URL. Persists nothing."""
     try:
-        token = _require_token(request, db, github_user)
+        token = _require_token(account)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
@@ -374,12 +369,16 @@ def preview_actions_project(
         }
         try:
             ref = get_default_branch(owner, repo, headers)
+        except DriftCheckUnavailable as e:
+            # Its message is only what GitHub answered for this repo, so it can be shown.
+            raise HTTPException(status_code=502, detail=str(e))
         except Exception as e:
             # Say we couldn't read the repo rather than guessing a branch and
             # reporting "action.yml not found" for a repo that has one.
+            print(f"❌ Could not determine a repository's default branch: {e}")
             raise HTTPException(
                 status_code=502,
-                detail=f"Could not determine the default branch of {owner}/{repo}: {e}",
+                detail=f"Could not determine the default branch of {owner}/{repo}",
             )
 
     try:
@@ -421,18 +420,14 @@ def preview_actions_project(
     responses={401: {"description": _MSG_NOT_AUTHENTICATED}},
 )
 def create_actions_project(
-    request: Request,
     payload: CreateActionsProjectRequest,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, payload.github_user)
+        _require_token(account)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
-
-    account = db.query(Account).filter_by(github_user=payload.github_user).first()
-    if not account:
-        raise HTTPException(status_code=401, detail=_MSG_NOT_AUTHENTICATED)
 
     project = ActionsProject(
         user_id=account.user_id,
@@ -446,7 +441,7 @@ def create_actions_project(
         inputs_json=json.dumps([i.model_dump() for i in payload.inputs]),
         branding_icon=payload.branding_icon,
         branding_color=payload.branding_color,
-        last_modified_by=payload.github_user,
+        last_modified_by=account.github_user,
     )
     db.add(project)
     db.commit()
@@ -460,14 +455,13 @@ def create_actions_project(
     responses={401: {"description": _MSG_NOT_AUTHENTICATED}},
 )
 def list_actions_projects(
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
 ):
     """Shared, workspace-wide catalog — returns every Actions Project regardless
     of who imported it, not just the caller's own."""
     try:
-        _require_token(request, db, github_user)
+        _require_token(account)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
@@ -484,13 +478,12 @@ def list_actions_projects(
     },
 )
 def get_actions_project(
-    request: Request,
     actions_project_id: int,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, github_user)
+        _require_token(account)
         project = _get_project_or_404(db, actions_project_id)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -506,20 +499,20 @@ def get_actions_project(
     },
 )
 def update_actions_project(
-    request: Request,
     actions_project_id: int,
     payload: UpdateActionsProjectRequest,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, payload.github_user)
+        _require_token(account)
         project = _get_project_or_404(db, actions_project_id)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     project.name = payload.name
     project.description = payload.description
     project.inputs_json = json.dumps([i.model_dump() for i in payload.inputs])
-    project.last_modified_by = payload.github_user
+    project.last_modified_by = account.github_user
     db.commit()
     db.refresh(project)
     return _to_response(project)
@@ -534,13 +527,12 @@ def update_actions_project(
     },
 )
 def delete_actions_project(
-    request: Request,
     actions_project_id: int,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, github_user)
+        _require_token(account)
         project = _get_project_or_404(db, actions_project_id)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)

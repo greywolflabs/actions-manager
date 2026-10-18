@@ -148,27 +148,53 @@ class TestPathValidation:
 
 class TestCustomFilesAPI:
     @pytest.fixture(autouse=True)
-    def setup(self):
+    def setup(self, authenticate_client):
         app.dependency_overrides[get_db] = override_get_db
         Base.metadata.create_all(bind=engine)
         self.db = TestingSessionLocal()
         self.client = TestClient(app)
+        # The caller comes from the session (#2241).
+        self.sign_in = lambda user: authenticate_client(self.client, user, TestingSessionLocal)
+        self.sign_in(TEST_USER)
         yield
         self.db.close()
         Base.metadata.drop_all(bind=engine)
         app.dependency_overrides.pop(get_db, None)
 
     def test_list_unauthenticated_returns_401(self):
+        """Signed in, but with no GitHub token stored for the caller."""
         _, project = _seed(self.db)
         resp = self.client.get(f"/api/projects/{project.project_id}/custom-files")
         assert resp.status_code == 401
+
+    def test_a_name_in_the_body_is_ignored(self):
+        """The caller comes from the session (#2241): a github_user the body still
+        carries changes nothing, and the file is recorded as the caller's."""
+        _, project = _seed(self.db)
+        with patch("custom_files.user_tokens", {TEST_USER: "fake-token", "someone-else": "their-token"}):
+            resp = self.client.post(
+                f"/api/projects/{project.project_id}/custom-files",
+                json={"github_user": "someone-else", "file_path": ".github/scripts/build.sh", "file_content": "x"},
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["custom_file"]["last_modified_by"] == TEST_USER
+
+    @pytest.mark.parametrize("method", ["get", "delete"])
+    def test_naming_someone_else_in_the_query_is_refused(self, method):
+        """auth.current_account owns the legacy github_user query parameter."""
+        _, project = _seed(self.db)
+        path = f"/api/projects/{project.project_id}/custom-files"
+        if method == "delete":
+            path += "/1"
+        with patch("custom_files.user_tokens", {TEST_USER: "fake-token", "someone-else": "their-token"}):
+            resp = self.client.request(method.upper(), path, params={"github_user": "someone-else"})
+        assert resp.status_code == 403, resp.text
 
     def test_list_returns_empty_for_new_project(self):
         _, project = _seed(self.db)
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.get(
                 f"/api/projects/{project.project_id}/custom-files",
-                headers={"X-GitHub-User": TEST_USER},
             )
         assert resp.status_code == 200
         assert resp.json()["custom_files"] == []
@@ -179,12 +205,10 @@ class TestCustomFilesAPI:
             resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
                 json={
-                    "github_user": TEST_USER,
                     "file_path": ".github/scripts/build.sh",
                     "file_content": "#!/bin/bash\necho hello",
                     "display_name": "Build Script",
                 },
-                headers={"X-GitHub-User": TEST_USER},
             )
         assert resp.status_code == 200
         data = resp.json()["custom_file"]
@@ -198,13 +222,11 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": "sonar-project.properties", "file_content": ""},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": "sonar-project.properties", "file_content": ""},
             )
             resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": "sonar-project.properties", "file_content": "x"},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": "sonar-project.properties", "file_content": "x"},
             )
         assert resp.status_code == 409
 
@@ -213,8 +235,7 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": "/etc/passwd", "file_content": ""},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": "/etc/passwd", "file_content": ""},
             )
         assert resp.status_code == 400
 
@@ -223,8 +244,7 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": "../../secret", "file_content": ""},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": "../../secret", "file_content": ""},
             )
         assert resp.status_code == 400
 
@@ -233,8 +253,7 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": ".env.production", "file_content": ""},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": ".env.production", "file_content": ""},
             )
         assert resp.status_code == 400
 
@@ -243,8 +262,7 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": "private.pem", "file_content": ""},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": "private.pem", "file_content": ""},
             )
         assert resp.status_code == 400
 
@@ -267,8 +285,7 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.post(
                 f"/api/projects/{other_project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": "sonar.properties", "file_content": ""},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": "sonar.properties", "file_content": ""},
             )
         assert resp.status_code in (403, 404)
 
@@ -277,14 +294,12 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             create_resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": ".yamllint.yml", "file_content": "---"},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": ".yamllint.yml", "file_content": "---"},
             )
             file_id = create_resp.json()["custom_file"]["id"]
             update_resp = self.client.put(
                 f"/api/projects/{project.project_id}/custom-files/{file_id}",
-                json={"github_user": TEST_USER, "file_content": "---\nextend: default"},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_content": "---\nextend: default"},
             )
         assert update_resp.status_code == 200
         data = update_resp.json()["custom_file"]
@@ -308,27 +323,49 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.put(
                 f"/api/projects/{project.project_id}/custom-files/{cf.id}",
-                json={"github_user": TEST_USER, "file_content": "sonar.projectKey=new"},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_content": "sonar.projectKey=new"},
             )
         assert resp.status_code == 200
         data = resp.json()["custom_file"]
         assert data["git_hash"] is None
         assert data["file_status"] == "committed_locally"
 
+    def test_a_path_only_edit_is_a_local_change(self):
+        """The path used to be compared after it was assigned, so moving a file
+        was never committed_locally and no campaign delivered it."""
+        _, project = _seed(self.db)
+        cf = CustomFile(
+            project_id=project.project_id,
+            file_path="sonar-project.properties",
+            file_content="sonar.projectKey=app",
+            file_status="synced_with_github",
+            git_hash="abc123" * 7,
+        )
+        self.db.add(cf)
+        self.db.commit()
+        self.db.refresh(cf)
+
+        with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
+            resp = self.client.put(
+                f"/api/projects/{project.project_id}/custom-files/{cf.id}",
+                json={"file_path": "config/sonar-project.properties", "file_content": "sonar.projectKey=app"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()["custom_file"]
+        assert data["file_path"] == "config/sonar-project.properties"
+        assert data["file_status"] == "committed_locally"
+        assert data["git_hash"] is None
+
     def test_delete_new_file_hard_deletes(self):
         _, project = _seed(self.db)
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             create_resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": ".hadolint.yaml", "file_content": ""},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": ".hadolint.yaml", "file_content": ""},
             )
             file_id = create_resp.json()["custom_file"]["id"]
             del_resp = self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{file_id}",
-                headers={"X-GitHub-User": TEST_USER},
-                params={"github_user": TEST_USER},
             )
         assert del_resp.status_code == 200
         assert del_resp.json()["hard_deleted"] is True
@@ -355,12 +392,10 @@ class TestCustomFilesAPI:
         file_id = cf.id
 
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}), \
-             patch("auth.user_tokens", {TEST_USER: "fake-token"}), \
+             patch.dict("auth.user_tokens", {TEST_USER: "fake-token"}), \
              patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{file_id}",
-                headers={"X-GitHub-User": TEST_USER},
-                params={"github_user": TEST_USER},
             )
         assert resp.status_code == 200
         assert resp.json()["hard_deleted"] is True
@@ -384,8 +419,7 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{file_id}",
-                headers={"X-GitHub-User": TEST_USER},
-                params={"github_user": TEST_USER, "scope": "project"},
+                params={"scope": "project"},
             )
         assert resp.status_code == 200
         assert resp.json()["hard_deleted"] is True
@@ -408,8 +442,7 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{cf.id}",
-                headers={"X-GitHub-User": TEST_USER},
-                params={"github_user": TEST_USER, "scope": "everything"},
+                params={"scope": "everything"},
             )
         assert resp.status_code == 400
         self.db.refresh(cf)
@@ -432,8 +465,6 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files/{cf.id}/restore",
-                headers={"X-GitHub-User": TEST_USER},
-                params={"github_user": TEST_USER},
             )
         assert resp.status_code == 200
         assert resp.json()["custom_file"]["pending_delete"] is False
@@ -448,7 +479,6 @@ class TestCustomFilesAPI:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.get(
                 f"/api/projects/{project.project_id}/custom-files",
-                headers={"X-GitHub-User": TEST_USER},
             )
         assert resp.status_code == 200
         returned_paths = {f["file_path"] for f in resp.json()["custom_files"]}
@@ -590,11 +620,14 @@ class TestBug1ProjectDraftPromotion:
     promote project.pr_state to 'draft' so the Create PR Campaign button enables."""
 
     @pytest.fixture(autouse=True)
-    def setup(self):
+    def setup(self, authenticate_client):
         app.dependency_overrides[get_db] = override_get_db
         Base.metadata.create_all(bind=engine)
         self.db = TestingSessionLocal()
         self.client = TestClient(app)
+        # The caller comes from the session (#2241).
+        self.sign_in = lambda user: authenticate_client(self.client, user, TestingSessionLocal)
+        self.sign_in(TEST_USER)
         yield
         self.db.close()
         Base.metadata.drop_all(bind=engine)
@@ -620,8 +653,7 @@ class TestBug1ProjectDraftPromotion:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": "sonar.properties", "file_content": "x"},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": "sonar.properties", "file_content": "x"},
             )
         assert resp.status_code == 200
         self.db.refresh(project)
@@ -632,8 +664,7 @@ class TestBug1ProjectDraftPromotion:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": "sonar.properties", "file_content": "x"},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": "sonar.properties", "file_content": "x"},
             )
         assert resp.status_code == 200
         self.db.refresh(project)
@@ -644,8 +675,7 @@ class TestBug1ProjectDraftPromotion:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             self.client.post(
                 f"/api/projects/{project.project_id}/custom-files",
-                json={"github_user": TEST_USER, "file_path": "sonar.properties", "file_content": "x"},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_path": "sonar.properties", "file_content": "x"},
             )
         self.db.refresh(project)
         assert project.pr_state == "open"
@@ -663,8 +693,7 @@ class TestBug1ProjectDraftPromotion:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.put(
                 f"/api/projects/{project.project_id}/custom-files/{cf.id}",
-                json={"github_user": TEST_USER, "file_content": "new"},
-                headers={"X-GitHub-User": TEST_USER},
+                json={"file_content": "new"},
             )
         assert resp.status_code == 200
         self.db.refresh(project)
@@ -686,12 +715,10 @@ class TestBug1ProjectDraftPromotion:
         self.db.refresh(cf)
 
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}), \
-             patch("auth.user_tokens", {TEST_USER: "fake-token"}), \
+             patch.dict("auth.user_tokens", {TEST_USER: "fake-token"}), \
              patch("workflows.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{cf.id}",
-                headers={"X-GitHub-User": TEST_USER},
-                params={"github_user": TEST_USER},
             )
         assert resp.status_code == 200
         self.db.refresh(project)
@@ -712,8 +739,7 @@ class TestBug1ProjectDraftPromotion:
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}):
             resp = self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{cf.id}",
-                headers={"X-GitHub-User": TEST_USER},
-                params={"github_user": TEST_USER, "scope": "project"},
+                params={"scope": "project"},
             )
         assert resp.status_code == 200
         self.db.refresh(project)
@@ -830,12 +856,13 @@ class TestBug2CustomFileSurvivesMerge:
         assert self.db.query(CustomFile).filter_by(id=keep_id).first() is not None
         assert self.db.query(CustomFile).filter_by(id=remove_id).first() is None
 
-    def test_project_get_endpoint_returns_custom_files_after_merge(self):
+    def test_project_get_endpoint_returns_custom_files_after_merge(self, authenticate_client):
         """The GET /api/projects/{name} response must include custom_files so the
         frontend loadProjectFromAPI call populates the component after merge."""
         app.dependency_overrides[get_db] = override_get_db
         client = TestClient(app)
         project = self._seed()
+        authenticate_client(client, "b2_user", TestingSessionLocal)
         cf = CustomFile(
             project_id=project.project_id,
             file_path="sonar-project.properties",
@@ -871,11 +898,14 @@ class TestGitHubScopedDeletion:
     """
 
     @pytest.fixture(autouse=True)
-    def setup(self):
+    def setup(self, authenticate_client):
         app.dependency_overrides[get_db] = override_get_db
         Base.metadata.create_all(bind=engine)
         self.db = TestingSessionLocal()
         self.client = TestClient(app)
+        # The caller comes from the session (#2241).
+        self.sign_in = lambda user: authenticate_client(self.client, user, TestingSessionLocal)
+        self.sign_in(TEST_USER)
         yield
         self.db.close()
         Base.metadata.drop_all(bind=engine)
@@ -903,13 +933,12 @@ class TestGitHubScopedDeletion:
 
     def _delete(self, project, cf, **params):
         with patch("custom_files.user_tokens", {TEST_USER: "fake-token"}), \
-             patch("auth.user_tokens", {TEST_USER: "fake-token"}), \
+             patch.dict("auth.user_tokens", {TEST_USER: "fake-token"}), \
              patch("workflows.user_tokens", {TEST_USER: "fake-token"}), \
              patch("workflows._resolve_branches_for_repo", return_value=["main"]):
             return self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{cf.id}",
-                headers={"X-GitHub-User": TEST_USER},
-                params={"github_user": TEST_USER, **params},
+                params=params,
             )
 
     @staticmethod
@@ -1085,10 +1114,13 @@ class TestGitHubScopedDeletion:
         assert resp.json()["hard_deleted"] is True
         gh_delete.assert_not_called()
 
-    def test_refuses_when_the_project_name_would_resolve_elsewhere(self):
-        """create_pull_requests takes a name, and _find_project_by_name falls back
-        to a global match for privileged members — so an admin acting on another
-        user's project while owning a same-named one would target the wrong repos."""
+    def test_a_same_named_project_cannot_redirect_the_removal(self):
+        """The removal campaign used to go through create_pull_requests, which takes a
+        name, and _find_project_by_name falls back to a global match for privileged
+        members: an admin acting on another user's project while owning a same-named
+        one would have targeted the wrong repositories, so it was refused. The
+        campaign now opens on the project this route resolved by id, whatever a
+        name lookup would answer."""
         project, cf = self._project_with_repo()
         other_owner = Account(
             github_user="cf_other", github_email="other@example.com", account_type="free"
@@ -1104,16 +1136,23 @@ class TestGitHubScopedDeletion:
         self.db.commit()
         self.db.refresh(decoy)
         assert decoy.project_id != project.project_id
+        pr = {"number": 7, "html_url": "https://github.com/acme/app/pull/7",
+              "title": "t", "user": {"login": TEST_USER}, "body": "b"}
 
         with patch("workflows._find_project_by_name", return_value=decoy), \
-             patch("workflows._create_pull_request") as create_pr:
+             patch("workflows._create_or_get_am_branch",
+                   return_value=("actions-manager/cft/app/ab12-main", True, None)) as cut, \
+             patch("workflows.github_get", return_value=self._resp(200, {"sha": "abc"})), \
+             patch("workflows.requests.delete", return_value=self._resp(200)), \
+             patch("workflows._check_existing_pr", return_value=None), \
+             patch("workflows._fetch_branch_protection", return_value={"status": "none"}), \
+             patch("workflows._create_pull_request", return_value=(pr, None)):
             resp = self._delete(project, cf, scope="project_and_github", delivery="campaign")
 
-        assert resp.status_code == 409
-        create_pr.assert_not_called()
-        # Nothing was delivered, so nothing may be marked for deletion.
-        self.db.refresh(cf)
-        assert cf.pending_delete is False
+        assert resp.status_code == 200, resp.text
+        assert cut.call_args.args[:2] == ("acme", "app")
+        campaign = self.db.query(ProjectPRCampaign).filter_by(campaign_id=resp.json()["campaign_id"]).one()
+        assert campaign.project_id == project.project_id
 
     def _make_viewer(self, project):
         """A workspace member with read-only project access."""
@@ -1139,18 +1178,17 @@ class TestGitHubScopedDeletion:
         """
         project, cf = self._project_with_repo()
         self._make_viewer(project)
+        self.sign_in("cf_viewer")
         file_id = cf.id
 
         with patch("custom_files.user_tokens", {"cf_viewer": "fake-token"}), \
-             patch("auth.user_tokens", {"cf_viewer": "fake-token"}), \
+             patch.dict("auth.user_tokens", {"cf_viewer": "fake-token"}), \
              patch("workflows.user_tokens", {"cf_viewer": "fake-token"}), \
              patch("workflows.requests.delete") as gh_delete, \
              patch("workflows._create_pull_request") as create_pr:
             resp = self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{file_id}",
-                headers={"X-GitHub-User": "cf_viewer"},
-                params={"github_user": "cf_viewer",
-                        "scope": "project_and_github", "delivery": "direct"},
+                params={"scope": "project_and_github", "delivery": "direct"},
             )
 
         assert resp.status_code == 403
@@ -1161,16 +1199,15 @@ class TestGitHubScopedDeletion:
     def test_a_project_viewer_cannot_open_a_deletion_campaign_either(self):
         project, cf = self._project_with_repo()
         self._make_viewer(project)
+        self.sign_in("cf_viewer")
 
         with patch("custom_files.user_tokens", {"cf_viewer": "fake-token"}), \
-             patch("auth.user_tokens", {"cf_viewer": "fake-token"}), \
+             patch.dict("auth.user_tokens", {"cf_viewer": "fake-token"}), \
              patch("workflows.user_tokens", {"cf_viewer": "fake-token"}), \
              patch("workflows._create_pull_request") as create_pr:
             resp = self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{cf.id}",
-                headers={"X-GitHub-User": "cf_viewer"},
-                params={"github_user": "cf_viewer",
-                        "scope": "project_and_github", "delivery": "campaign"},
+                params={"scope": "project_and_github", "delivery": "campaign"},
             )
 
         assert resp.status_code == 403
@@ -1183,15 +1220,15 @@ class TestGitHubScopedDeletion:
         is a write like any other; a viewer is read-only."""
         project, cf = self._project_with_repo()
         self._make_viewer(project)
+        self.sign_in("cf_viewer")
         file_id = cf.id
 
         with patch("custom_files.user_tokens", {"cf_viewer": "fake-token"}), \
-             patch("auth.user_tokens", {"cf_viewer": "fake-token"}), \
+             patch.dict("auth.user_tokens", {"cf_viewer": "fake-token"}), \
              patch("workflows.requests.delete") as gh_delete:
             resp = self.client.delete(
                 f"/api/projects/{project.project_id}/custom-files/{file_id}",
-                headers={"X-GitHub-User": "cf_viewer"},
-                params={"github_user": "cf_viewer", "scope": "project"},
+                params={"scope": "project"},
             )
 
         assert resp.status_code == 403
@@ -1216,3 +1253,61 @@ class TestGitHubScopedDeletion:
         assert resp.status_code == 400
         self.db.refresh(cf)
         assert cf.pending_delete is False
+
+
+class TestRemovingAMovedCustomFile:
+    """Moving a custom file is a local edit: GitHub keeps it where it was delivered
+    until a campaign delivers the move. Removing it before then has to remove that
+    copy, not the path it has only in ActionsManager, which GitHub never had."""
+
+    OLD, NEW = ".github/scripts/build.sh", ".github/scripts/ci/build.sh"
+    APP = "acme/moved"
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        Base.metadata.create_all(bind=engine)
+        self.db = TestingSessionLocal()
+        yield
+        self.db.close()
+        Base.metadata.drop_all(bind=engine)
+
+    def _delivered_then_moved(self, github):
+        from custom_files import UpdateCustomFileRequest, update_custom_file
+        from tests.campaign_harness import USER, account, run_campaign
+
+        owner = Account(github_user=USER, github_email="mv@example.com", account_type="free")
+        self.db.add(owner)
+        self.db.flush()
+        project = Project(project_name="moved", project_code="MVD", user_id=owner.user_id,
+                          project_type="standard", branch_option="default", pr_state="draft")
+        repo = Repo(repo_name=self.APP)
+        self.db.add_all([project, repo])
+        self.db.flush()
+        self.db.add(ProjectRepo(project_id=project.project_id, repo_id=repo.repo_id))
+        cf = CustomFile(project_id=project.project_id, file_path=self.OLD, file_content="echo build\n",
+                        file_status="new")
+        self.db.add(cf)
+        self.db.commit()
+        for pr in run_campaign(self.db, github, project, [self.APP]):
+            github.merge(self.db, pr)
+        github.deletes.clear()
+        with patch("custom_files.user_tokens", {USER: "token"}):
+            update_custom_file(project.project_id, cf.id, UpdateCustomFileRequest(file_path=self.NEW),
+                               self.db, account())
+        return project, cf
+
+    @pytest.mark.parametrize("delivery", ["campaign", "direct"])
+    def test_removing_a_moved_custom_file_deletes_where_it_was_delivered(self, delivery):
+        from tests.campaign_harness import FakeGitHub, remove_custom_file
+
+        github = FakeGitHub()
+        project, cf = self._delivered_then_moved(github)
+        assert github.paths(self.APP) == {self.OLD}
+
+        _, prs = remove_custom_file(self.db, github, project, cf, direct=delivery == "direct")
+        for pr in prs:
+            github.merge(self.db, pr)
+
+        assert [path for _repo, _branch, path in github.deletes] == [self.OLD]
+        assert github.paths(self.APP) == set()
+        assert not any(path == self.NEW for *_, path in github.calls), "GitHub never had the new path"

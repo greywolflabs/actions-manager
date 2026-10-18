@@ -4,8 +4,10 @@
 // learn more: https://github.com/testing-library/jest-dom
 import '@testing-library/jest-dom';
 
-// Mock axios for all tests
-vi.mock('axios');
+// Mock axios for all tests, with the stand-in in src/__mocks__: vitest only finds
+// a manual mock by itself in the project root, and the automock it used instead
+// returns undefined from axios.create, leaving apiClient undefined.
+vi.mock('axios', () => import('./__mocks__/axios'));
 
 // jsdom has no layout engine, so scrollIntoView is simply absent. Components
 // that scroll a newly revealed panel into view would throw on mount.

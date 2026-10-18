@@ -234,7 +234,7 @@ const ProjectMembers: React.FC<ProjectMembersProps> = ({
                 id="add-member-user"
                 value={selectedUserId ?? ''}
                 onChange={(e) => setSelectedUserId(e.target.value ? Number(e.target.value) : null)}
-                className="w-full text-sm rounded-md border border-border dark:border-border-dark bg-container dark:bg-container-dark text-text-primary dark:text-text-primary-dark px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-primary"
+                className="w-full text-sm rounded-md border border-border dark:border-border-dark bg-container dark:bg-container-dark text-text-primary dark:text-text-primary-dark px-2 py-1.5 focus:outline-hidden focus:ring-2 focus:ring-primary"
               >
                 <option value="">Select a user…</option>
                 {availableUsers.map((u) => (
@@ -255,7 +255,7 @@ const ProjectMembers: React.FC<ProjectMembersProps> = ({
                 id="add-member-role"
                 value={selectedRole}
                 onChange={(e) => setSelectedRole(e.target.value)}
-                className="text-sm rounded-md border border-border dark:border-border-dark bg-container dark:bg-container-dark text-text-primary dark:text-text-primary-dark px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-primary"
+                className="text-sm rounded-md border border-border dark:border-border-dark bg-container dark:bg-container-dark text-text-primary dark:text-text-primary-dark px-2 py-1.5 focus:outline-hidden focus:ring-2 focus:ring-primary"
               >
                 {PROJECT_ROLE_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
@@ -333,7 +333,7 @@ const ProjectMembers: React.FC<ProjectMembersProps> = ({
                       value={member.project_role}
                       onChange={(e) => handleRoleChange(member.user_id, e.target.value)}
                       disabled={updating === member.user_id}
-                      className="text-sm rounded-md border border-border dark:border-border-dark bg-container dark:bg-container-dark text-text-primary dark:text-text-primary-dark px-2 py-1 focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50"
+                      className="text-sm rounded-md border border-border dark:border-border-dark bg-container dark:bg-container-dark text-text-primary dark:text-text-primary-dark px-2 py-1 focus:outline-hidden focus:ring-2 focus:ring-primary disabled:opacity-50"
                       aria-label={`Change project role for ${member.github_user}`}
                     >
                       {PROJECT_ROLE_OPTIONS.map((opt) => (

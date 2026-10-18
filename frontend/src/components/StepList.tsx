@@ -30,9 +30,12 @@ const StepList: React.FC<StepListProps> = ({ steps, onChange, validationErrors, 
 
   const duplicateStep = (index: number) => {
     const step = steps[index];
+    // A YAML id must be unique within its job, and `steps.<id>` references
+    // should keep pointing at the original, so the copy gets none.
     const newStep: WorkflowStep = {
       ...step,
       id: uniqueId(steps.map(s => s.id), `${step.id}-copy`),
+      yamlId: undefined,
       name: step.name ? `${step.name} (Copy)` : undefined
     };
 

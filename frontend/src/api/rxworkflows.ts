@@ -2,6 +2,7 @@ import { AxiosResponse } from "axios";
 import apiClient from "./apiClient";
 import config from "../config";
 import { RXWorkflow } from "../types/workflow";
+import type { WorkflowKindChange } from "../utils/workflowKindChanges";
 
 const BACKEND_URL = config.BACKEND_URL;
 
@@ -11,6 +12,8 @@ interface SaveRxWorkflowsResponse {
   message?: string;
   project_code?: string;
   pr_state?: string;
+  /** Workflows this save gave the other kind, by their trigger (#2318). */
+  kind_changes?: WorkflowKindChange[];
   [key: string]: any;
 }
 

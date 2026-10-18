@@ -6,6 +6,7 @@ import { createEnvironment } from "./environments";
 import { saveProject, fetchProjects, loadProject, Project } from "./projects";
 import { WorkflowUpdateResponse } from "../types/workflowResponse";
 import type { ProjectColorKey } from "../utils/projectColors";
+import { planWorkflowKindMoves, type WorkflowKindChange } from "../utils/workflowKindChanges";
 import { toast } from "../utils/toast";
 
 // ===== Type Definitions =====
@@ -71,6 +72,7 @@ export interface SaveProjectResponse {
   pr_state?: string;
   pending_delivery_repos?: string[];
   pending_delivery_known?: boolean;
+  kind_changes?: WorkflowKindChange[];
 }
 
 export interface SaveProjectResult {
@@ -84,6 +86,8 @@ export interface SaveProjectResult {
   pendingDeliveryRepos?: string[];
   /** False when the server could not tell — see `pending_delivery_known`. */
   pendingDeliveryKnown?: boolean;
+  /** Workflows this save gave the other kind, by their trigger (#2318). */
+  kindChanges?: WorkflowKindChange[];
 }
 
 export interface SelectedItems {
@@ -147,6 +151,8 @@ export interface UpdateResult {
   pendingDeliveryRepos?: string[];
   /** False when the server could not tell — see `pending_delivery_known`. */
   pendingDeliveryKnown?: boolean;
+  /** Workflows this save gave the other kind, by their trigger (#2318). */
+  kindChanges?: WorkflowKindChange[];
 }
 
 export interface SaveProjectWithModalParams {
@@ -330,6 +336,7 @@ export const handleSaveProject = async (
             prState: response.pr_state,
             pendingDeliveryRepos: response.pending_delivery_repos,
             pendingDeliveryKnown: response.pending_delivery_known,
+            kindChanges: response.kind_changes,
             message: "Project saved successfully"
         };
 
@@ -337,9 +344,17 @@ export const handleSaveProject = async (
         console.error("❌ Error saving project:", error);
         return {
             success: false,
-            error: (error as Error).message || "Failed to save project"
+            error: saveErrorMessage(error)
         };
     }
+};
+
+// The server's reason (a 409 name clash, a 403 limit) tells the user what to
+// change; Axios's own message is only "Request failed with status code 409".
+const saveErrorMessage = (error: unknown): string => {
+    const detail = (error as { response?: { data?: { detail?: unknown } } }).response?.data?.detail;
+    if (typeof detail === "string" && detail) return detail;
+    return (error as Error).message || "Failed to save project";
 };
 
 // Helper function for handleSaveProjectWithModal: performs the optional
@@ -453,8 +468,12 @@ export const handleSaveProjectWithModal = async (
 
         if (onProgress) onProgress(40, "Project saved to database");
 
-        // If GitHub update is requested, perform it
-        await applyGithubUpdateIfRequested(results, params);
+        // If GitHub update is requested, perform it. A workflow the save gave
+        // the other kind is pushed as that kind, or it goes to the wrong place.
+        const moves = planWorkflowKindMoves(workflows, rxworkflows, saveResult.kindChanges ?? [], null, false);
+        await applyGithubUpdateIfRequested(results, moves
+            ? { ...params, workflows: moves.nextRegular(workflows), rxworkflows: moves.nextReusable(rxworkflows) }
+            : params);
 
         return {
             success: true,
@@ -464,7 +483,8 @@ export const handleSaveProjectWithModal = async (
             projectCode: saveResult.projectCode,
             prState: saveResult.prState,
             pendingDeliveryRepos: saveResult.pendingDeliveryRepos,
-            pendingDeliveryKnown: saveResult.pendingDeliveryKnown
+            pendingDeliveryKnown: saveResult.pendingDeliveryKnown,
+            kindChanges: saveResult.kindChanges
         };
 
     } catch (error) {
@@ -876,7 +896,6 @@ const executeGitHubUpdates = async (
     config.workflows, 
     config.rxworkflows, 
     config.selectedItems, 
-    config.user, 
     config.selectedRepos, 
     {
       updateAll: updateFlags.updateAll,
@@ -896,7 +915,6 @@ const handleWorkflowsUpdate = async (
   workflows: Workflow[], 
   rxworkflows: Workflow[], 
   selectedItems: SelectedItems | null, 
-  user: string, 
   selectedRepos: (Repository | string)[], 
   updateConfig: UpdateConfig
 ): Promise<string[]> => {
@@ -933,7 +951,7 @@ const handleWorkflowsUpdate = async (
       console.log(`📌 Debug: Sending ${workflowsToUpdate.length} regular workflows and ${rxworkflowsToUpdate.length} reusable workflows to GitHub`);
       // Convert Repository objects to strings
       const repoNames = selectedRepos.map(repo => typeof repo === "string" ? repo : (repo.full_name || repo.name));
-      const response = await updateWorkflows(user, repoNames, workflowsToUpdate, rxworkflowsToUpdate, updateConfig.regexPattern, updateConfig.branchOption, updateConfig.projectName); 
+      const response = await updateWorkflows(updateConfig.projectName, repoNames, { workflows: workflowsToUpdate, rxworkflows: rxworkflowsToUpdate });
       const workflowResults = processWorkflowResults(response);
       results.push(...workflowResults);
     } else {

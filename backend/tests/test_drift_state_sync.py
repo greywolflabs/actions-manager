@@ -19,13 +19,15 @@ from sqlalchemy.pool import StaticPool
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import deliveries  # noqa: E402
 from models import (
     Base, Account, Project, Workflow, Repo, ProjectWorkflow,
-    NotificationEvent, WorkflowDriftState, ProjectPullRequest,
+    NotificationEvent, FileDelivery, ProjectPullRequest,
 )
 from workflows import _clear_drift_for_merged_pr
+from tests.delivery_records import record_delivered, record_drift, record_pr_merged  # noqa: E402
 from drift_notifications import (
-    clear_workflow_drift,
+    clear_drift,
     recompute_project_drift_summary,
     drop_workflow_drift,
 )
@@ -77,41 +79,47 @@ def _setup_project(db, repo_names=("acme/widgets",)):
     return project, workflow, repos
 
 
-def _drifted_state(db, project, workflow, repo, has_drift=True, branch="main"):
-    state = WorkflowDriftState(
-        project_id=project.project_id,
-        workflow_id=workflow.workflow_id,
-        repo_id=repo.repo_id,
-        # Drift state is per (workflow, repo, branch). Defaults to "main" to
-        # match _merged_pr's target_branch, which is how production pairs up.
-        branch=branch,
-        has_drift=has_drift,
-        content_hash="hash-1",
-        drift_cycle_count=1,
-    )
-    db.add(state)
-    db.commit()
-    db.refresh(state)
-    return state
+def _drifted_state(db, workflow, repo, has_drift=True, branch="main"):
+    # Drift is per (workflow, repo, branch). Defaults to "main" to match
+    # _merged_pr's target_branch, which is how production pairs up. A clean
+    # result is recorded over a delivery, the only place a check keeps one.
+    if not has_drift:
+        record_delivered(db, workflow, repo.repo_name, branch)
+    record_drift(db, workflow, repo.repo_name, branch, has_drift=has_drift, content_hash="hash-1")
 
 
-class TestClearWorkflowDrift:
+def _row(db, workflow, repo, branch="main"):
+    db.expire_all()
+    return db.query(FileDelivery).filter_by(workflow_id=workflow.workflow_id, repo_id=repo.repo_id,
+                                            branch=branch).one()
+
+
+def _rows(db):
+    db.expire_all()
+    return db.query(FileDelivery).all()
+
+
+def _clear(db, project, workflow_id, repo_name=None, branch=None):
+    return clear_drift(db, project, deliveries.WORKFLOW, workflow_id, repo_name, branch)
+
+
+class TestClearDrift:
     def test_clears_drift_and_emits_resolved_event(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
 
-        cleared = clear_workflow_drift(db_session, project, workflow.workflow_id, repo.repo_name)
+        cleared = _clear(db_session, project, workflow.workflow_id, repo.repo_name)
 
         assert cleared == 1
-        assert db_session.query(WorkflowDriftState).one().has_drift is False
+        assert _rows(db_session)[0].has_drift is False
         events = db_session.query(NotificationEvent).all()
         assert [e.event_type for e in events] == ["drift.resolved"]
 
     def test_updates_the_project_level_summary(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
 
-        clear_workflow_drift(db_session, project, workflow.workflow_id, repo.repo_name)
+        _clear(db_session, project, workflow.workflow_id, repo.repo_name)
 
         db_session.refresh(project)
         assert project.drift_status == "clean"
@@ -121,12 +129,12 @@ class TestClearWorkflowDrift:
         project, workflow, (repo_a, repo_b) = _setup_project(
             db_session, repo_names=("acme/widgets", "acme/gadgets")
         )
-        _drifted_state(db_session, project, workflow, repo_a)
-        _drifted_state(db_session, project, workflow, repo_b)
+        _drifted_state(db_session, workflow, repo_a)
+        _drifted_state(db_session, workflow, repo_b)
 
-        clear_workflow_drift(db_session, project, workflow.workflow_id, repo_a.repo_name)
+        _clear(db_session, project, workflow.workflow_id, repo_a.repo_name)
 
-        by_repo = {s.repo_id: s.has_drift for s in db_session.query(WorkflowDriftState).all()}
+        by_repo = {s.repo_id: s.has_drift for s in _rows(db_session)}
         assert by_repo[repo_a.repo_id] is False
         assert by_repo[repo_b.repo_id] is True
 
@@ -138,76 +146,71 @@ class TestClearWorkflowDrift:
         # Guards the dangerous failure mode: silently falling back to clearing
         # every repo would wrongly resolve drift the caller never touched.
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
 
-        cleared = clear_workflow_drift(db_session, project, workflow.workflow_id, "acme/not-a-repo")
+        cleared = _clear(db_session, project, workflow.workflow_id, "acme/not-a-repo")
 
         assert cleared == 0
-        assert db_session.query(WorkflowDriftState).one().has_drift is True
+        assert _rows(db_session)[0].has_drift is True
 
     def test_is_idempotent(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
 
-        clear_workflow_drift(db_session, project, workflow.workflow_id, repo.repo_name)
-        second = clear_workflow_drift(db_session, project, workflow.workflow_id, repo.repo_name)
+        _clear(db_session, project, workflow.workflow_id, repo.repo_name)
+        second = _clear(db_session, project, workflow.workflow_id, repo.repo_name)
 
         assert second == 0
         # Re-clearing must not emit a duplicate resolved notification.
         assert db_session.query(NotificationEvent).count() == 1
 
-    def test_delivering_to_a_branch_records_the_delivery(self, db_session):
-        """The caller just put the file there, and no drift check will see it.
-
-        A deletion on GitHub before the next check would otherwise leave the
-        pairing unconfirmed forever — the file is gone, so no later check can
-        supply the evidence — and be reported as "never delivered" (issue #1981).
-        """
+    def test_clearing_records_no_delivery(self, db_session):
+        """Every caller that put the file on GitHub records that delivery itself
+        (deliveries.record_delivered, or a merge's record_pr_outcome). A clear
+        that recorded one too would invent a delivery for a resolution that
+        made none."""
         project, workflow, (repo,) = _setup_project(db_session)
 
-        clear_workflow_drift(db_session, project, workflow.workflow_id,
-                             repo.repo_name, "main")
+        _clear(db_session, project, workflow.workflow_id, repo.repo_name, "main")
 
-        state = db_session.query(WorkflowDriftState).one()
-        assert state.branch == "main"
-        assert state.confirmed_present_at is not None
+        assert _rows(db_session) == []
 
-    def test_a_delivery_does_not_overwrite_an_earlier_confirmation(self, db_session):
+    def test_clearing_keeps_the_delivery_already_recorded(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        state = _drifted_state(db_session, project, workflow, repo)
-        state.confirmed_present_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        db_session.commit()
+        record_delivered(db_session, workflow, repo.repo_name, "main", sha="delivered",
+                         at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        _drifted_state(db_session, workflow, repo)
 
-        clear_workflow_drift(db_session, project, workflow.workflow_id,
-                             repo.repo_name, "main")
+        _clear(db_session, project, workflow.workflow_id, repo.repo_name, "main")
 
-        db_session.refresh(state)
-        assert state.confirmed_present_at.year == 2026
-        assert state.confirmed_present_at.month == 1
+        row = _row(db_session, workflow, repo)
+        assert (row.has_drift, row.delivered_sha) == (False, "delivered")
+        assert (row.delivered_at.year, row.delivered_at.month) == (2026, 1)
 
     def test_clearing_every_repo_records_no_delivery(self, db_session):
         """Without a repo and branch there is no pairing to confirm."""
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
 
-        clear_workflow_drift(db_session, project, workflow.workflow_id)
+        _clear(db_session, project, workflow.workflow_id)
 
-        assert db_session.query(WorkflowDriftState).one().confirmed_present_at is None
+        assert _rows(db_session)[0].delivered_at is None
 
     def test_omitting_repo_clears_every_repo_for_the_workflow(self, db_session):
         project, workflow, (repo_a, repo_b) = _setup_project(
             db_session, repo_names=("acme/widgets", "acme/gadgets")
         )
-        _drifted_state(db_session, project, workflow, repo_a)
-        _drifted_state(db_session, project, workflow, repo_b)
+        _drifted_state(db_session, workflow, repo_a)
+        _drifted_state(db_session, workflow, repo_b)
 
-        cleared = clear_workflow_drift(db_session, project, workflow.workflow_id)
+        cleared = _clear(db_session, project, workflow.workflow_id)
 
         assert cleared == 2
-        assert all(s.has_drift is False for s in db_session.query(WorkflowDriftState).all())
+        assert all(s.has_drift is False for s in _rows(db_session))
 
 
-def _merged_pr(db, project, repo_name, workflow_names):
+def _merged_pr(db, project, repo_name, workflow_names, *carried):
+    """A merged PR row, with the delivery record its campaign and merge write for *carried*."""
     pr = ProjectPullRequest(
         project_id=project.project_id,
         repo_name=repo_name,
@@ -221,6 +224,7 @@ def _merged_pr(db, project, repo_name, workflow_names):
     db.add(pr)
     db.commit()
     db.refresh(pr)
+    record_pr_merged(db, pr, *carried)
     return pr
 
 
@@ -230,18 +234,18 @@ class TestClearDriftForMergedPR:
 
     def test_clears_drift_for_the_workflows_the_pr_carried(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
-        pr = _merged_pr(db_session, project, repo.repo_name, "ci.yml")
+        _drifted_state(db_session, workflow, repo)
+        pr = _merged_pr(db_session, project, repo.repo_name, "ci.yml", workflow)
 
         _clear_drift_for_merged_pr(db_session, project, pr)
 
-        assert db_session.query(WorkflowDriftState).one().has_drift is False
+        assert _row(db_session, workflow, repo).has_drift is False
         db_session.refresh(project)
         assert project.drift_status == "clean"
 
     def test_leaves_workflows_not_in_the_pr_drifted(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
 
         other_wf = Workflow(workflow_name="release.yml", workflow_yaml="name: release")
         db_session.add(other_wf)
@@ -251,12 +255,12 @@ class TestClearDriftForMergedPR:
             project_id=project.project_id, workflow_id=other_wf.workflow_id
         ))
         db_session.commit()
-        _drifted_state(db_session, project, other_wf, repo)
+        _drifted_state(db_session, other_wf, repo)
 
-        pr = _merged_pr(db_session, project, repo.repo_name, "ci.yml")
+        pr = _merged_pr(db_session, project, repo.repo_name, "ci.yml", workflow)
         _clear_drift_for_merged_pr(db_session, project, pr)
 
-        by_wf = {s.workflow_id: s.has_drift for s in db_session.query(WorkflowDriftState).all()}
+        by_wf = {s.workflow_id: s.has_drift for s in _rows(db_session)}
         assert by_wf[workflow.workflow_id] is False
         assert by_wf[other_wf.workflow_id] is True
 
@@ -264,24 +268,24 @@ class TestClearDriftForMergedPR:
         project, workflow, (repo_a, repo_b) = _setup_project(
             db_session, repo_names=("acme/widgets", "acme/gadgets")
         )
-        _drifted_state(db_session, project, workflow, repo_a)
-        _drifted_state(db_session, project, workflow, repo_b)
+        _drifted_state(db_session, workflow, repo_a)
+        _drifted_state(db_session, workflow, repo_b)
 
-        pr = _merged_pr(db_session, project, repo_a.repo_name, "ci.yml")
+        pr = _merged_pr(db_session, project, repo_a.repo_name, "ci.yml", workflow)
         _clear_drift_for_merged_pr(db_session, project, pr)
 
-        by_repo = {s.repo_id: s.has_drift for s in db_session.query(WorkflowDriftState).all()}
+        by_repo = {s.repo_id: s.has_drift for s in _rows(db_session)}
         assert by_repo[repo_a.repo_id] is False
         assert by_repo[repo_b.repo_id] is True
 
     def test_pr_without_recorded_workflows_is_a_no_op(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
         pr = _merged_pr(db_session, project, repo.repo_name, None)
 
         _clear_drift_for_merged_pr(db_session, project, pr)
 
-        assert db_session.query(WorkflowDriftState).one().has_drift is True
+        assert _row(db_session, workflow, repo).has_drift is True
 
 
 class TestRecomputeProjectDriftSummary:
@@ -289,8 +293,8 @@ class TestRecomputeProjectDriftSummary:
         project, workflow, (repo_a, repo_b) = _setup_project(
             db_session, repo_names=("acme/widgets", "acme/gadgets")
         )
-        _drifted_state(db_session, project, workflow, repo_a)
-        _drifted_state(db_session, project, workflow, repo_b)
+        _drifted_state(db_session, workflow, repo_a)
+        _drifted_state(db_session, workflow, repo_b)
 
         recompute_project_drift_summary(db_session, project)
 
@@ -301,7 +305,7 @@ class TestRecomputeProjectDriftSummary:
 
     def test_reports_clean_when_nothing_is_drifted(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo, has_drift=False)
+        _drifted_state(db_session, workflow, repo, has_drift=False)
 
         recompute_project_drift_summary(db_session, project)
 
@@ -311,7 +315,7 @@ class TestRecomputeProjectDriftSummary:
 
     def test_ignores_other_projects_drift(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
 
         other = Project(project_name="other", project_code="OTH", user_id=project.user_id)
         db_session.add(other)
@@ -332,7 +336,7 @@ class TestRecomputeProjectDriftSummary:
         project, workflow, (repo,) = _setup_project(db_session)
         project.drift_check_failure_count = 5
         db_session.commit()
-        _drifted_state(db_session, project, workflow, repo, has_drift=False)
+        _drifted_state(db_session, workflow, repo, has_drift=False)
 
         recompute_project_drift_summary(db_session, project)
 
@@ -341,51 +345,46 @@ class TestRecomputeProjectDriftSummary:
 
 
 class TestDropWorkflowDrift:
-    def test_removes_rows_and_recomputes(self, db_session):
+    def test_resets_its_drift_and_recomputes(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
 
         drop_workflow_drift(db_session, project, workflow.workflow_id)
 
-        assert db_session.query(WorkflowDriftState).count() == 0
+        row = _row(db_session, workflow, repo)
+        assert (row.has_drift, row.github_sha, row.content_hash) == (False, None, None)
         db_session.refresh(project)
         assert project.drift_status == "clean"
         assert project.drift_count == 0
 
-    def test_only_drops_rows_belonging_to_this_project(self, db_session):
-        # WorkflowDriftState is unique per (workflow, repo), so a row recorded
-        # under another project must survive - removing a workflow from one
-        # project says nothing about drift another project tracks.
-        project, workflow, (repo_a, repo_b) = _setup_project(
-            db_session, repo_names=("acme/widgets", "acme/gadgets")
-        )
-        _drifted_state(db_session, project, workflow, repo_a)
-
-        other = Project(project_name="other", project_code="OTH", user_id=project.user_id)
-        db_session.add(other)
-        db_session.commit()
-        db_session.refresh(other)
-        _drifted_state(db_session, other, workflow, repo_b)
+    def test_keeps_what_was_delivered(self, db_session):
+        # The record of a delivery outlives the drift check that saw it: only
+        # what the checks saw is forgotten.
+        project, workflow, (repo,) = _setup_project(db_session)
+        record_delivered(db_session, workflow, repo.repo_name, "main", sha="delivered")
+        _drifted_state(db_session, workflow, repo)
 
         drop_workflow_drift(db_session, project, workflow.workflow_id)
 
-        remaining = db_session.query(WorkflowDriftState).all()
-        assert len(remaining) == 1
-        assert remaining[0].project_id == other.project_id
+        row = _row(db_session, workflow, repo)
+        assert (row.has_drift, row.delivered_sha) == (False, "delivered")
+        assert row.delivered_at is not None
 
     def test_leaves_other_workflows_in_the_same_project_alone(self, db_session):
         project, workflow, (repo,) = _setup_project(db_session)
-        _drifted_state(db_session, project, workflow, repo)
+        _drifted_state(db_session, workflow, repo)
 
         kept = Workflow(workflow_name="release.yml", workflow_yaml="name: release")
         db_session.add(kept)
         db_session.commit()
         db_session.refresh(kept)
-        _drifted_state(db_session, project, kept, repo)
+        db_session.add(ProjectWorkflow(project_id=project.project_id, workflow_id=kept.workflow_id))
+        db_session.commit()
+        _drifted_state(db_session, kept, repo)
 
         drop_workflow_drift(db_session, project, workflow.workflow_id)
 
-        remaining = db_session.query(WorkflowDriftState).all()
+        remaining = [row for row in _rows(db_session) if row.has_drift]
         assert len(remaining) == 1
         assert remaining[0].workflow_id == kept.workflow_id
         db_session.refresh(project)

@@ -167,14 +167,14 @@ def observe_environment_sync(db, account):
             "environment_name": "staging",
         })
         session = MagicMock()
-        session.query.return_value.filter.return_value.first.return_value = account
         with patch("github_env_vars.require_project_write_access"), \
+                patch("github_env_vars._require_project_repos"), \
                 patch.dict("github_env_vars.user_tokens", {account.github_user: "token"}), \
                 patch("github_env_vars.count_project_environments", count), \
                 patch("github_env_vars._find_existing_environments", AsyncMock(return_value={})), \
                 patch("github_env_vars.httpx.AsyncClient") as client:
             client.return_value.__aenter__.return_value.get = AsyncMock(return_value=Mock(status_code=404))
-            result = asyncio.run(github_env_vars.sync_environment(request, session))
+            result = asyncio.run(github_env_vars.sync_environment(request, session, account))
         results[current] = (result, count.await_count)
     return results
 

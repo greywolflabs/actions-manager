@@ -11,9 +11,8 @@ The report has to be right about two things that are easy to get wrong:
 
 * **What "delivered" means.** ``workflow_git_hash`` cannot answer it: it is
   zeroed by any local edit and set to a PR branch SHA by a campaign that has
-  not landed. The report uses the tree listing plus
-  ``WorkflowDriftState.confirmed_present_at``, which is stamped the first time
-  a check actually saw the file and never cleared.
+  not landed. The report uses the tree listing plus the delivery record's
+  ``delivered_at``, reported as ``confirmed_present_at``.
 
 Cost matters — the report runs on every rename attempt — but not more than
 being right. Presence is **revalidated** through ``_fetch_tree_using_cache``
@@ -21,7 +20,7 @@ rather than replayed from ``workflow_tree_cache``: nothing invalidates that row
 when GitHub changes, so replaying it answers from whenever drift last ran, and a
 file added since then is invisible. Revalidating costs a round trip and no rate
 limit, because the request carries ``If-None-Match`` and a 304 is free. Branches
-are likewise resolved live, not read back from ``workflow_drift_states``, so a
+are likewise resolved live, not read back from the last drift check, so a
 branch added since the last drift run is still checked.
 """
 import json
@@ -49,10 +48,10 @@ from models import (
     ProjectWorkflow,
     Repo,
     Workflow,
-    WorkflowDriftState,
     WorkflowTreeCache,
 )
 from tests.conftest import TestingSessionLocal
+from tests.delivery_records import record_delivered, record_drift, record_pr_carries  # noqa: E402
 
 OWNER = "impact-owner"
 REPO = "acme/api"
@@ -62,8 +61,9 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def _token():
+def _token(authenticate_client):
     user_tokens[OWNER] = "test-token"
+    authenticate_client(client, OWNER, TestingSessionLocal)
     yield
     user_tokens.pop(OWNER, None)
 
@@ -142,22 +142,18 @@ def _tree(*filenames):
     return {name: "sha-%d" % i for i, name in enumerate(filenames)}
 
 
-def _drift_state(db, project, workflow_id, repo_id, branch=BRANCH, confirmed_at=None):
-    """Record a drift result for this (workflow, repo, branch).
+def _drift_state(db, workflow_id, repo_id, branch=BRANCH, confirmed_at=None):
+    """Record a clean drift result for this (workflow, repo, branch), and the
+    delivery it confirmed at *confirmed_at* when given.
 
-    Only ``confirmed_present_at`` is consumed by the report — the branch list is
-    resolved live, precisely so a branch added after the last drift run is not
-    skipped.
+    Only the delivery is consumed by the report — the branch list is resolved
+    live, precisely so a branch added after the last drift run is not skipped.
     """
-    db.add(WorkflowDriftState(
-        project_id=project.id,
-        workflow_id=workflow_id,
-        repo_id=repo_id,
-        branch=branch,
-        has_drift=False,
-        confirmed_present_at=confirmed_at,
-    ))
-    db.commit()
+    repo_name = db.query(Repo.repo_name).filter(Repo.repo_id == repo_id).scalar()
+    workflow = db.get(Workflow, workflow_id)
+    record_drift(db, workflow, repo_name, branch, has_drift=False)
+    if confirmed_at is not None:
+        record_delivered(db, workflow, repo_name, branch, at=confirmed_at)
 
 
 def _ask(project, workflow_name, new_name, *, files=(), branches=(BRANCH,),
@@ -222,7 +218,7 @@ def test_the_response_field_names_are_the_ones_the_dialog_reads():
     }
     assert set(body["targets"][0]) == {
         "repo", "branch", "old_file_present", "new_file_present",
-        "confirmed_present_at",
+        "confirmed_present_at", "old_path",
     }
 
 
@@ -410,7 +406,7 @@ def test_listing_is_conditional_so_an_unchanged_repo_costs_no_rate_limit():
 
 
 def test_a_branch_added_since_the_last_drift_run_is_still_checked():
-    """Branches are resolved live, not read back from workflow_drift_states.
+    """Branches are resolved live, not read back from the last drift check.
 
     Reusing the recorded branches made a branch added after the last drift run
     invisible — the report would stay silent about a file the rename orphans
@@ -421,7 +417,7 @@ def test_a_branch_added_since_the_last_drift_run_is_still_checked():
         project, repo_id = _make_project(db, code="NEWB")
         wf = _add_workflow(db, project, "ci")
         # Drift only ever saw main.
-        _drift_state(db, project, wf.workflow_id, repo_id, branch="main")
+        _drift_state(db, wf.workflow_id, repo_id, branch="main")
     finally:
         db.close()
 
@@ -453,14 +449,15 @@ def test_open_pr_naming_the_workflow_blocks_the_rename():
     db = TestingSessionLocal()
     try:
         project, repo_id = _make_project(db, code="OPEN")
-        _add_workflow(db, project, "ci")
-        db.add(ProjectPullRequest(
+        wf = _add_workflow(db, project, "ci")
+        pr = ProjectPullRequest(
             project_id=project.id, repo_name=REPO, pr_number=7,
             pr_url="https://github.com/acme/api/pull/7", pr_state="open",
             branch_name="actions-manager/open", target_branch=BRANCH,
             workflow_names="ci",
-        ))
-        db.commit()
+        )
+        db.add(pr)
+        record_pr_carries(db, pr, wf)
     finally:
         db.close()
 
@@ -782,13 +779,12 @@ def test_rename_onto_a_tombstone_name_is_reported_as_blocked():
     assert "queued for removal" in body["blocked_reason"]
 
 
-def test_collision_check_is_scoped_to_the_same_kind():
-    """A regular and a reusable workflow may share a name; renaming into that is legal.
-
-    create_or_update_workflow scopes every name lookup by reusable_workflow, so
-    an unscoped clash query refused a rename the write path performs without
-    complaint — with a reason the user cannot act on.
-    """
+def test_a_rename_onto_the_other_kinds_name_is_blocked():
+    """#2309: a regular and a reusable workflow this project owns are both
+    delivered to its repositories, so one name would be one file, overwritten
+    by whichever is delivered last. The write path refuses the same rename
+    (_assert_rename_allowed shares this blocker), so the preview and the save
+    agree."""
     db = TestingSessionLocal()
     try:
         proj, _ = _make_project(db, code="KIND")
@@ -798,8 +794,8 @@ def test_collision_check_is_scoped_to_the_same_kind():
         db.close()
 
     body = _ask(proj, "build", "deploy", files=[], is_reusable=False)[0].json()
-    assert body["blocked_reason"] is None, body
-    assert body["classification"] != "blocked"
+    assert body["classification"] == "blocked", body
+    assert "'deploy'" in body["blocked_reason"]
 
 
 def test_is_reusable_selects_which_workflow_the_preview_answers_about():
@@ -855,7 +851,7 @@ def test_confirmed_present_at_carries_an_explicit_utc_offset():
     try:
         proj, repo_id = _make_project(db, code="UTC1")
         wf = _add_workflow(db, proj, "ci")
-        _drift_state(db, proj, wf.workflow_id, repo_id,
+        _drift_state(db, wf.workflow_id, repo_id,
                      confirmed_at=datetime(2026, 9, 16, 11, 30, 0))
     finally:
         db.close()
@@ -863,3 +859,40 @@ def test_confirmed_present_at_carries_an_explicit_utc_offset():
     body = _ask(proj, "ci", "ci-v2", files=["AM_UTC1_ci.yml"])[0].json()
     stamps = [t["confirmed_present_at"] for t in body["targets"]]
     assert stamps == ["2026-09-16T11:30:00+00:00"], stamps
+
+
+def test_the_preview_names_the_file_the_campaign_will_remove():
+    """ci was delivered, then renamed to ci2 without delivering. Renaming ci2
+    now still removes ci, the file GitHub holds, which the preview has to say:
+    asking about ci2's file found nothing and called the workflow undelivered."""
+    db = TestingSessionLocal()
+    try:
+        project, _repo_id = _make_project(db, code="PREV")
+        wf = _add_workflow(db, project, "ci2")
+        record_delivered(db, wf, REPO, BRANCH, sha="a" * 40, path=".github/workflows/AM_PREV_ci.yml")
+    finally:
+        db.close()
+
+    resp, _ = _ask(project, "ci2", "ci3", files=["AM_PREV_ci.yml"])
+
+    assert resp.status_code == 200, resp.text
+    [target] = resp.json()["targets"]
+    assert target["old_path"] == ".github/workflows/AM_PREV_ci.yml"
+    assert target["old_file_present"] is True
+
+
+def test_the_preview_of_renaming_back_removes_nothing():
+    """Back to the delivered name, the campaign writes that file again and removes none."""
+    db = TestingSessionLocal()
+    try:
+        project, _repo_id = _make_project(db, code="BACK")
+        wf = _add_workflow(db, project, "ci2")
+        record_delivered(db, wf, REPO, BRANCH, sha="a" * 40, path=".github/workflows/AM_BACK_ci.yml")
+    finally:
+        db.close()
+
+    resp, _ = _ask(project, "ci2", "ci", files=["AM_BACK_ci.yml"])
+
+    assert resp.status_code == 200, resp.text
+    [target] = resp.json()["targets"]
+    assert target["old_path"] is None

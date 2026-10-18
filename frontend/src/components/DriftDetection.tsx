@@ -38,6 +38,8 @@ import {
   type DriftResolution,
   type BulkResolveDriftItem,
   type ProjectDriftSummary,
+  type CodeownersDriftDetail,
+  type CustomFileDriftDetail,
 } from "../api/drift";
 import ConfirmDialog from "./ConfirmDialog";
 import { deleteWorkflowFromGitHub, deleteWorkflowFromDatabase } from "../api/workflows";
@@ -97,7 +99,11 @@ interface DriftDetectionProps {
    * per-workflow drift badges and decide whether destructive actions need
    * confirmation.
    */
-  onDriftLoaded?: (details: WorkflowDriftDetail[]) => void;
+  onDriftLoaded?: (
+    details: WorkflowDriftDetail[],
+    codeowners: CodeownersDriftDetail[],
+    customFiles: CustomFileDriftDetail[],
+  ) => void;
   /**
    * External signal – when this number changes, drift is re-checked.
    * Use this to refresh after a save/PR completes.
@@ -120,7 +126,78 @@ interface DriftDetectionProps {
    * as the check completes.
    */
   seededDriftNames?: string[];
+  /** Whether the last check found the project's CODEOWNERS drifted, from the project fetch, for the same reason. */
+  seededCodeownersDrift?: boolean;
+  /** How many custom files the last check found drifted, from the project fetch, for the same reason. */
+  seededCustomFileDriftCount?: number;
+  /** Opens the CODEOWNERS editor, where a drifted CODEOWNERS is resolved. */
+  onOpenCodeowners?: () => void;
 }
+
+const countOf = (count: number, noun: string) => (count === 1 ? `1 ${noun}` : `${count} ${noun}s`);
+
+/** "2 workflows changed in GitHub", naming custom files and CODEOWNERS when they drifted too. */
+export const driftSummaryText = (workflowCount: number, codeownersDrifted: boolean, customFileCount = 0): string => {
+  const parts = [
+    workflowCount > 0 ? countOf(workflowCount, "workflow") : null,
+    customFileCount > 0 ? countOf(customFileCount, "custom file") : null,
+    codeownersDrifted ? "CODEOWNERS" : null,
+  ].filter((part): part is string => part !== null);
+  if (parts.length === 0) return "";
+  const named = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
+  return `${named} changed in GitHub`;
+};
+
+interface FileDriftSectionProps {
+  readonly title: string;
+  readonly hint: string;
+  readonly drift: CodeownersDriftDetail[];
+  readonly testId: string;
+  readonly onOpen?: () => void;
+  readonly openLabel?: string;
+  readonly openTestId?: string;
+}
+
+/**
+ * Files the project delivers whole — its CODEOWNERS, its custom files — where
+ * they drifted. Each has one copy for every repository, so it is resolved in
+ * its editor rather than per row: load a GitHub version there and Commit
+ * Locally, or deliver it in a PR campaign.
+ */
+const FileDriftSection: React.FC<FileDriftSectionProps> = ({ title, hint, drift, testId, onOpen, openLabel, openTestId }) => (
+  <section className="space-y-2" aria-label={`${title} drift`} data-testid={testId}>
+    <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">{title}</h3>
+    <p className="text-xs text-slate-600 dark:text-slate-400">{hint}</p>
+    <ul className="divide-y divide-slate-200 text-sm dark:divide-slate-700">
+      {drift.map((d) => (
+        <li key={`${d.file_path}::${d.repo}::${d.branch}`} className="flex flex-wrap items-center gap-x-4 gap-y-1 py-2">
+          <span className="font-mono">{d.file_path}</span>
+          <span>{d.repo}</span>
+          <span className="text-slate-500 dark:text-slate-400">{d.branch}</span>
+          <span className="text-amber-700 dark:text-amber-400">
+            {d.deleted_in_github ? "Deleted in GitHub" : "Changed in GitHub"}
+          </span>
+        </li>
+      ))}
+    </ul>
+    {onOpen && (
+      <Button variant="outline" size="sm" onClick={onOpen} data-testid={openTestId}>
+        {openLabel}
+      </Button>
+    )}
+  </section>
+);
+
+const CODEOWNERS_HINT =
+  "Load the GitHub version in the CODEOWNERS editor and Commit Locally to keep it, or include " +
+  "CODEOWNERS in a PR campaign to put the project's version back.";
+const CUSTOM_FILE_HINT =
+  "Open the file under Project Files, load the GitHub version and Commit Locally to keep it, or " +
+  "include it in a PR campaign to put the project's version back.";
+
+/** How many custom files drifted: from the live check once it has loaded, else the project fetch's seed. */
+const driftedCustomFileCount = (liveLoaded: boolean, drift: CustomFileDriftDetail[], seeded: number) =>
+  liveLoaded ? new Set(drift.map((d) => d.custom_file_id)).size : seeded;
 
 /**
  * Render two `<pre>` blocks side-by-side highlighting changed lines.
@@ -545,8 +622,13 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
   refreshSignal,
   onWorkflowStatusesChanged,
   seededDriftNames,
+  seededCodeownersDrift = false,
+  seededCustomFileDriftCount = 0,
+  onOpenCodeowners,
 }) => {
   const [drifts, setDrifts] = useState<WorkflowDriftDetail[]>([]);
+  const [codeownersDrifts, setCodeownersDrifts] = useState<CodeownersDriftDetail[]>([]);
+  const [customFileDrifts, setCustomFileDrifts] = useState<CustomFileDriftDetail[]>([]);
   const [uncheckedCount, setUncheckedCount] = useState(0);
   const [liveLoaded, setLiveLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -655,6 +737,8 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
     if (!user || !projectId || !projectName || selectedRepos.length === 0) {
       driftsRef.current = [];
       setDrifts([]);
+      setCodeownersDrifts([]);
+      setCustomFileDrifts([]);
       // Otherwise these carry over from whatever project was last loaded,
       // e.g. showing this project as "last checked 3pm" using another
       // project's timestamp.
@@ -666,7 +750,7 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
       // completed check and let the seeded banner clear. Before the project
       // loads there is no projectId yet — stay pending so the seed still shows.
       if (projectId) setLiveLoaded(true);
-      onDriftLoaded?.([]);
+      onDriftLoaded?.([], [], []);
       return [];
     }
     setError(null);
@@ -675,6 +759,8 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
       if (requestId !== requestIdRef.current) return driftsRef.current;
       driftsRef.current = summary.drifted_workflows;
       setDrifts(summary.drifted_workflows);
+      setCodeownersDrifts(summary.drifted_codeowners ?? []);
+      setCustomFileDrifts(summary.drifted_custom_files ?? []);
       setLastChecked(summary.last_checked ?? null);
       setStaleReason(summary.stale_reason ?? null);
       setDriftStatus(summary.drift_status ?? null);
@@ -682,7 +768,7 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
       // list is not evidence that everything is in sync.
       setUncheckedCount(summary.unchecked_count ?? 0);
       setLiveLoaded(true);
-      onDriftLoaded?.(summary.drifted_workflows);
+      onDriftLoaded?.(summary.drifted_workflows, summary.drifted_codeowners ?? [], summary.drifted_custom_files ?? []);
       return summary.drifted_workflows;
     } catch (err: unknown) {
       if (requestId !== requestIdRef.current) return driftsRef.current;
@@ -939,20 +1025,21 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
   // the last check persisted. Otherwise the banner is absent on first paint
   // and pops in when the check resolves, shifting the page layout.
   const bannerCount = liveLoaded ? driftCount : (seededDriftNames?.length ?? 0);
+  const codeownersDrifted = liveLoaded ? codeownersDrifts.length > 0 : seededCodeownersDrift;
+  const customFileCount = driftedCustomFileCount(liveLoaded, customFileDrifts, seededCustomFileDriftCount);
+  const hasDrift = bannerCount > 0 || codeownersDrifted || customFileCount > 0;
+  // Files other than workflows, which the modal lists in their own sections.
+  const hasFileDrift = codeownersDrifts.length > 0 || customFileDrifts.length > 0;
   // The seed carries names only, so the modal's rows/resolve actions aren't
   // usable yet. An error still enables it — that's how the user reaches the
   // failure message inside the modal.
   const canReviewDrift = liveLoaded || error !== null;
-  const summaryText = useMemo(() => {
-    if (bannerCount === 0) return "";
-    if (bannerCount === 1) return "1 workflow changed in GitHub";
-    return `${bannerCount} workflows changed in GitHub`;
-  }, [bannerCount]);
+  const summaryText = driftSummaryText(bannerCount, codeownersDrifted, customFileCount);
   const statusRow = getDriftStatusRow(driftStatus, uncheckedCount, lastChecked);
 
   return (
     <>
-      {bannerCount === 0 && (
+      {!hasDrift && (
         // Persistent, muted status row so a clean or never-checked project
         // always has a way to trigger a live check — the "Review Drift"
         // button below only exists once drift is already known, so without
@@ -981,7 +1068,7 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
         </output>
       )}
 
-      {bannerCount > 0 && (
+      {hasDrift && (
         <div
           className="mx-4 mb-2 px-4 py-2 rounded-lg flex items-center gap-3 bg-amber-50 border border-amber-200 text-amber-900 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"
           role="alert"
@@ -1009,11 +1096,11 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
         >
           <DialogHeader>
             <DialogTitle className="text-amber-700 dark:text-amber-400">
-              ⚠️ Workflow Drift Detected
+              {hasFileDrift ? "⚠️ Drift Detected" : "⚠️ Workflow Drift Detected"}
             </DialogTitle>
             <DialogDescription>
-              The following workflows were changed directly in GitHub. Review the diff and
-              choose how to resolve each drift safely.
+              The following {hasFileDrift ? "files" : "workflows"} were changed directly in
+              GitHub. Review the diff and choose how to resolve each drift safely.
             </DialogDescription>
             <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
               <span data-testid="drift-last-checked">
@@ -1121,148 +1208,174 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
           )}
 
           {/* Drift table */}
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm border-collapse">
-              <thead>
-                <tr className="text-left border-b border-slate-200 dark:border-slate-700">
-                  <th className="py-2 pr-2" />
-                  <th className="py-2 pr-4">Workflow</th>
-                  <th className="py-2 pr-4">Repo</th>
-                  <th className="py-2 pr-4">Branch</th>
-                  <th className="py-2 pr-4">Status</th>
-                  <th className="py-2 pr-4">Last Checked</th>
-                  <th className="py-2">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {drifts.map((d) => {
-                  const k = driftKey(d);
-                  const isOpen = openDiffKey === k;
-                  const diffButtonLabel = isOpen ? "Hide Diff" : "View Diff";
-                  const busy = resolving === k;
-                  const group = driftGroups.get(groupKeyFor(d)) ?? [d];
-                  return (
-                    <React.Fragment key={k}>
-                      <tr className="border-b border-slate-100 dark:border-slate-800">
-                        <td className="py-2 pr-2">
-                          <input
-                            type="checkbox"
-                            data-testid={`select-drift-${k}`}
-                            checked={selectedKeys.has(k)}
-                            onChange={() => toggleSelected(k)}
-                          />
-                        </td>
-                        <td className="py-2 pr-4 font-medium">
-                          <div className="flex items-center gap-2">
-                            <span>{d.workflow_filename}</span>
-                            {group.length > 1 && (
-                              <button
-                                type="button"
-                                className="text-xs text-blue-600 hover:underline dark:text-blue-400"
-                                data-testid={`select-group-${k}`}
-                                onClick={() => selectGroup(d)}
-                              >
-                                {group.length} identical — select all
-                              </button>
-                            )}
-                            {d.is_shared_workflow && (
-                              <span
-                                className="px-2 py-0.5 text-xs rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
-                                data-testid="shared-workflow-badge"
-                              >
-                                Shared Workflow
-                              </span>
-                            )}
-                            {d.has_repo_override && (
-                              <span
-                                className="px-2 py-0.5 text-xs rounded-full bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200"
-                                data-testid="repo-override-badge"
-                                title="This repository uses a workflow override and is no longer following the shared project workflow for this file."
-                              >
-                                Repo Override
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="py-2 pr-4">{d.repo}</td>
-                        <td className="py-2 pr-4">{d.branch}</td>
-                        <td className="py-2 pr-4">
-                          {d.deleted_in_github ? (
-                            <span
-                              className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200"
-                              data-testid="drift-status-deleted"
-                            >
-                              Deleted in GitHub
-                            </span>
-                          ) : (
-                            <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">
-                              Drift detected
-                            </span>
-                          )}
-                        </td>
-                        <td className="py-2 pr-4 text-xs text-slate-500 dark:text-slate-400">
-                          {d.last_checked
-                            ? new Date(d.last_checked).toLocaleString()
-                            : "—"}
-                        </td>
-                        <td className="py-2">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => handleToggleDiff(d, k)}
-                            disabled={diffLoadingKey === k}
-                          >
-                            {diffLoadingKey === k ? "Loading…" : diffButtonLabel}
-                          </Button>
-                        </td>
-                      </tr>
-                      {isOpen && (
-                        <tr>
-                          <td colSpan={7} className="py-2">
-                            <div className="space-y-2">
-                              <p className="text-sm text-slate-700 dark:text-slate-300">
-                                Repository: <strong>{d.repo}</strong>
-                                {" · "}Target branch: <strong>{d.branch}</strong>
-                              </p>
-                              {d.message && (
-                                <p className="text-xs text-slate-500 dark:text-slate-400">
-                                  {d.message}
-                                </p>
+          {(driftCount > 0 || !hasFileDrift) && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm border-collapse">
+                <thead>
+                  <tr className="text-left border-b border-slate-200 dark:border-slate-700">
+                    <th className="py-2 pr-2" />
+                    <th className="py-2 pr-4">Workflow</th>
+                    <th className="py-2 pr-4">Repo</th>
+                    <th className="py-2 pr-4">Branch</th>
+                    <th className="py-2 pr-4">Status</th>
+                    <th className="py-2 pr-4">Last Checked</th>
+                    <th className="py-2">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {drifts.map((d) => {
+                    const k = driftKey(d);
+                    const isOpen = openDiffKey === k;
+                    const diffButtonLabel = isOpen ? "Hide Diff" : "View Diff";
+                    const busy = resolving === k;
+                    const group = driftGroups.get(groupKeyFor(d)) ?? [d];
+                    return (
+                      <React.Fragment key={k}>
+                        <tr className="border-b border-slate-100 dark:border-slate-800">
+                          <td className="py-2 pr-2">
+                            <input
+                              type="checkbox"
+                              data-testid={`select-drift-${k}`}
+                              checked={selectedKeys.has(k)}
+                              onChange={() => toggleSelected(k)}
+                            />
+                          </td>
+                          <td className="py-2 pr-4 font-medium">
+                            <div className="flex items-center gap-2">
+                              <span>{d.workflow_filename}</span>
+                              {group.length > 1 && (
+                                <button
+                                  type="button"
+                                  className="text-xs text-blue-600 hover:underline dark:text-blue-400"
+                                  data-testid={`select-group-${k}`}
+                                  onClick={() => selectGroup(d)}
+                                >
+                                  {group.length} identical — select all
+                                </button>
                               )}
-                              {d.deleted_in_github ? (
-                                <DeletedInGithubPanel
-                                  detail={d}
-                                  busyAction={busy ? resolvingMode : null}
-                                  onRestorePR={() =>
-                                    handleResolve(d, "restore_actionsmanager", "pr")
-                                  }
-                                  onRestoreDirect={() => setConfirmDirect(d)}
-                                  onDeleteEverywhere={() => setConfirmDeleteEverywhere(d)}
-                                />
-                              ) : (
-                                <SideBySideDiff
-                                  left={d.actionsmanager_yaml ?? ""}
-                                  right={liveDiffs[k]?.github_yaml ?? d.github_yaml ?? ""}
-                                  repo={d.repo}
-                                  branch={d.branch}
-                                  onAdoptGithub={() => setAdoptDetail(d)}
-                                  onRestorePR={() =>
-                                    handleResolve(d, "restore_actionsmanager", "pr")
-                                  }
-                                  onRestoreDirect={() => setConfirmDirect(d)}
-                                  busyAction={busy ? resolvingMode : null}
-                                />
+                              {d.is_shared_workflow && (
+                                <span
+                                  className="px-2 py-0.5 text-xs rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
+                                  data-testid="shared-workflow-badge"
+                                >
+                                  Shared Workflow
+                                </span>
+                              )}
+                              {d.has_repo_override && (
+                                <span
+                                  className="px-2 py-0.5 text-xs rounded-full bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200"
+                                  data-testid="repo-override-badge"
+                                  title="This repository uses a workflow override and is no longer following the shared project workflow for this file."
+                                >
+                                  Repo Override
+                                </span>
                               )}
                             </div>
                           </td>
+                          <td className="py-2 pr-4">{d.repo}</td>
+                          <td className="py-2 pr-4">{d.branch}</td>
+                          <td className="py-2 pr-4">
+                            {d.deleted_in_github ? (
+                              <span
+                                className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200"
+                                data-testid="drift-status-deleted"
+                              >
+                                Deleted in GitHub
+                              </span>
+                            ) : (
+                              <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">
+                                Drift detected
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 pr-4 text-xs text-slate-500 dark:text-slate-400">
+                            {d.last_checked
+                              ? new Date(d.last_checked).toLocaleString()
+                              : "—"}
+                          </td>
+                          <td className="py-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => handleToggleDiff(d, k)}
+                              disabled={diffLoadingKey === k}
+                            >
+                              {diffLoadingKey === k ? "Loading…" : diffButtonLabel}
+                            </Button>
+                          </td>
                         </tr>
-                      )}
-                    </React.Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                        {isOpen && (
+                          <tr>
+                            <td colSpan={7} className="py-2">
+                              <div className="space-y-2">
+                                <p className="text-sm text-slate-700 dark:text-slate-300">
+                                  Repository: <strong>{d.repo}</strong>
+                                  {" · "}Target branch: <strong>{d.branch}</strong>
+                                </p>
+                                {d.message && (
+                                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                                    {d.message}
+                                  </p>
+                                )}
+                                {d.deleted_in_github ? (
+                                  <DeletedInGithubPanel
+                                    detail={d}
+                                    busyAction={busy ? resolvingMode : null}
+                                    onRestorePR={() =>
+                                      handleResolve(d, "restore_actionsmanager", "pr")
+                                    }
+                                    onRestoreDirect={() => setConfirmDirect(d)}
+                                    onDeleteEverywhere={() => setConfirmDeleteEverywhere(d)}
+                                  />
+                                ) : (
+                                  <SideBySideDiff
+                                    left={d.actionsmanager_yaml ?? ""}
+                                    right={liveDiffs[k]?.github_yaml ?? d.github_yaml ?? ""}
+                                    repo={d.repo}
+                                    branch={d.branch}
+                                    onAdoptGithub={() => setAdoptDetail(d)}
+                                    onRestorePR={() =>
+                                      handleResolve(d, "restore_actionsmanager", "pr")
+                                    }
+                                    onRestoreDirect={() => setConfirmDirect(d)}
+                                    busyAction={busy ? resolvingMode : null}
+                                  />
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {codeownersDrifts.length > 0 && (
+            <FileDriftSection
+              title="CODEOWNERS"
+              hint={CODEOWNERS_HINT}
+              drift={codeownersDrifts}
+              testId="codeowners-drift-section"
+              onOpen={onOpenCodeowners && (() => {
+                setShowModal(false);
+                onOpenCodeowners();
+              })}
+              openLabel="Open CODEOWNERS"
+              openTestId="open-codeowners-button"
+            />
+          )}
+
+          {customFileDrifts.length > 0 && (
+            <FileDriftSection
+              title="Custom files"
+              hint={CUSTOM_FILE_HINT}
+              drift={customFileDrifts}
+              testId="custom-file-drift-section"
+            />
+          )}
 
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowModal(false)}>

@@ -53,6 +53,7 @@ const PROJECT_STATE = {
   DRAFT: "draft" as const,
   OPEN: "open" as const,
   SYNCED: "synced" as const,
+  DELETING: "deleting" as const,
 };
 
 const STATE_DISPLAY = {
@@ -60,6 +61,7 @@ const STATE_DISPLAY = {
   DRAFT: "Draft" as const,
   OPEN: "Under Review" as const,
   SYNCED: "Synced" as const,
+  DELETING: "Deleting" as const,
 };
 
 // Props interface for the ProjectList component
@@ -254,6 +256,10 @@ const projectHasDrift = (project: Project): boolean => {
 type ProjectStateTone = "neutral" | "info" | "success" | "warning" | "danger";
 
 const getProjectState = (project: Project): { label: string; tone: ProjectStateTone } => {
+  // Ahead of drift: nothing checks a project being deleted, and it is going.
+  if (project.pr_state === PROJECT_STATE.DELETING) {
+    return { label: STATE_DISPLAY.DELETING, tone: "danger" };
+  }
   const cachedDriftStatus = getCachedDriftStatus(project);
   if (projectHasDrift(project)) {
     return { label: "Drift Detected", tone: "danger" };
@@ -375,7 +381,9 @@ const matchesStatusFilter = (
       || projectHasWorkflowStatus(project, LOCAL_CHANGE_STATUS_VALUES);
   }
 
+  // A project being deleted is waiting on its removal pull requests' review.
   return project.pr_state === PROJECT_STATE.OPEN
+    || project.pr_state === PROJECT_STATE.DELETING
     || projectHasWorkflowStatus(project, UNDER_REVIEW_STATUS_VALUES);
 };
 
@@ -394,7 +402,7 @@ const ProjectList: React.FC<ProjectListProps> = ({
   const [namingModeFilter, setNamingModeFilter] = useState<"all" | "prefix" | "no_prefix">("all");
   const [statusFilter, setStatusFilter] = useState<StatusFilterValue>("all");
 
-  const handleLoadProject = (projectName: string): void => {
+  const handleLoadProject = (projectName: string, projectId?: number | string): void => {
     console.log("📌 Debug: Loading Project:", projectName);
 
     if (!user) {
@@ -404,7 +412,8 @@ const ProjectList: React.FC<ProjectListProps> = ({
 
     // Navigate to the project URL; the parent's useEffect will trigger
     // loadProjectFromAPI (which has a staleness guard) to load the data.
-    navigate(`/project/${user}/${projectName}`);
+    // The id tells the page which project it is when another owner's has the same name (#2240).
+    navigate(`/project/${user}/${projectName}`, { state: { projectId } });
   };
 
   const filtersActive = (
@@ -586,7 +595,7 @@ const ProjectList: React.FC<ProjectListProps> = ({
                 data-testid="project-type-filter"
                 value={projectTypeFilter}
                 onChange={(e) => setProjectTypeFilter(e.target.value as typeof projectTypeFilter)}
-                className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-none focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100"
+                className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-hidden focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100"
                 style={{ colorScheme: "light dark" }}
               >
                 <option value="all">All</option>
@@ -604,7 +613,7 @@ const ProjectList: React.FC<ProjectListProps> = ({
                 data-testid="project-status-filter"
                 value={statusFilter}
                 onChange={(e) => setStatusFilter(e.target.value as StatusFilterValue)}
-                className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-none focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100"
+                className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-hidden focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100"
                 style={{ colorScheme: "light dark" }}
               >
                 {STATUS_FILTER_OPTIONS.map(({ value, label }) => (
@@ -644,7 +653,7 @@ const ProjectList: React.FC<ProjectListProps> = ({
                         data-testid="project-visibility-filter"
                         value={visibilityFilter}
                         onChange={(e) => setVisibilityFilter(e.target.value as typeof visibilityFilter)}
-                        className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-none focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100"
+                        className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-hidden focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100"
                         style={{ colorScheme: "light dark" }}
                       >
                         <option value="all">All</option>
@@ -662,7 +671,7 @@ const ProjectList: React.FC<ProjectListProps> = ({
                         data-testid="project-naming-mode-filter"
                         value={namingModeFilter}
                         onChange={(e) => setNamingModeFilter(e.target.value as typeof namingModeFilter)}
-                        className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-none focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100"
+                        className="h-10 w-full rounded-md border border-slate-200 bg-white/80 px-3 text-sm text-slate-900 shadow-sm transition focus:outline-hidden focus:ring-2 focus:ring-sky-500/25 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-100"
                         style={{ colorScheme: "light dark" }}
                       >
                         <option value="all">All</option>
@@ -741,7 +750,8 @@ const ProjectList: React.FC<ProjectListProps> = ({
               const projectState = project.pr_state ?? PROJECT_STATE.NEW;
               const showContinueEditing = projectState === PROJECT_STATE.DRAFT;
               const showConfigure = projectState === PROJECT_STATE.NEW;
-              const showView = projectState === PROJECT_STATE.SYNCED || projectState === PROJECT_STATE.OPEN;
+              const showView = projectState === PROJECT_STATE.SYNCED || projectState === PROJECT_STATE.OPEN
+                || projectState === PROJECT_STATE.DELETING;
               const showOpenPrPlaceholder = projectState === PROJECT_STATE.OPEN;
               const scopeVisibility = (project.repository_visibility_scope ?? "public").toString().toLowerCase() === "private"
                 ? "Private"
@@ -782,8 +792,8 @@ const ProjectList: React.FC<ProjectListProps> = ({
                     <>
                   <button
                     type="button"
-                    className="absolute inset-0 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
-                    onClick={() => handleLoadProject(projectName)}
+                    className="absolute inset-0 rounded-lg focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-slate-400"
+                    onClick={() => handleLoadProject(projectName, project.project_id ?? project.id)}
                     aria-label={`Open project ${projectName || project.project_code || "project"}`}
                   />
                   <Card className="pointer-events-none relative h-full border-slate-200 bg-white/85 shadow-sm transition-shadow hover:border-slate-300 hover:shadow-md dark:border-slate-700/80 dark:bg-slate-900/70 dark:hover:border-slate-600">
@@ -877,7 +887,7 @@ const ProjectList: React.FC<ProjectListProps> = ({
                           <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
                             {showContinueEditing && (
                               <DropdownMenuItem
-                                onSelect={() => handleLoadProject(projectName)}
+                                onSelect={() => handleLoadProject(projectName, project.project_id ?? project.id)}
                                 data-testid="project-action-continue-editing"
                               >
                                 Continue Editing
@@ -885,7 +895,7 @@ const ProjectList: React.FC<ProjectListProps> = ({
                             )}
                             {showConfigure && (
                               <DropdownMenuItem
-                                onSelect={() => handleLoadProject(projectName)}
+                                onSelect={() => handleLoadProject(projectName, project.project_id ?? project.id)}
                                 data-testid="project-action-configure"
                               >
                                 Configure
@@ -893,7 +903,7 @@ const ProjectList: React.FC<ProjectListProps> = ({
                             )}
                             {showView && (
                               <DropdownMenuItem
-                                onSelect={() => handleLoadProject(projectName)}
+                                onSelect={() => handleLoadProject(projectName, project.project_id ?? project.id)}
                                 data-testid="project-action-view"
                               >
                                 View

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import GUIWorkflowEditor from './GUIWorkflowEditor';
@@ -240,6 +240,101 @@ describe('GUIWorkflowEditor step detail panel', () => {
     expect(screen.getAllByLabelText('Step Name (optional)')).toHaveLength(1);
   });
 
+  // GitHub rejects two steps with the same id in one job, and references to
+  // `steps.<id>` should keep pointing at the original.
+  it('does not copy the YAML id when a step is duplicated', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const withId = makeWorkflow({
+      jobs: [{
+        id: 'build',
+        name: 'Build',
+        runsOn: 'ubuntu-latest',
+        steps: [{ id: 'meta', yamlId: 'meta', name: 'Read version', run: 'make' }],
+      }],
+    });
+    render(<Harness initial={withId} onChange={onChange} />);
+
+    await user.click(screen.getAllByTitle('Duplicate step')[0]);
+
+    const [original, copy] = (onChange.mock.calls.at(-1)![0] as WorkflowGUI).jobs[0].steps;
+    expect(original.yamlId).toBe('meta');
+    expect(copy.yamlId).toBeUndefined();
+  });
+
+  // Step ids are scoped to their job, so the copied job's own references still resolve.
+  it('keeps step YAML ids in a duplicated job', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const withId = makeWorkflow({
+      jobs: [{
+        id: 'build',
+        name: 'Build',
+        runsOn: 'ubuntu-latest',
+        steps: [{ id: 'meta', yamlId: 'meta', name: 'Read version', run: 'make' }],
+      }],
+    });
+    render(<Harness initial={withId} onChange={onChange} />);
+
+    await user.click(screen.getAllByTitle('Duplicate job')[0]);
+
+    const jobs = (onChange.mock.calls.at(-1)![0] as WorkflowGUI).jobs;
+    expect(jobs.map(j => j.steps[0].yamlId)).toEqual(['meta', 'meta']);
+  });
+
+  // GitHub allows no runs-on, steps, env or timeout-minutes on a job that
+  // calls a reusable workflow, so the GUI offers none of them there.
+  it('shows a caller job the workflow it calls instead of a runner and steps', async () => {
+    const user = userEvent.setup();
+    const withCaller = makeWorkflow({
+      jobs: [
+        { id: 'build', name: 'Build', runsOn: 'ubuntu-latest', steps: [{ id: 'step-1', name: 'Checkout' }] },
+        {
+          id: 'deploy',
+          name: 'Deploy',
+          runsOn: 'ubuntu-latest',
+          steps: [],
+          uses: 'org/repo/.github/workflows/deploy.yml@main',
+          unsupportedFields: { secrets: 'inherit' },
+        },
+      ],
+    });
+    render(<Harness initial={withCaller} />);
+
+    for (const toggle of screen.getAllByRole('button', { name: /Advanced Settings/ })) {
+      await user.click(toggle);
+    }
+
+    expect(screen.getByText('org/repo/.github/workflows/deploy.yml@main')).toBeInTheDocument();
+    expect(screen.getAllByLabelText(/^Runner/)).toHaveLength(1);
+    expect(screen.getAllByLabelText('Timeout (minutes)')).toHaveLength(1);
+    expect(screen.getAllByText('Job Environment Variables')).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: /Add Step/ })).toHaveLength(1);
+    expect(screen.getAllByLabelText('If Condition (optional)')).toHaveLength(2);
+  });
+
+  // `needs: build` round-trips as a string; treating it as an array matched
+  // `build-docker` by substring and spread the string into characters.
+  it('edits a single needs: string as one dependency', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const job = (id: string, needs?: string) => ({ id, runsOn: 'ubuntu-latest', steps: [{ id: 'step-1', run: 'make' }], needs });
+    render(
+      <Harness initial={makeWorkflow({ jobs: [job('build'), job('build-docker'), job('test', 'build')] })} onChange={onChange} />
+    );
+    const needs = within(document.getElementById('job-needs-test')!);
+    const lastNeeds = () => (onChange.mock.calls.at(-1)![0] as WorkflowGUI).jobs[2].needs;
+
+    expect(needs.getByRole('checkbox', { name: 'build' })).toBeChecked();
+    expect(needs.getByRole('checkbox', { name: 'build-docker' })).not.toBeChecked();
+
+    await user.click(needs.getByRole('checkbox', { name: 'build-docker' }));
+    expect(lastNeeds()).toEqual(['build', 'build-docker']);
+
+    await user.click(needs.getByRole('checkbox', { name: 'build' }));
+    expect(lastNeeds()).toEqual(['build-docker']);
+  });
+
   it('remounts the form when switching between same-id steps in different jobs', async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
@@ -398,14 +493,28 @@ describe('GUIWorkflowEditor variants', () => {
 
   it('defaults to the regular variant', () => {
     renderVariant();
-    expect(screen.getByText('Workflow Name *')).toBeInTheDocument();
+    expect(screen.getByText('Workflow Name (optional)')).toBeInTheDocument();
     expect(screen.getByPlaceholderText('Enter workflow name...')).toBeInTheDocument();
     expect(screen.getByText('Trigger Events *')).toBeInTheDocument();
   });
 
+  it('shows no error for a workflow without a name', () => {
+    render(
+      <GUIWorkflowEditor
+        workflow={makeWorkflow({ name: '' })}
+        onChange={() => {}}
+        importedActions={[] as ActionsProject[]}
+        actionGroups={[] as ActionGroup[]}
+      />
+    );
+
+    expect(screen.queryByText('Workflow name is required')).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Enter workflow name...')).not.toHaveClass('error');
+  });
+
   it('labels the reusable variant for reusable workflows', () => {
     renderVariant('reusable');
-    expect(screen.getByText('Reusable Workflow Name *')).toBeInTheDocument();
+    expect(screen.getByText('Reusable Workflow Name (optional)')).toBeInTheDocument();
     expect(screen.getByPlaceholderText('Enter reusable workflow name...')).toBeInTheDocument();
     // Singular: a reusable workflow only ever triggers on workflow_call.
     expect(screen.getByText('Trigger Event')).toBeInTheDocument();

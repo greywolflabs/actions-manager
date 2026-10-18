@@ -109,6 +109,20 @@ Quick reference for common errors and their solutions.
 
 ---
 
+### "More than one project is named …"
+
+**Symptoms:** An action on a project you don't own fails with *More than one project is named 'X'. Open it from the projects list, or rename one so they can be told apart.*
+
+**Causes:** Project names are unique per owner, not across the workspace. A project page tells ActionsManager which project it shows, so actions taken from the page act on that project even when another owner's project has the same name. A request that only names the project — a bookmarked or shared project link, or a direct API call — can't say which one it means when two owners use that name and you own neither (or hold a grant on both). ActionsManager refuses rather than guess, because a guess could act on the other project.
+
+The owners of each project are not affected: a name always resolves to the project they own.
+
+**Solutions:**
+1. Open the project from the projects list rather than a bookmarked link.
+2. Or rename one of the projects from the project sidebar (see [Renaming a Project](../features/projects.html#renaming-a-project)), so links and direct calls work too. Anyone with editor access to that project can rename it, and its owner and workspace admins always can.
+
+---
+
 ## Workflow and PR Errors
 
 ### PR campaign creates no PRs

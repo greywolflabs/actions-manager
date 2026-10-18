@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
 import requests
+from error_detail import failure_kind
 
 GITHUB_USER_API_URL = "https://api.github.com/user"
 
@@ -219,10 +220,11 @@ class GitHubPermissionValidator:
                 "token_type": self.token_type,
             }
         except Exception as e:
+            print(f"❌ Token type check failed: {e}")
             return {
                 "is_github_app": False,
                 "token_valid": False,
-                "error": str(e),
+                "error": failure_kind(e),
                 "token_type": self.token_type,
             }
 
@@ -448,7 +450,8 @@ class GitHubPermissionValidator:
             else:
                 return {"valid": False, "error": f"Unexpected status code: {response.status_code}"}
         except Exception as e:
-            return {"valid": False, "error": f"Error checking token: {str(e)}"}
+            print(f"❌ Token validity check failed: {e}")
+            return {"valid": False, "error": f"Error checking token: {failure_kind(e)}"}
 
     def _check_oauth_scopes(self) -> Dict:
         """
@@ -486,11 +489,12 @@ class GitHubPermissionValidator:
                 "has_all_required": len(missing_scopes) == 0
             }
         except Exception as e:
+            print(f"❌ OAuth scope check failed: {e}")
             return {
                 "granted_scopes": [],
                 "missing_scopes": list(REQUIRED_GITHUB_PERMISSIONS.keys()),
                 "has_all_required": False,
-                "error": str(e)
+                "error": failure_kind(e)
             }
 
     def _check_repository_access(self) -> Dict:
@@ -552,10 +556,11 @@ class GitHubPermissionValidator:
                 "limited_repos": limited_repos
             }
         except Exception as e:
+            print(f"❌ Repository access check failed: {e}")
             return {
                 "has_repo_access": False,
                 "accessible_repos": [],
-                "error": str(e)
+                "error": failure_kind(e)
             }
 
     def _check_github_app_permissions(self) -> Dict:
@@ -701,29 +706,13 @@ class GitHubPermissionValidator:
                 "has_org_restrictions": len(restricted_orgs) > 0
             }
         except Exception as e:
+            print(f"❌ Organization access check failed: {e}")
             return {
                 "has_orgs": False,
                 "organizations": [],
                 "has_org_restrictions": False,
-                "error": str(e)
+                "error": failure_kind(e)
             }
-
-
-def get_required_scopes() -> List[str]:
-    """Get list of required OAuth scope strings"""
-    return list(REQUIRED_GITHUB_PERMISSIONS.keys())
-
-
-def get_required_scopes_description() -> Dict[str, Dict]:
-    """Get detailed descriptions of all required scopes"""
-    return {
-        scope: {
-            "description": perm.description,
-            "required_for": perm.required_for,
-            "critical": perm.critical
-        }
-        for scope, perm in REQUIRED_GITHUB_PERMISSIONS.items()
-    }
 
 
 def _valid_permission_message(auth_type: Optional[str], token_type: Optional[str]) -> str:

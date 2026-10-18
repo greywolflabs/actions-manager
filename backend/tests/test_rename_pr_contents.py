@@ -4,26 +4,59 @@ The user's requirement, stated plainly: opening the pull request must do two
 things — write the new filename, and delete the old one — so the PR carries two
 changes rather than a new file plus an orphan nobody removes.
 
-The existing delivery tests mock ``_delete_workflow_from_branch``, which proves
-the branch is wired but not what actually reaches GitHub. These assert on the
-HTTP calls themselves: the PUT path, the DELETE path, and that both name the
-same AM branch.
+The old one is where the delivery record says the workflow was delivered on the
+target. These assert on the HTTP calls themselves: the PUT path, the DELETE
+path, and that both name the same AM branch.
 """
 import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from tests.conftest import TestingSessionLocal
-from workflows import _commit_workflows_to_branch
+from models import Account, Base, Project, ProjectWorkflow, Workflow  # noqa: E402
+from tests.delivery_records import record_delivered  # noqa: E402
+from workflows import _commit_workflows_to_branch  # noqa: E402
 
 OWNER, REPO, CODE, AM_BRANCH = "acme", "app", "MYP1", "AM_MYP1_update"
 
+engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-def _run(workflow_dict):
+
+@pytest.fixture(autouse=True)
+def _schema():
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+
+
+def _delivered(db, name, delivered_file, use_prefix):
+    """Workflow *name*, delivered to acme/app on main as *delivered_file*; returns its campaign dict."""
+    account = Account(github_user="octocat", github_email="o@example.com", account_type="free")
+    db.add(account)
+    db.flush()
+    project = Project(project_name="pr-contents", project_code=CODE, user_id=account.user_id,
+                      project_type="standard", use_prefix=use_prefix)
+    workflow = Workflow(workflow_name=name, workflow_yaml="name: x\non: push", workflow_status="committed_locally")
+    db.add_all([project, workflow])
+    db.flush()
+    db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=workflow.workflow_id))
+    db.commit()
+    if delivered_file:
+        record_delivered(db, workflow, f"{OWNER}/{REPO}", "main", sha="a" * 40,
+                         path=f".github/workflows/{delivered_file}")
+    return {"id": workflow.workflow_id, "name": name, "content": "name: x\non: push"}
+
+
+def _run(name, delivered_file):
     """Drive the campaign's commit loop with GitHub's HTTP surface mocked."""
-    db = TestingSessionLocal()
+    db = Session()
     puts, deletes = [], []
 
     def fake_put(url, *a, **kwargs):
@@ -43,6 +76,7 @@ def _run(workflow_dict):
         return MagicMock(status_code=200, json=lambda: {"sha": "a" * 40})
 
     try:
+        workflow_dict = _delivered(db, name, delivered_file, True)
         with patch("workflows.github_put", side_effect=fake_put), \
              patch("workflows.requests.delete", side_effect=fake_delete), \
              patch("workflows.github_get", side_effect=fake_get), \
@@ -50,7 +84,7 @@ def _run(workflow_dict):
              patch("workflows._update_workflow_git_hash"):
             committed, errors = _commit_workflows_to_branch(
                 [workflow_dict], OWNER, REPO, CODE, AM_BRANCH,
-                {}, f"{OWNER}/{REPO}", "octocat", db, True,
+                {}, f"{OWNER}/{REPO}", "octocat", db, True, target=(f"{OWNER}/{REPO}", "main"),
             )
         return committed, errors, puts, deletes
     finally:
@@ -58,9 +92,7 @@ def _run(workflow_dict):
 
 
 def test_opening_the_pr_writes_the_new_file_and_deletes_the_old_one():
-    committed, errors, puts, deletes = _run(
-        {"name": "renamed", "content": "name: x\non: push", "renamed_from": "okokok"}
-    )
+    committed, errors, puts, deletes = _run("renamed", "AM_MYP1_okokok.yml")
 
     assert errors == []
     assert committed == ["renamed"]
@@ -76,7 +108,7 @@ def test_opening_the_pr_writes_the_new_file_and_deletes_the_old_one():
 
 
 def test_an_ordinary_edit_deletes_nothing():
-    _, errors, puts, deletes = _run({"name": "renamed", "content": "name: x", "renamed_from": None})
+    _, errors, puts, deletes = _run("renamed", "AM_MYP1_renamed.yml")
 
     assert errors == []
     assert len(puts) == 1
@@ -86,9 +118,9 @@ def test_an_ordinary_edit_deletes_nothing():
 # --- the delete must never target the path the same campaign just wrote ------
 
 
-def _run_unprefixed(workflow_dict):
+def _run_unprefixed(name, delivered_file):
     """Same as _run, without the AM_<CODE>_ prefix, where names collide."""
-    db = TestingSessionLocal()
+    db = Session()
     puts, deletes = [], []
 
     def fake_put(url, *a, **kwargs):
@@ -103,6 +135,7 @@ def _run_unprefixed(workflow_dict):
         return MagicMock(status_code=200, json=lambda: {"sha": "a" * 40})
 
     try:
+        workflow_dict = _delivered(db, name, delivered_file, False)
         with patch("workflows.github_put", side_effect=fake_put), \
              patch("workflows.requests.delete", side_effect=fake_delete), \
              patch("workflows.github_get", side_effect=fake_get), \
@@ -110,7 +143,7 @@ def _run_unprefixed(workflow_dict):
              patch("workflows._update_workflow_git_hash"):
             _commit_workflows_to_branch(
                 [workflow_dict], OWNER, REPO, CODE, AM_BRANCH,
-                {}, f"{OWNER}/{REPO}", "octocat", db, False,
+                {}, f"{OWNER}/{REPO}", "octocat", db, False, target=(f"{OWNER}/{REPO}", "main"),
             )
         return puts, deletes
     finally:
@@ -120,14 +153,13 @@ def _run_unprefixed(workflow_dict):
 def test_adding_the_yml_suffix_does_not_delete_the_file_just_written():
     """Without a prefix, `ci` and `ci.yml` are both `ci.yml`.
 
-    renamed_from records a NAME; the guard used to compare names, so `ci` !=
-    `ci.yml` and the removal went ahead — PUT ci.yml then DELETE ci.yml on the
-    same branch. Merging that campaign removed the workflow from every target
-    repository while ActionsManager reported the rename as delivered.
+    A guard comparing names saw `ci` != `ci.yml` and removed the file —
+    PUT ci.yml then DELETE ci.yml on the same branch. Merging that campaign
+    removed the workflow from every target repository while ActionsManager
+    reported the rename as delivered. The record holds paths, so the delivered
+    `ci.yml` is the one being written.
     """
-    puts, deletes = _run_unprefixed(
-        {"name": "ci.yml", "content": "name: x", "renamed_from": "ci"}
-    )
+    puts, deletes = _run_unprefixed("ci.yml", "ci.yml")
 
     assert len(puts) == 1
     assert puts[0].endswith("/.github/workflows/ci.yml")
@@ -135,9 +167,7 @@ def test_adding_the_yml_suffix_does_not_delete_the_file_just_written():
 
 
 def test_dropping_the_yml_suffix_is_the_same_collision():
-    puts, deletes = _run_unprefixed(
-        {"name": "ci", "content": "name: x", "renamed_from": "ci.yml"}
-    )
+    puts, deletes = _run_unprefixed("ci", "ci.yml")
 
     assert len(puts) == 1
     assert deletes == []
@@ -145,13 +175,11 @@ def test_dropping_the_yml_suffix_is_the_same_collision():
 
 def test_a_case_only_difference_does_not_delete_the_file_just_written():
     """`ci` -> `ci2` -> `CI` is the two-step route the case-only refusal
-    recommends, and it leaves renamed_from='ci' against workflow_name='CI'.
+    recommends, and it leaves `ci.yml` delivered against workflow_name='CI'.
     If GitHub's contents API folds case, deleting `ci.yml` destroys `CI.yml`.
     Leaving an orphan is the cheaper mistake, so the comparison ignores case.
     """
-    puts, deletes = _run_unprefixed(
-        {"name": "CI", "content": "name: x", "renamed_from": "ci"}
-    )
+    puts, deletes = _run_unprefixed("CI", "ci.yml")
 
     assert len(puts) == 1
     assert deletes == []
@@ -159,9 +187,7 @@ def test_a_case_only_difference_does_not_delete_the_file_just_written():
 
 def test_a_genuine_rename_still_removes_the_old_file():
     """The guard must skip the collision and nothing else."""
-    puts, deletes = _run_unprefixed(
-        {"name": "ci-v2", "content": "name: x", "renamed_from": "ci"}
-    )
+    puts, deletes = _run_unprefixed("ci-v2", "ci.yml")
 
     assert len(puts) == 1
     assert puts[0].endswith("/.github/workflows/ci-v2.yml")

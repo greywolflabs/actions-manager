@@ -9,7 +9,7 @@ any authenticated user can create, view, edit, or delete any group.
 
 from typing import Annotated, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Depends, Query, Request
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -30,13 +30,11 @@ _MSG_GROUP_NOT_FOUND = "Action Group not found"
 
 
 class ActionGroupCreateRequest(BaseModel):
-    github_user: str
     name: str
     description: Optional[str] = None
 
 
 class ActionGroupUpdateRequest(BaseModel):
-    github_user: str
     name: str
     description: Optional[str] = None
 
@@ -59,17 +57,11 @@ class _ApiError(Exception):
         self.detail = detail
 
 
-def _require_token(request: Request, db: Session, github_user: str) -> str:
-    """Verify the caller's actual session belongs to github_user, then return
-    their stored GitHub token. github_user is client-supplied (query param or
-    request body), so it must never be trusted as identity on its own -
-    resolve_authenticated_user reads the server-issued session cookie instead."""
-    account = auth_module.resolve_authenticated_user(request, db)
-    if account.github_user.lower() != github_user.lower():
-        raise _ApiError(403, "Access denied")
-    if github_user not in user_tokens:
+def _require_token(account) -> str:
+    """The session caller's stored GitHub token (#2241), or 401 when none is held."""
+    if account.github_user not in user_tokens:
         raise _ApiError(401, _MSG_NOT_AUTHENTICATED)
-    return user_tokens[github_user]
+    return user_tokens[account.github_user]
 
 
 def _get_group_or_404(db: Session, action_group_id: int) -> ActionGroup:
@@ -107,19 +99,19 @@ def _to_group_response(group: ActionGroup, member_ids: List[int]) -> ActionGroup
     responses={401: {"description": _MSG_NOT_AUTHENTICATED}},
 )
 def create_action_group(
-    request: Request,
     payload: ActionGroupCreateRequest,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, payload.github_user)
+        _require_token(account)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
     group = ActionGroup(
         name=payload.name,
         description=payload.description,
-        last_modified_by=payload.github_user,
+        last_modified_by=account.github_user,
     )
     db.add(group)
     db.commit()
@@ -133,12 +125,11 @@ def create_action_group(
     responses={401: {"description": _MSG_NOT_AUTHENTICATED}},
 )
 def list_action_groups(
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, github_user)
+        _require_token(account)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
@@ -165,13 +156,12 @@ def list_action_groups(
     },
 )
 def get_action_group(
-    request: Request,
     action_group_id: int,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, github_user)
+        _require_token(account)
         group = _get_group_or_404(db, action_group_id)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -187,20 +177,20 @@ def get_action_group(
     },
 )
 def update_action_group(
-    request: Request,
     action_group_id: int,
     payload: ActionGroupUpdateRequest,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, payload.github_user)
+        _require_token(account)
         group = _get_group_or_404(db, action_group_id)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
     group.name = payload.name
     group.description = payload.description
-    group.last_modified_by = payload.github_user
+    group.last_modified_by = account.github_user
     db.commit()
     db.refresh(group)
     return _to_group_response(group, _member_ids(db, action_group_id))
@@ -215,13 +205,12 @@ def update_action_group(
     },
 )
 def delete_action_group(
-    request: Request,
     action_group_id: int,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, github_user)
+        _require_token(account)
         group = _get_group_or_404(db, action_group_id)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -238,14 +227,13 @@ def delete_action_group(
     },
 )
 def add_action_to_group(
-    request: Request,
     action_group_id: int,
     actions_project_id: int,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, github_user)
+        _require_token(account)
         group = _get_group_or_404(db, action_group_id)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -275,14 +263,13 @@ def add_action_to_group(
     },
 )
 def remove_action_from_group(
-    request: Request,
     action_group_id: int,
     actions_project_id: int,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
 ):
     try:
-        _require_token(request, db, github_user)
+        _require_token(account)
         group = _get_group_or_404(db, action_group_id)
     except _ApiError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)

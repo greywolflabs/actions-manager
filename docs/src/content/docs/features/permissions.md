@@ -22,16 +22,21 @@ change.
 | Role | Sees | Changes |
 |---|---|---|
 | **Admin** | every project | everything, with no project assignment needed |
-| **Member** | every project, read-only | only the projects an admin has made them an **Editor** of |
-| **Read Only** | only projects they have been assigned to | nothing, ever |
+| **Member** | every project, read-only | the projects they own, and the ones an admin has made them an **Editor** of |
+| **Read Only** | only projects they own or have been assigned to | nothing, ever |
 
 ActionsManager is a single workspace: every project belongs to it. So adding someone as
 a **Member** is what gives them the workspace — they can open any project and read its
 workflows, campaigns and history immediately, without being assigned to it one by one.
 
+Creating a project makes you its **owner**. A Member changes the work in a project they
+own without being assigned to it, as an Editor would. Project Configs stays Admin-only
+even for the owner — see [What requires Admin](#what-requires-admin).
+
 A **Read Only** user is the opposite: they see nothing until an admin assigns them to a
-specific project, and no assignment ever grants them write access. Writes are refused
-before the request reaches the feature.
+specific project, and no assignment ever grants them write access — nor does owning a
+project they created before their role changed. Writes are refused before the request
+reaches the feature.
 
 ## Project roles
 

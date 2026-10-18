@@ -73,7 +73,7 @@ vi.mock("./api/actionsProjects", () => ({ listActionsProjects: vi.fn().mockResol
 vi.mock("./api/actionGroups", () => ({ listActionGroups: vi.fn().mockResolvedValue([]) }));
 
 vi.mock("./api/codeowners", () => ({
-  getProjectCodeownersStatuses: vi.fn().mockResolvedValue({ statuses: [] }),
+  getProjectCodeowners: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("./components/Sidebar", () => ({
@@ -320,9 +320,10 @@ describe("ProjectMgmt – rename navigates to new URL (stale-name regression)", 
 
     // The key assertion: navigate must be called with the new project name in the URL
     await waitFor(() => {
+      // The id rides along so a reload still opens this project (#2240).
       expect(mockNavigate).toHaveBeenCalledWith(
         "/project/alice/new-name",
-        { replace: true }
+        { replace: true, state: { projectId: 42 } }
       );
     });
 

@@ -27,14 +27,15 @@ from sqlalchemy.pool import StaticPool
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import deliveries  # noqa: E402
 from models import (  # noqa: E402
-    Base, Account, Project, Repo, ProjectRepo, Workflow, ProjectWorkflow,
-    WorkflowDriftState,
+    Base, Account, Project, Repo, ProjectRepo, Workflow, ProjectWorkflow, FileDelivery,
 )
 from workflows import (  # noqa: E402
     DriftCheckUnavailable, _process_regular_workflows, _prefetch_workflow_shas_per_repo,
 )
-from drift_notifications import clear_workflow_drift  # noqa: E402
+from drift_notifications import clear_drift  # noqa: E402
+from tests.delivery_records import record_delivered, record_drift  # noqa: E402
 
 engine = create_engine(
     "sqlite:///:memory:",
@@ -75,7 +76,8 @@ def _repo(db, project, name="acme/api"):
     return repo
 
 
-def _workflow(db, project, name="ci", git_hash="sha-local"):
+def _workflow(db, project, name="ci", git_hash="sha-local", delivered_to=()):
+    """A workflow, delivered as blob *git_hash* to acme/api on each of *delivered_to*."""
     wf = Workflow(
         workflow_name=name, workflow_yaml="name: ci\non: push\n",
         workflow_git_hash=git_hash, reusable_workflow=False,
@@ -84,6 +86,8 @@ def _workflow(db, project, name="ci", git_hash="sha-local"):
     db.add(wf); db.commit(); db.refresh(wf)
     db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=wf.workflow_id))
     db.commit()
+    for branch in delivered_to:
+        record_delivered(db, wf, "acme/api", branch, sha=git_hash)
     return wf
 
 
@@ -99,7 +103,7 @@ class TestDriftChecksTheProjectsTargetBranches:
         """
         project = _project(db, branch_option="pattern", branch_regex=r"^release/")
         _repo(db, project)
-        _workflow(db, project)
+        _workflow(db, project, delivered_to=("main", "release/2.0"))
 
         shas = {
             "main": {"ci.yml": "sha-local"},          # identical -> would look clean
@@ -130,7 +134,7 @@ class TestDriftChecksTheProjectsTargetBranches:
     def test_each_matched_branch_is_reported_separately(self, db):
         project = _project(db, branch_option="pattern", branch_regex=r"^release/")
         _repo(db, project)
-        _workflow(db, project)
+        _workflow(db, project, delivered_to=("release/2.0", "release/2.1"))
 
         shas = {
             "release/2.0": {"ci.yml": "sha-local"},   # in sync
@@ -155,7 +159,7 @@ class TestDriftChecksTheProjectsTargetBranches:
         """No behaviour change for the ordinary case."""
         project = _project(db, branch_option="default")
         _repo(db, project)
-        _workflow(db, project)
+        _workflow(db, project, delivered_to=("trunk",))
         checked = []
 
         with patch("workflows.get_default_branch", return_value="trunk"), \
@@ -172,7 +176,7 @@ class TestDriftChecksTheProjectsTargetBranches:
         """Carried as data, not recovered by substring-matching the message."""
         project = _project(db)
         _repo(db, project)
-        _workflow(db, project)
+        _workflow(db, project, delivered_to=("main",))
 
         with patch("workflows.get_default_branch", return_value="main"), \
              patch("workflows.fetch_workflow_tree", return_value=({"ci.yml": "sha-local"}, None)):
@@ -197,14 +201,8 @@ class TestUnresolvableBranchIsUnknown:
 
 
 class TestResolutionIsBranchScoped:
-    def _drifted(self, db, project, wf, repo, branch):
-        state = WorkflowDriftState(
-            project_id=project.project_id, workflow_id=wf.workflow_id,
-            repo_id=repo.repo_id, branch=branch, has_drift=True,
-            content_hash="h", drift_cycle_count=1,
-        )
-        db.add(state); db.commit()
-        return state
+    def _drifted(self, db, wf, repo, branch):
+        record_drift(db, wf, repo.repo_name, branch)
 
     def test_clearing_one_branch_leaves_the_other_drifted(self, db):
         """Otherwise fixing release/2.1 reports the workflow clean while
@@ -212,13 +210,13 @@ class TestResolutionIsBranchScoped:
         project = _project(db)
         repo = _repo(db, project)
         wf = _workflow(db, project)
-        self._drifted(db, project, wf, repo, "release/2.1")
-        self._drifted(db, project, wf, repo, "release/2.2")
+        self._drifted(db, wf, repo, "release/2.1")
+        self._drifted(db, wf, repo, "release/2.2")
 
-        cleared = clear_workflow_drift(db, project, wf.workflow_id, repo.repo_name, "release/2.1")
+        cleared = clear_drift(db, project, deliveries.WORKFLOW, wf.workflow_id, repo.repo_name, "release/2.1")
 
         assert cleared == 1
-        remaining = {s.branch: s.has_drift for s in db.query(WorkflowDriftState).all()}
+        remaining = {s.branch: s.has_drift for s in db.query(FileDelivery).all()}
         assert remaining == {"release/2.1": False, "release/2.2": True}
 
     def test_clearing_without_a_branch_still_clears_the_whole_repo(self, db):
@@ -226,10 +224,10 @@ class TestResolutionIsBranchScoped:
         project = _project(db)
         repo = _repo(db, project)
         wf = _workflow(db, project)
-        self._drifted(db, project, wf, repo, "release/2.1")
-        self._drifted(db, project, wf, repo, "release/2.2")
+        self._drifted(db, wf, repo, "release/2.1")
+        self._drifted(db, wf, repo, "release/2.2")
 
-        cleared = clear_workflow_drift(db, project, wf.workflow_id, repo.repo_name)
+        cleared = clear_drift(db, project, deliveries.WORKFLOW, wf.workflow_id, repo.repo_name)
 
         assert cleared == 2
 

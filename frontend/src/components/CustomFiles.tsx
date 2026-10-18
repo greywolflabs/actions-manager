@@ -10,10 +10,16 @@ import {
   updateCustomFile,
   deleteCustomFile,
   restoreCustomFile,
+  getCustomFileOnGitHub,
   validateFilePath,
 } from "../api/customFiles";
+import type { CustomFileDriftDetail } from "../api/drift";
+import { FileDriftBadge, FileDriftBanner, driftTargetLabel } from "./FileDriftBanner";
 import { toast } from "../utils/toast";
 import RemovalScopeDialog, { RemovalDelivery, RemovalScope } from "./RemovalScopeDialog";
+import { UnlockOverlay, UnlockUnderReviewDialog } from "./UnlockUnderReview";
+import { updateWorkflows } from "../api/workflows";
+import { assertPushed } from "../utils/workflowOperations";
 import { apiErrorMessage } from "../utils/apiErrorMessage";
 import "../styles/UnifiedWorkflows.css";
 
@@ -126,8 +132,8 @@ export const FileForm = React.forwardRef<HTMLFormElement, FileFormProps>(
   const isEditing = !!initial?.id;
   const buttonLabel = saving ? "Saving…" : (isEditing ? "Save Changes" : "Add File");
 
-  const inputCls = "w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500";
-  const filePathCls = `w-full rounded-md border px-2 py-1.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-1 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500 dark:placeholder:text-slate-500 dark:disabled:bg-slate-700 dark:disabled:text-slate-400 ${pathError ? "border-red-400 bg-red-50 text-slate-900 focus:border-red-500 focus:ring-red-500 dark:border-red-600 dark:bg-red-900/10 dark:text-slate-100" : "border-slate-300 bg-white text-slate-900 focus:border-blue-500 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"}`;
+  const inputCls = "w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500";
+  const filePathCls = `w-full rounded-md border px-2 py-1.5 text-sm placeholder:text-slate-400 focus:outline-hidden focus:ring-1 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500 dark:placeholder:text-slate-500 dark:disabled:bg-slate-700 dark:disabled:text-slate-400 ${pathError ? "border-red-400 bg-red-50 text-slate-900 focus:border-red-500 focus:ring-red-500 dark:border-red-600 dark:bg-red-900/10 dark:text-slate-100" : "border-slate-300 bg-white text-slate-900 focus:border-blue-500 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"}`;
 
   return (
     <form ref={ref} onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "0.75rem", padding: "1.25rem" }}>
@@ -546,7 +552,124 @@ export interface CustomFilePanelProps {
    * Campaign button if the mutation reports it.
    */
   onProjectStateChange?: (state: string) => void;
+  /** For Commit and Update PR, which pushes an unlocked file to its open pull request. */
+  projectName?: string;
+  selectedRepos?: string[];
+  onReposDelivered?: (repos: string[]) => void;
+  /** Each (repo, branch) where the last drift check found this file changed on GitHub. */
+  drift?: CustomFileDriftDetail[];
 }
+
+const LOCKED_TITLE = "Locked while its pull request is open. Unlock the file below to edit it.";
+
+interface CustomFileDriftNoticeProps {
+  readonly projectId: number;
+  readonly cf: CustomFile;
+  readonly drift: CustomFileDriftDetail[];
+  readonly canLoad: boolean;
+  /** Called with a drifted GitHub copy the user chose to load into the editor. */
+  readonly onLoaded?: (content: string) => void;
+}
+
+/** The file's drift banner, loading a drifted GitHub copy into the editor on request. */
+const CustomFileDriftNotice: React.FC<CustomFileDriftNoticeProps> = ({ projectId, cf, drift, canLoad, onLoaded }) => {
+  const [loadingFrom, setLoadingFrom] = useState<string | null>(null);
+  if (drift.length === 0) return null;
+
+  const load = async (d: CustomFileDriftDetail) => {
+    const from = driftTargetLabel(d);
+    setLoadingFrom(from);
+    try {
+      const { github } = await getCustomFileOnGitHub(projectId, cf.id, d.repo, d.branch);
+      if (github.exists) {
+        onLoaded?.(github.content ?? "");
+        toast.success(`Loaded '${cf.file_path}' from ${from}. Commit Locally to keep it.`);
+      } else {
+        toast.error(`${from} no longer has '${github.path}'`);
+      }
+    } catch (e) {
+      toast.error(apiErrorMessage(e, "Failed to load the GitHub version"));
+    } finally {
+      setLoadingFrom(null);
+    }
+  };
+
+  return (
+    <div style={{ padding: '0.75rem 1rem 0' }}>
+      <FileDriftBanner
+        drift={drift}
+        subject={`'${cf.file_path}'`}
+        restoreHint="include it in a PR campaign"
+        canLoad={canLoad}
+        loadingFrom={loadingFrom}
+        onLoad={load}
+        testId="custom-file-drift-banner"
+      />
+    </div>
+  );
+};
+
+interface UnderReviewFileViewProps {
+  readonly cf: CustomFile;
+  readonly projectId: number;
+  readonly drift: CustomFileDriftDetail[];
+  readonly onUnlock: () => void;
+}
+
+/** A file whose pull request is open: read-only until the user unlocks it. */
+const UnderReviewFileView: React.FC<UnderReviewFileViewProps> = ({ cf, projectId, drift, onUnlock }) => {
+  const [confirming, setConfirming] = useState(false);
+  return (
+    <div className="regular-workflow-editor">
+      <div className="workflow-editor-header-new">
+        <div className="workflow-toolbar-top">
+          <div className="workflow-identity" style={{ minWidth: 0, flex: 1 }}>
+            <code className="workflow-name" style={{ fontFamily: 'monospace', fontSize: '0.875rem' }}>
+              {cf.file_path}
+            </code>
+            <WorkflowStatusBadge status={cf.file_status} />
+            {drift.length > 0 && <FileDriftBadge drift={drift} />}
+          </div>
+          <div className="workflow-primary-actions">
+            <button type="button" className="btn btn-primary" disabled title={LOCKED_TITLE} data-testid="save-button">
+              💾 Commit Locally
+            </button>
+          </div>
+        </div>
+        {cf.last_modified_by && (
+          <div className="workflow-toolbar-status">
+            <span className="status-item">
+              <span className="status-label">Last saved by:</span>
+              <span className="status-value">{cf.last_modified_by}</span>
+            </span>
+          </div>
+        )}
+      </div>
+      <CustomFileDriftNotice projectId={projectId} cf={cf} drift={drift} canLoad={false} />
+      <div className="workflow-editor-content workflow-editor-content--lockable">
+        <UnlockOverlay
+          title="This file has an open pull request. Click to unlock editing."
+          onRequestUnlock={() => setConfirming(true)}
+          buttonTestId="unlock-custom-file-button"
+        />
+        <PlainFileEditor
+          value={cf.file_content || ''}
+          language={detectLanguage(cf.file_path)}
+          readOnly
+          height="100%"
+          theme="dark"
+        />
+      </div>
+      {confirming && (
+        <UnlockUnderReviewDialog
+          subject="file"
+          onCancel={() => setConfirming(false)}
+          onUnlock={() => { setConfirming(false); onUnlock(); }}
+        />
+      )}
+    </div>
+  );
+};
 
 export const CustomFilePanel: React.FC<CustomFilePanelProps> = ({
   cf,
@@ -557,15 +680,36 @@ export const CustomFilePanel: React.FC<CustomFilePanelProps> = ({
   onAfterAdd,
   onRemoved,
   onProjectStateChange,
+  projectName = "",
+  selectedRepos = [],
+  onReposDelivered,
+  drift = [],
 }) => {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [resetKey, setResetKey] = useState(0);
   const [pendingDelete, setPendingDelete] = useState<CustomFile | null>(null);
+  // A GitHub copy loaded into the form in place of the saved content, until it is saved or reverted.
+  const [loadedContent, setLoadedContent] = useState<string | null>(null);
   const formRef = React.useRef<HTMLFormElement>(null);
 
   const cfId = cf?.id ?? null;
-  React.useEffect(() => { setResetKey(0); setFormError(null); }, [cfId]);
+  // A file unlocked for editing while under review; another file starts locked.
+  const [unlockedId, setUnlockedId] = useState<number | null>(null);
+  React.useEffect(() => {
+    setResetKey(0); setFormError(null); setUnlockedId(null); setLoadedContent(null);
+  }, [cfId]);
+
+  const loadIntoForm = (content: string) => {
+    setLoadedContent(content);
+    setResetKey(k => k + 1);
+  };
+
+  const revert = () => {
+    setFormError(null);
+    setLoadedContent(null);
+    setResetKey(k => k + 1);
+  };
 
   const handleAdd = async (data: CreateCustomFilePayload) => {
     setSaving(true);
@@ -586,7 +730,40 @@ export const CustomFilePanel: React.FC<CustomFilePanelProps> = ({
     setFormError(null);
     try {
       const result = await updateCustomFile(projectId, id, { ...data, github_user: githubUser });
+      // The form already shows what was saved, so it is not remounted.
+      setLoadedContent(null);
       onChange(allFiles.map((f) => (f.id === id ? result.custom_file : f)));
+    } catch (e: any) {
+      setFormError(e?.response?.data?.detail ?? "Failed to update file");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // The saved file, or that file under review once its open pull request carries it.
+  const pushToOpenPR = async (saved: CustomFile): Promise<CustomFile> => {
+    try {
+      assertPushed(
+        await updateWorkflows(projectName, selectedRepos, { customFileIds: [saved.id] }),
+        onReposDelivered
+      );
+    } catch (e: any) {
+      toast.error(`'${saved.file_path}' committed locally, but its pull request was not updated: ${e.message}`);
+      return saved;
+    }
+    toast.success(`'${saved.file_path}' committed and pull request updated.`);
+    setUnlockedId(null);
+    return { ...saved, file_status: "under_review" };
+  };
+
+  const handleCommitAndUpdatePR = async (id: number, data: CreateCustomFilePayload) => {
+    setSaving(true);
+    setFormError(null);
+    try {
+      const result = await updateCustomFile(projectId, id, { ...data, github_user: githubUser });
+      setLoadedContent(null);
+      const pushed = await pushToOpenPR(result.custom_file);
+      onChange(allFiles.map((f) => (f.id === id ? pushed : f)));
     } catch (e: any) {
       setFormError(e?.response?.data?.detail ?? "Failed to update file");
     } finally {
@@ -688,49 +865,12 @@ export const CustomFilePanel: React.FC<CustomFilePanelProps> = ({
     );
   }
 
-  // Under review: locked read-only — matches workflow lock behavior
-  if (cf.file_status === 'under_review') {
-    return (
-      <div className="regular-workflow-editor">
-        <div className="workflow-editor-header-new">
-          <div className="workflow-toolbar-top">
-            <div className="workflow-identity" style={{ minWidth: 0, flex: 1 }}>
-              <code className="workflow-name" style={{ fontFamily: 'monospace', fontSize: '0.875rem' }}>
-                {cf.file_path}
-              </code>
-              <WorkflowStatusBadge status={cf.file_status} />
-            </div>
-          </div>
-          {cf.last_modified_by && (
-            <div className="workflow-toolbar-status">
-              <span className="status-item">
-                <span className="status-label">Last saved by:</span>
-                <span className="status-value">{cf.last_modified_by}</span>
-              </span>
-            </div>
-          )}
-        </div>
-        <div className="workflow-editor-content workflow-editor-content--lockable">
-          <div className="workflow-lock-overlay">
-            <div className="workflow-lock-btn workflow-lock-btn-static">
-              <span className="workflow-lock-icon" aria-hidden="true">🔒</span>
-              <span className="workflow-lock-label">
-                <span className="workflow-lock-label-strong">Under Review</span>
-                {" — merge or close the PR Campaign to edit"}
-              </span>
-            </div>
-          </div>
-          <PlainFileEditor
-            value={cf.file_content || ''}
-            language={detectLanguage(cf.file_path)}
-            readOnly
-            height="100%"
-            theme="dark"
-          />
-        </div>
-      </div>
-    );
+  // Under review: locked until unlocked, as a workflow is
+  if (cf.file_status === 'under_review' && unlockedId !== cf.id) {
+    return <UnderReviewFileView cf={cf} projectId={projectId} drift={drift} onUnlock={() => setUnlockedId(cf.id)} />;
   }
+  const isUnlockedPR = cf.file_status === 'under_review';
+  const commitLabel = isUnlockedPR ? "🔄 Commit and Update PR" : "💾 Commit Locally";
 
   // Normal file: always directly editable, no Edit button required
   return (
@@ -742,11 +882,18 @@ export const CustomFilePanel: React.FC<CustomFilePanelProps> = ({
               {cf.file_path}
             </code>
             <WorkflowStatusBadge status={cf.file_status} />
+            {drift.length > 0 && <FileDriftBadge drift={drift} />}
           </div>
           <div className="workflow-primary-actions">
-            <button type="button" className="btn btn-secondary" onClick={() => { setFormError(null); setResetKey(k => k + 1); }} disabled={saving}>Revert</button>
-            <button type="button" className="btn btn-primary" disabled={saving} onClick={() => formRef.current?.requestSubmit()} data-testid="save-button">
-              {saving ? "Saving…" : "💾 Commit Locally"}
+            <button type="button" className="btn btn-secondary" onClick={revert} disabled={saving}>Revert</button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={saving}
+              onClick={() => formRef.current?.requestSubmit()}
+              data-testid={isUnlockedPR ? "update-pr-button" : "save-button"}
+            >
+              {saving ? "Saving…" : commitLabel}
             </button>
             <button type="button" className="btn btn-danger" onClick={() => setPendingDelete(cf)} data-testid="delete-button">
               Delete
@@ -762,13 +909,14 @@ export const CustomFilePanel: React.FC<CustomFilePanelProps> = ({
           </div>
         )}
       </div>
+      <CustomFileDriftNotice projectId={projectId} cf={cf} drift={drift} canLoad={!saving} onLoaded={loadIntoForm} />
       <div className="workflow-editor-content" style={{ overflow: 'auto' }}>
         <FileForm
           ref={formRef}
           key={`${cf.id}-${resetKey}`}
-          initial={cf}
-          onSave={(data) => handleUpdate(cf.id, data)}
-          onCancel={() => { setFormError(null); setResetKey(k => k + 1); }}
+          initial={loadedContent === null ? cf : { ...cf, file_content: loadedContent }}
+          onSave={(data) => (isUnlockedPR ? handleCommitAndUpdatePR : handleUpdate)(cf.id, data)}
+          onCancel={revert}
           saving={saving}
           error={formError}
           hideButtons

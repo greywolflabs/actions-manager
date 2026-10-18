@@ -16,8 +16,6 @@ from github_permissions import (
     PermissionStatus,
     REQUIRED_GITHUB_PERMISSIONS,
     TokenType,
-    get_required_scopes,
-    get_required_scopes_description,
     format_permission_issues_for_user,
 )
 
@@ -47,22 +45,6 @@ class TestPermissionRequirements:
         assert REQUIRED_GITHUB_PERMISSIONS["repo"].critical is True
         assert REQUIRED_GITHUB_PERMISSIONS["workflow"].critical is True
         assert REQUIRED_GITHUB_PERMISSIONS["user:email"].critical is True
-
-    def test_get_required_scopes(self):
-        """Test get_required_scopes returns correct scope list"""
-        scopes = get_required_scopes()
-        assert "repo" in scopes
-        assert "workflow" in scopes
-        assert "read:org" in scopes
-        assert "user:email" in scopes
-
-    def test_get_required_scopes_description(self):
-        """Test get_required_scopes_description returns detailed info"""
-        descriptions = get_required_scopes_description()
-        assert "repo" in descriptions
-        assert "description" in descriptions["repo"]
-        assert "required_for" in descriptions["repo"]
-        assert "critical" in descriptions["repo"]
 
 
 class TestGitHubPermissionValidator:

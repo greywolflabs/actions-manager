@@ -45,7 +45,7 @@ const PrefixedInput: React.FC<PrefixedInputProps> = ({
     "prefixed-input-container",
     "flex h-9 w-full rounded-md border text-sm shadow-sm transition-colors overflow-hidden",
     "border-input-border bg-input-bg",
-    "focus-within:outline-none focus-within:ring-1 focus-within:ring-input-focus",
+    "focus-within:outline-hidden focus-within:ring-1 focus-within:ring-input-focus",
     "dark:border-input-dark-border dark:bg-input-dark-bg",
     disabled ? "cursor-not-allowed opacity-50" : "cursor-text",
   );
@@ -76,7 +76,7 @@ const PrefixedInput: React.FC<PrefixedInputProps> = ({
     "flex-1 h-full px-3 py-1 text-sm",
     "bg-transparent text-text-primary",
     "placeholder:text-text-muted",
-    "outline-none border-0",
+    "outline-hidden border-0",
     "dark:text-text-primary-dark dark:placeholder:text-text-muted-dark",
     disabled && "cursor-not-allowed",
   );
@@ -116,7 +116,7 @@ const PrefixedInput: React.FC<PrefixedInputProps> = ({
           "flex h-9 w-full rounded-md border px-3 py-1 text-sm shadow-sm transition-colors",
           "border-input-border bg-input-bg text-text-primary",
           "placeholder:text-text-muted",
-          "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-input-focus",
+          "focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-input-focus",
           "disabled:cursor-not-allowed disabled:opacity-50",
           "dark:border-input-dark-border dark:bg-input-dark-bg dark:text-text-primary-dark dark:placeholder:text-text-muted-dark",
           className,

@@ -1,3 +1,5 @@
+import type { WorkflowKindChange } from "../utils/workflowKindChanges";
+
 // Workflow type definitions extracted from UnifiedWorkflows.tsx
 import { RwxWorkflow } from '../api/projects';
 
@@ -39,12 +41,6 @@ export interface DetectedBuildResult {
   error?: string;
 }
 
-export interface WorkflowStatusData {
-  status?: string;
-  html_url?: string;
-  message?: string;
-}
-
 export interface WorkflowTemplate {
   name: string;
   content: string;
@@ -84,7 +80,8 @@ export interface UnifiedWorkflowItem {
   lastModifiedBy?: string;
 }
 
-export type ProjectPRState = 'new' | 'draft' | 'open' | 'synced';
+/** 'deleting': the project's removal pull requests are open, and it is read-only until they merge. */
+export type ProjectPRState = 'new' | 'draft' | 'open' | 'synced' | 'deleting';
 
 export interface UnifiedWorkflowsProps {
   // Common props
@@ -94,10 +91,8 @@ export interface UnifiedWorkflowsProps {
   selectedRepos: string[];
   regexPattern: string;
   accountType?: string;
-  projectPRState?: ProjectPRState; // Project PR state shared across UI: "new" | "draft" | "open" | "synced"
   usePrefix?: boolean; // Whether to use AM_{PROJECT_CODE}_ prefix
   isReadOnly?: boolean; // Whether the current user has read-only access
-  branchOption?: string; // Branch option used for PR creation ("default" or "pattern")
 
   // Regular workflows props
   workflows: Workflow[];
@@ -105,6 +100,11 @@ export interface UnifiedWorkflowsProps {
   onRefreshStatus?: (refreshFn: () => Promise<void>, isLoading: boolean) => void;
   onAddWorkflow?: (addWorkflowFn: () => void) => void;
   onClearModifiedStates?: (clearFn: () => void) => void;
+  /**
+   * Hands the parent the function that keeps the editor on a workflow the parent
+   * is about to move between sections (#2318), or null once this unmounts.
+   */
+  onRegisterSelectionFollower?: (followFn: ((changes: WorkflowKindChange[]) => void) | null) => void;
 
   // Reusable workflows props
   rxworkflows: RXWorkflow[];
@@ -134,8 +134,12 @@ export interface UnifiedWorkflowsProps {
   /** Reloads the project itself (not just the list), so drift names and other
    *  state seeded by the project-load endpoint are corrected after a removal. */
   refreshProjectData?: () => Promise<void>;
+  /** Re-reads the stored drift after a save, which resolves the edited workflow's drift. */
+  refreshDrift?: () => void;
   // Callback to notify parent when project PR state changes
   onProjectStateChange?: (state: string) => void;
+  /** Repositories a push opened or added to a pull request in, so they stop waiting for delivery. */
+  onReposDelivered?: (repos: string[]) => void;
   // Set of workflow names currently drifted on GitHub (rendered as a badge in the list)
   driftedWorkflowNames?: Set<string>;
 
@@ -144,12 +148,20 @@ export interface UnifiedWorkflowsProps {
   setCustomFiles?: (files: import('../api/customFiles').CustomFile[]) => void;
   projectId?: number;
   onCustomFilesChange?: (files: import('../api/customFiles').CustomFile[]) => void;
-  /** Bump to force CodeownersManager to reload (e.g. after a campaign completes). */
-  codeownersRefreshCounter?: number;
-  /** Aggregate status across all repos' CODEOWNERS records, for the nav badge. */
-  codeownersAggregateStatus?: string;
-  /** Called after a CODEOWNERS draft is saved locally so the parent can refresh status. */
-  onCodeownersSaved?: () => void;
+  /** Each (repo, branch) where the last drift check found a custom file changed on GitHub. */
+  customFileDrift?: import('../api/drift').CustomFileDriftDetail[];
+  /** Ids of the drifted custom files; seeded by the project load until the drift check has loaded. */
+  driftedCustomFileIds?: Set<number>;
+  /** The project's CODEOWNERS file, null when it has none, undefined until loaded. */
+  codeowners?: import('../api/codeowners').CodeownersRecord | null;
+  /** Each (repo, branch) where the last drift check found CODEOWNERS changed on GitHub. */
+  codeownersDrift?: import('../api/drift').CodeownersDriftDetail[];
+  /** Called with what a Commit Locally saved and the project's resulting pr_state. */
+  onCodeownersSaved?: (record: import('../api/codeowners').CodeownersRecord, prState?: string) => void;
+  /** Asks the Project Files view to open the CODEOWNERS editor, e.g. from the drift panel. */
+  codeownersOpenRequested?: boolean;
+  /** Called once the CODEOWNERS editor has been opened for that request. */
+  onCodeownersOpened?: () => void;
 
   /** Shared, workspace-wide catalog of imported Actions Projects, surfaced in the GUI step editor. */
   importedActions?: import('../api/actionsProjects').ActionsProject[];

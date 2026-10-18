@@ -5,7 +5,7 @@ name is a prefix of another's.
 _match_repo_for_status pins a drift status to a repo by scanning the status
 message for a repo name. Scanning in list order meant "acme/api" matched a
 message about "acme/api-gateway" first, so the longer repo's drift was
-recorded against the shorter one. Because WorkflowDriftState is unique per
+recorded against the shorter one. Because stored drift was unique per
 (workflow_id, repo_id), every drifted repo then collapsed onto a single row —
 the project reported drift in a repo that was actually clean, and none in the
 repos that had really drifted.

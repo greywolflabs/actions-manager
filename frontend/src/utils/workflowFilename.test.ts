@@ -6,6 +6,7 @@ import {
   workflowDisplayFilename,
   validateWorkflowName,
   setWorkflowYamlName,
+  duplicateWorkflowNames,
 } from './workflowFilename';
 
 describe('workflowFilename utilities', () => {
@@ -278,6 +279,17 @@ describe('workflowFilename utilities', () => {
 
     test('prepends a name when one is missing', () => {
       expect(setWorkflowYamlName('on: push', 'custom-workflow')).toBe('name: custom-workflow\n\non: push');
+    });
+  });
+
+  describe('duplicateWorkflowNames', () => {
+    test('a name differing only by case or extension is a duplicate (#2309)', () => {
+      // The server matches lower(stem), so a regular "deploy" and a reusable
+      // "Deploy" are one file; the save must catch it before writing anything.
+      expect(duplicateWorkflowNames(['deploy', 'build', 'Deploy.yml'])).toEqual(['Deploy']);
+    });
+    test('distinct and blank names are not duplicates', () => {
+      expect(duplicateWorkflowNames(['deploy', 'build', '', '  '])).toEqual([]);
     });
   });
 });

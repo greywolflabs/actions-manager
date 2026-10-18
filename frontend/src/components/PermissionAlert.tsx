@@ -79,7 +79,7 @@ export const PermissionAlert: React.FC<PermissionAlertProps> = ({
       role="alert"
     >
       <div className="flex items-start">
-        <div className="flex-shrink-0 text-2xl mr-3" aria-hidden="true">
+        <div className="shrink-0 text-2xl mr-3" aria-hidden="true">
           {getSeverityIcon(permissionStatus.status)}
         </div>
         <div className="flex-1">
@@ -125,7 +125,7 @@ export const PermissionAlert: React.FC<PermissionAlertProps> = ({
                   {permissionStatus.missing_scopes.map((scope, idx) => (
                     <span
                       key={idx}
-                      className="inline-flex items-center px-2 py-1 rounded text-xs font-mono bg-white bg-opacity-60"
+                      className="inline-flex items-center px-2 py-1 rounded text-xs font-mono bg-white/60"
                     >
                       {scope}
                     </span>
@@ -162,7 +162,7 @@ export const PermissionAlert: React.FC<PermissionAlertProps> = ({
             {onDismiss && (
               <button
                 onClick={onDismiss}
-                className="px-4 py-2 bg-white bg-opacity-60 rounded hover:bg-opacity-80 transition-colors text-sm font-medium"
+                className="px-4 py-2 bg-white/60 rounded hover:bg-white/80 transition-colors text-sm font-medium"
               >
                 Dismiss
               </button>
@@ -174,7 +174,7 @@ export const PermissionAlert: React.FC<PermissionAlertProps> = ({
         {onDismiss && (
           <button
             onClick={onDismiss}
-            className="flex-shrink-0 ml-2 text-gray-400 hover:text-gray-600"
+            className="shrink-0 ml-2 text-gray-400 hover:text-gray-600"
             aria-label="Dismiss alert"
           >
             <svg

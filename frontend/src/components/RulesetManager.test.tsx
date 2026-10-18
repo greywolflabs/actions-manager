@@ -374,3 +374,34 @@ describe("RulesetManager ruleset deletion", () => {
     expect(screen.getByText("require-reviews")).toBeInTheDocument();
   });
 });
+
+describe("RulesetManager ruleset upload", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedSyncStatus.mockResolvedValue(syncStatus("exists") as any);
+    mockedClient.get.mockResolvedValue(listResponse([]));
+  });
+
+  test("lists the uploaded ruleset without a refresh", async () => {
+    const { container } = render(<RulesetManager {...props} />);
+    await waitFor(() => expect(mockedClient.get).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("require-reviews")).not.toBeInTheDocument();
+
+    mockedClient.post.mockResolvedValue({
+      data: { success: true, message: "Ruleset 'require-reviews' uploaded successfully" },
+    });
+    mockedClient.get.mockResolvedValue(listResponse([RULESET]));
+    const file = new File([JSON.stringify(RULESET.ruleset_json)], "require-reviews.json", {
+      type: "application/json",
+    });
+    fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: /Upload Ruleset/i }));
+
+    expect(await screen.findByText("require-reviews")).toBeInTheDocument();
+    expect(mockedClient.post).toHaveBeenCalledWith(
+      expect.stringContaining("/api/rulesets/upload"),
+      expect.any(FormData),
+      expect.anything()
+    );
+  });
+});

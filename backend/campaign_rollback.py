@@ -31,15 +31,18 @@ with the reason, and no PR is opened for it — never silently skipped or guesse
 import base64
 from typing import Annotated, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
+import auth as auth_module
+import deliveries
 import workflows as wf
 from campaign_notifications import record_campaign_opened
 from database import get_db
 from github_api_tracker import RateLimitExceeded, github_get
-from models import Project, ProjectPRCampaign, ProjectPullRequest, ProjectWorkflow, Workflow
+from models import Codeowners, CustomFile, Project, ProjectPRCampaign, ProjectPullRequest, ProjectWorkflow, Workflow
+from error_detail import failure_kind
 
 router = APIRouter()
 
@@ -69,7 +72,6 @@ _LEGACY_DETAIL = (
 
 
 class RollbackPreviewRequest(BaseModel):
-    github_user: Optional[str] = None
     project_name: str
     # The string form the UI holds ("campaign-12"); a bare integer also works.
     campaign_id: str
@@ -355,9 +357,11 @@ def _deliver_one_target(target: dict, project: Project, campaign_meta: dict,
          "pending_delete": entry["action"] == "delete"}
         for entry in target["files"]
     ]
+    carried: list = []
     committed, errors = wf._commit_custom_files_to_branch(
-        files, owner, repo, am_branch, project.project_code, user, db, headers
+        files, owner, repo, am_branch, project.project_code, user, db, headers, carried=carried,
     )
+    carried = wf._record_absent_removals(db, _carried_source_files(db, project, carried), repo_name, branch)
     if errors:
         # Any failed path fails the whole target — the same rule inversion
         # applies. A PR restoring three of a repo's four files is a half-revert,
@@ -384,6 +388,7 @@ def _deliver_one_target(target: dict, project: Project, campaign_meta: dict,
             # the same workflows, and so apply_rollback_am_action has names to act on.
             "workflows_committed": wf._split_workflow_names(target.get("workflow_names")),
             "workflow_errors": [],
+            "deliveries": carried,
             "custom_files_result": {
                 "custom_files_committed": committed,
                 "custom_file_errors": errors,
@@ -394,6 +399,57 @@ def _deliver_one_target(target: dict, project: Project, campaign_meta: dict,
             "pr_title": f"[Actions Manager] Roll back {project.project_code} workflows",
         },
     )
+
+
+def _source_file(db: Session, project: Project, path: str) -> Optional[tuple]:
+    """``(kind, id)`` of the project's file a rolled-back path is, or None.
+
+    A workflow of its own by the name its filename carries, or one linked into
+    it, else a custom file or the CODEOWNERS file by path.
+    """
+    workflow = _own_workflow_at(db, project, path) or _linked_workflow_at(db, project, path)
+    if workflow is not None:
+        return deliveries.WORKFLOW, workflow.workflow_id
+    for kind, model in ((deliveries.CUSTOM_FILE, CustomFile), (deliveries.CODEOWNERS, Codeowners)):
+        file_id = db.query(model.id).filter(
+            model.project_id == project.project_id, model.file_path == path,
+        ).scalar()
+        if file_id is not None:
+            return kind, file_id
+    return None
+
+
+def _own_workflow_at(db: Session, project: Project, path: str) -> Optional[Workflow]:
+    name = _workflow_name_from_path(path, project.project_code)
+    return _project_workflow_named(db, project, name) if name else None
+
+
+def _linked_workflow_at(db: Session, project: Project, path: str) -> Optional[Workflow]:
+    """The reusable workflow linked into *project* that is delivered at *path*.
+
+    Named as the reusable flow delivers it, under the owning RWX project's code
+    and prefix rather than the caller's.
+    """
+    code, use_prefix = wf._resolve_effective_rwx_params(project, project.project_code, db)
+    linked_ids = wf._get_linked_workflow_ids_for_project(db, project.project_id)
+    linked = db.query(Workflow).filter(Workflow.workflow_id.in_(linked_ids)).all()
+    return next((w for w in linked
+                 if path == f"{_WORKFLOWS_DIR}{wf.format_workflow_name(w.workflow_name, code, use_prefix)}"),
+                None)
+
+
+def _carried_source_files(db: Session, project: Project, carried: List[dict]) -> List[dict]:
+    """What the rollback committed, as the project's files, for the delivery record.
+
+    The committer only sees paths. One that is none of the project's files is
+    dropped: there is nothing in ActionsManager to record it against.
+    """
+    mapped = []
+    for entry in carried:
+        source = _source_file(db, project, entry["path"])
+        if source is not None:
+            mapped.append({**entry, "kind": source[0], "id": source[1]})
+    return mapped
 
 
 def _persist_rollback_campaign(db: Session, project: Project, results: dict,
@@ -477,8 +533,8 @@ def create_rollback_campaign(db: Session, project: Project, source: ProjectPRCam
                 target, project, campaign_meta, user, db, headers, stamps
             )
         except Exception as exc:
-            aborted = f"{target['repo_name']}: {type(exc).__name__}: {exc}"
-            print(f"❌ Rollback delivery stopped at {aborted}")
+            aborted = f"{target['repo_name']}: {failure_kind(exc, wf._SHOWN_GITHUB_ERRORS)}"
+            print(f"❌ Rollback delivery stopped at {target['repo_name']}: {type(exc).__name__}: {exc}")
             break
         results[result_key] = result
 
@@ -560,6 +616,15 @@ def _workflow_name_from_path(path: str, project_code: str) -> Optional[str]:
     return filename[len(prefix):] if filename.startswith(prefix) else filename
 
 
+def _project_workflow_named(db: Session, project: Project, name: str) -> Optional[Workflow]:
+    return db.query(Workflow).join(
+        ProjectWorkflow, ProjectWorkflow.workflow_id == Workflow.workflow_id
+    ).filter(
+        ProjectWorkflow.project_id == project.project_id,
+        Workflow.workflow_name == name,
+    ).first()
+
+
 def _adopt_github_after_rollback(db: Session, project: Project, pr: ProjectPullRequest,
                                  user: str, token: str) -> None:
     """Pull each rolled-back workflow's GitHub content back into ActionsManager.
@@ -571,12 +636,7 @@ def _adopt_github_after_rollback(db: Session, project: Project, pr: ProjectPullR
         name = _workflow_name_from_path(path, project.project_code)
         if not name:
             continue
-        workflow = db.query(Workflow).join(
-            ProjectWorkflow, ProjectWorkflow.workflow_id == Workflow.workflow_id
-        ).filter(
-            ProjectWorkflow.project_id == project.project_id,
-            Workflow.workflow_name == name,
-        ).first()
+        workflow = _project_workflow_named(db, project, name)
         if not workflow:
             continue
 
@@ -647,9 +707,12 @@ def _parse_campaign_id(raw: str) -> int:
         raise HTTPException(status_code=400, detail=f"Unrecognized campaign id '{raw}'.") from exc
 
 
-def _resolve(payload: RollbackPreviewRequest, db: Session, github_user: Optional[str]):
-    """(user, token, project, campaign) for a rollback request, or the right HTTP error."""
-    user = wf._resolve_github_user(github_user, payload.github_user)
+def _resolve(payload: RollbackPreviewRequest, db: Session, account):
+    """(user, token, project, campaign) for a rollback request, or the right HTTP error.
+
+    The caller is the session's account (#2241), never a name the request carries.
+    """
+    user = account.github_user
     token, project = wf._get_project_and_token(payload, db, github_user=user)
     # A rollback opens PRs across every merged repo in the campaign, so proving
     # the caller can *see* the project is not enough — _get_project_and_token
@@ -677,14 +740,14 @@ def _inverse_or_429(db: Session, campaign_id: int, user: str, token: str) -> Lis
         ) from exc
 
 
-@router.post("/api/campaign-rollback-preview", responses=wf._responses(400, 401, 404, 429, 500))
+@router.post("/api/campaign-rollback-preview", responses=wf._responses(400, 401, 403, 404, 409, 429, 500))
 def preview_campaign_rollback(
     payload: RollbackPreviewRequest,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """The proposed inverse diff for a campaign, for review before anything opens."""
-    user, token, _project, campaign = _resolve(payload, db, x_github_user)
+    user, token, _project, campaign = _resolve(payload, db, account)
     targets = _inverse_or_429(db, campaign.campaign_id, user, token)
     return {
         "campaign_id": campaign.campaign_id,
@@ -694,11 +757,11 @@ def preview_campaign_rollback(
     }
 
 
-@router.post("/api/campaign-rollback", responses=wf._responses(400, 401, 404, 429, 500))
+@router.post("/api/campaign-rollback", responses=wf._responses(400, 401, 403, 404, 409, 429, 500))
 def create_campaign_rollback(
     payload: RollbackCreateRequest,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
     """Open the rollback campaign.
 
@@ -710,7 +773,7 @@ def create_campaign_rollback(
     policy against a validation repository, which says nothing about a revert.
     The reviewed inverse diff is this action's own gate.
     """
-    user, token, project, campaign = _resolve(payload, db, x_github_user)
+    user, token, project, campaign = _resolve(payload, db, account)
     targets = _inverse_or_429(db, campaign.campaign_id, user, token)
     if not any(target["invertible"] for target in targets):
         raise HTTPException(

@@ -98,6 +98,15 @@ def test_a_member_sees_them_rather_than_an_error(seeded, authenticate_client):
     assert [r["ruleset_name"] for r in resp.json()["rulesets"]] == ["require-reviews"]
 
 
+def test_naming_nobody_lists_them_for_the_caller(seeded, authenticate_client):
+    authenticate_client(client, MEMBER, TestingSessionLocal)
+
+    resp = client.get(f"/api/rulesets/{PROJECT}")
+
+    assert resp.status_code == 200, resp.text
+    assert [r["ruleset_name"] for r in resp.json()["rulesets"]] == ["require-reviews"]
+
+
 def test_naming_someone_else_is_still_refused(seeded, authenticate_client):
     """Resolution widened; the session-ownership assertion did not."""
     authenticate_client(client, MEMBER, TestingSessionLocal)

@@ -1,9 +1,11 @@
-import React from "react";
+import React, { useState } from "react";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { vi } from "vitest";
 import CustomFiles, { CustomFilePanel } from "./CustomFiles";
 import * as api from "../api/customFiles";
+import * as workflowsApi from "../api/workflows";
+import type { CustomFileDriftDetail } from "../api/drift";
 
 vi.mock("./PlainFileEditor", () => ({
   default: ({ value, onChange }: { value: string; onChange?: (v: string) => void }) => (
@@ -20,6 +22,7 @@ vi.mock("../api/customFiles", () => ({
   updateCustomFile: vi.fn(),
   deleteCustomFile: vi.fn(),
   restoreCustomFile: vi.fn(),
+  getCustomFileOnGitHub: vi.fn(),
   validateFilePath: vi.fn((p: string) => {
     if (!p?.trim()) return "File path is required";
     if (p.startsWith("/")) return "Absolute paths are not allowed";
@@ -27,6 +30,10 @@ vi.mock("../api/customFiles", () => ({
     if (p.endsWith(".env") || p.includes(".env.")) return ".env files are not allowed";
     return null;
   }),
+}));
+
+vi.mock("../api/workflows", () => ({
+  updateWorkflows: vi.fn(),
 }));
 
 const mockFile = (overrides = {}): api.CustomFile => ({
@@ -345,5 +352,204 @@ describe("CustomFiles", () => {
     rerender(<CustomFiles {...defaultProps} initialFiles={[fileB]} />);
     expect(screen.queryByText(".yamllint.yml")).not.toBeInTheDocument();
     expect(screen.getByText("sonar.properties")).toBeInTheDocument();
+  });
+
+  describe("CustomFilePanel under review", () => {
+    const underReview = () => mockFile({ file_status: "under_review", file_content: "echo old" });
+
+    // Owns the list as the page does, so a save shows up without a remount.
+    function Panel({ onReposDelivered }: Readonly<{ onReposDelivered?: (repos: string[]) => void }>) {
+      const [files, setFiles] = useState([underReview()]);
+      return (
+        <CustomFilePanel
+          cf={files[0]}
+          allFiles={files}
+          projectId={42}
+          githubUser="testuser"
+          projectName="proj"
+          selectedRepos={["octo/a"]}
+          onChange={setFiles}
+          onReposDelivered={onReposDelivered}
+        />
+      );
+    }
+
+    const unlockAndEdit = () => {
+      fireEvent.click(screen.getByTestId("unlock-custom-file-button"));
+      fireEvent.click(screen.getByRole("button", { name: "Unlock and Edit" }));
+      fireEvent.change(screen.getByTestId("file-content-input"), { target: { value: "echo new" } });
+      fireEvent.click(screen.getByTestId("update-pr-button"));
+    };
+
+    beforeEach(() => {
+      vi.mocked(api.updateCustomFile).mockImplementation(async (_projectId, id, data) => ({
+        custom_file: mockFile({ id, file_content: data.file_content, file_status: "committed_locally" }),
+      }));
+    });
+
+    test("is locked with a greyed-out Commit Locally", () => {
+      render(<Panel />);
+
+      expect(screen.getByTestId("unlock-custom-file-button")).toBeInTheDocument();
+      expect(screen.getByTestId("save-button")).toHaveTextContent("💾 Commit Locally");
+      expect(screen.getByTestId("save-button")).toBeDisabled();
+      expect(screen.queryByTestId("update-pr-button")).not.toBeInTheDocument();
+    });
+
+    test("Commit and Update PR adds the edit to the open PR and locks the file again", async () => {
+      vi.mocked(workflowsApi.updateWorkflows).mockResolvedValue({ results: { "octo/a on main": { status: "pr_updated" } } } as never);
+      const onReposDelivered = vi.fn();
+      render(<Panel onReposDelivered={onReposDelivered} />);
+
+      unlockAndEdit();
+
+      await waitFor(() => expect(screen.getByTestId("unlock-custom-file-button")).toBeInTheDocument());
+      expect(api.updateCustomFile).toHaveBeenCalledWith(42, 1, expect.objectContaining({ file_content: "echo new" }));
+      expect(workflowsApi.updateWorkflows).toHaveBeenCalledWith(
+        "proj", ["octo/a"], { customFileIds: [1] }
+      );
+      expect(onReposDelivered).toHaveBeenCalledWith(["octo/a"]);
+      expect(screen.getByTestId("file-content-input")).toHaveValue("echo new");
+    });
+
+    test("leaves the save committed locally when the push fails", async () => {
+      vi.mocked(workflowsApi.updateWorkflows).mockResolvedValue({ error: "GitHub is down" } as never);
+      render(<Panel />);
+
+      unlockAndEdit();
+
+      await waitFor(() => expect(screen.getByTestId("save-button")).toHaveTextContent("💾 Commit Locally"));
+      expect(screen.getByTestId("save-button")).not.toBeDisabled();
+      expect(screen.queryByTestId("unlock-custom-file-button")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("CustomFilePanel drift", () => {
+    const GITHUB_COPY = "#!/bin/bash\necho hotfix\n";
+    const synced = () => mockFile({ file_status: "synced_with_github", git_hash: "a".repeat(40) });
+    const drifted = (repo: string, branch = "main", overrides: Partial<CustomFileDriftDetail> = {}): CustomFileDriftDetail => ({
+      custom_file_id: 1,
+      file_path: ".github/scripts/build.sh",
+      repo,
+      repo_id: 3,
+      branch,
+      has_drift: true,
+      actionsmanager_sha: "a".repeat(40),
+      github_sha: "b".repeat(40),
+      last_checked: "2026-10-17T00:00:00+00:00",
+      message: `.github/scripts/build.sh content differs between local and ${repo}`,
+      ...overrides,
+    });
+
+    /** Owns the file and its drift as the page does: a save is handed back, then drift is re-read. */
+    function Harness({ initial, drift: initialDrift }: Readonly<{ initial: api.CustomFile; drift: CustomFileDriftDetail[] }>) {
+      const [files, setFiles] = useState([initial]);
+      const [drift, setDrift] = useState(initialDrift);
+      return (
+        <CustomFilePanel
+          cf={files[0]}
+          allFiles={files}
+          projectId={42}
+          githubUser="testuser"
+          drift={drift}
+          onChange={(next) => {
+            setFiles(next);
+            // The page's re-read after the save: the server resolved the drift the save adopted.
+            setDrift((rows) => rows.filter((d) => d.github_sha !== "b".repeat(40) || next[0].file_content !== GITHUB_COPY));
+          }}
+        />
+      );
+    }
+
+    beforeEach(() => {
+      vi.mocked(api.getCustomFileOnGitHub).mockReset();
+      vi.mocked(api.updateCustomFile).mockClear();
+      vi.mocked(api.updateCustomFile).mockImplementation(async (_projectId, id, data) => ({
+        custom_file: mockFile({ id, file_content: data.file_content, file_status: "committed_locally" }),
+      }));
+    });
+
+    test("shows a drift badge and a banner naming each drifted repo @ branch", () => {
+      render(
+        <Harness
+          initial={synced()}
+          drift={[drifted("octo/a"), drifted("octo/b", "dev", { deleted_in_github: true, github_sha: null })]}
+        />
+      );
+
+      expect(screen.getByTestId("file-drift-badge")).toHaveTextContent("Drift detected");
+      expect(screen.getByTestId("custom-file-drift-banner")).toHaveTextContent(
+        "'.github/scripts/build.sh' on GitHub has changed or was removed on octo/a @ main, octo/b @ dev"
+      );
+      // A deleted copy has nothing to load.
+      expect(screen.getByRole("button", { name: "Load from octo/a @ main" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Load from octo/b @ dev" })).not.toBeInTheDocument();
+    });
+
+    test("a file without drift shows neither", () => {
+      render(<Harness initial={synced()} drift={[]} />);
+
+      expect(screen.queryByTestId("file-drift-badge")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("custom-file-drift-banner")).not.toBeInTheDocument();
+    });
+
+    test("Load GitHub version puts GitHub's copy in the form, and Commit Locally adopts it without a remount", async () => {
+      vi.mocked(api.getCustomFileOnGitHub).mockResolvedValue({
+        repo_id: 3, repo_name: "octo/a", branch: "release/1.0",
+        github: { exists: true, content: GITHUB_COPY, sha: "b".repeat(40), path: ".github/scripts/build.sh" },
+      });
+      render(<Harness initial={synced()} drift={[drifted("octo/a", "release/1.0")]} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Load GitHub version" }));
+
+      await waitFor(() => expect(screen.getByTestId("file-content-input")).toHaveValue(GITHUB_COPY));
+      expect(api.getCustomFileOnGitHub).toHaveBeenCalledWith(42, 1, "octo/a", "release/1.0");
+      expect(api.updateCustomFile).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByTestId("save-button"));
+
+      await waitFor(() => expect(screen.queryByTestId("custom-file-drift-banner")).not.toBeInTheDocument());
+      expect(api.updateCustomFile).toHaveBeenCalledWith(42, 1, expect.objectContaining({ file_content: GITHUB_COPY }));
+      expect(screen.queryByTestId("file-drift-badge")).not.toBeInTheDocument();
+      expect(screen.getByTestId("file-content-input")).toHaveValue(GITHUB_COPY);
+    });
+
+    test("Revert after loading goes back to the saved content", async () => {
+      vi.mocked(api.getCustomFileOnGitHub).mockResolvedValue({
+        repo_id: 3, repo_name: "octo/a", branch: "main",
+        github: { exists: true, content: GITHUB_COPY, sha: "b".repeat(40), path: ".github/scripts/build.sh" },
+      });
+      render(<Harness initial={synced()} drift={[drifted("octo/a")]} />);
+      fireEvent.click(screen.getByRole("button", { name: "Load GitHub version" }));
+      await waitFor(() => expect(screen.getByTestId("file-content-input")).toHaveValue(GITHUB_COPY));
+
+      fireEvent.click(screen.getByRole("button", { name: "Revert" }));
+
+      expect(screen.getByTestId("file-content-input")).toHaveValue("#!/bin/bash");
+      expect(screen.getByTestId("custom-file-drift-banner")).toBeInTheDocument();
+    });
+
+    test("a copy gone from GitHub since the check loads nothing", async () => {
+      vi.mocked(api.getCustomFileOnGitHub).mockResolvedValue({
+        repo_id: 3, repo_name: "octo/a", branch: "main",
+        github: { exists: false, content: null, sha: null, path: ".github/scripts/build.sh" },
+      });
+      render(<Harness initial={synced()} drift={[drifted("octo/a")]} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Load GitHub version" }));
+
+      await waitFor(() => expect(api.getCustomFileOnGitHub).toHaveBeenCalled());
+      await waitFor(() => expect(screen.getByRole("button", { name: "Load GitHub version" })).not.toBeDisabled());
+      expect(screen.getByTestId("file-content-input")).toHaveValue("#!/bin/bash");
+    });
+
+    test("a locked file under review shows its drift without offering to load", () => {
+      render(<Harness initial={mockFile({ file_status: "under_review" })} drift={[drifted("octo/a")]} />);
+
+      expect(screen.getByTestId("unlock-custom-file-button")).toBeInTheDocument();
+      expect(screen.getByTestId("file-drift-badge")).toBeInTheDocument();
+      expect(screen.getByTestId("custom-file-drift-banner")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Load GitHub version" })).not.toBeInTheDocument();
+    });
   });
 });

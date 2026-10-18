@@ -1,7 +1,8 @@
 import { renderHook, act } from '@testing-library/react';
-import { useWorkflowSelectionLogic } from './useWorkflowSelectionLogic';
+import { useWorkflowSelectionLogic, GuiRefusal } from './useWorkflowSelectionLogic';
 import { WorkflowGUI, DEFAULT_WORKFLOW_GUI, DEFAULT_REUSABLE_WORKFLOW_GUI } from '../utils/workflowGuiConversion';
-import { UnifiedWorkflowItem } from '../types/workflow';
+import { UnifiedWorkflowItem, RXWorkflow } from '../types/workflow';
+import { createBlankWorkflow } from '../utils/workflowOperations';
 
 // Mock the workflowGuiConversion module
 vi.mock('../utils/workflowGuiConversion', async (importOriginal) => {
@@ -12,7 +13,8 @@ vi.mock('../utils/workflowGuiConversion', async (importOriginal) => {
   };
 });
 
-import { yamlToGuiResult } from '../utils/workflowGuiConversion';
+import { yamlToGuiResult, guiToYaml } from '../utils/workflowGuiConversion';
+import * as yaml from 'js-yaml';
 
 import type { Mock } from 'vitest';
 // The hook converts through yamlToGuiResult so it can report a failure; these
@@ -21,6 +23,12 @@ const mockConversion = (gui: WorkflowGUI) =>
   (yamlToGuiResult as Mock).mockReturnValue({ gui, error: null });
 const mockConversionFailure = (error: string) =>
   (yamlToGuiResult as Mock).mockReturnValue({ gui: DEFAULT_WORKFLOW_GUI, error });
+const useRealConversion = async () => {
+  const actual = await vi.importActual<typeof import('../utils/workflowGuiConversion')>(
+    '../utils/workflowGuiConversion'
+  );
+  (yamlToGuiResult as Mock).mockImplementation(actual.yamlToGuiResult);
+};
 
 describe('useWorkflowSelectionLogic', () => {
   const mockSetSelectedWorkflowId = vi.fn();
@@ -253,7 +261,9 @@ describe('useWorkflowSelectionLogic', () => {
     );
   });
 
-  test('should preserve workflow name from unified workflow', () => {
+  // workflow.name is the filename stem; the GUI name box edits the YAML label.
+  test('seeds the GUI name from the YAML name: label, not the filename', async () => {
+    await useRealConversion();
     const unifiedWorkflows: UnifiedWorkflowItem[] = [
       {
         id: 'regular-0',
@@ -279,9 +289,39 @@ describe('useWorkflowSelectionLogic', () => {
       result.current.handleSelectWorkflow('regular-0');
     });
 
-    // The name should be overridden from the unified workflow
     const callArgs = (mockSetRegularGuiWorkflow as Mock).mock.calls[0][0];
-    expect(callArgs.name).toBe('Custom Name');
+    expect(callArgs.name).toBe('Different Name');
+  });
+
+  test('a workflow with no name: label gains none from a GUI round trip', async () => {
+    await useRealConversion();
+    const unifiedWorkflows: UnifiedWorkflowItem[] = [
+      {
+        id: 'regular-0',
+        name: 'build',
+        content: 'on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n',
+        isReusable: false,
+        isModified: false,
+        originalIndex: 0,
+        type: 'regular'
+      }
+    ];
+
+    const { result } = renderHook(() =>
+      useWorkflowSelectionLogic({
+        unifiedWorkflows,
+        setSelectedWorkflowId: mockSetSelectedWorkflowId,
+        setGuiWorkflow: mockSetGuiWorkflow,
+        setRegularGuiWorkflow: mockSetRegularGuiWorkflow
+      })
+    );
+
+    act(() => {
+      result.current.handleSelectWorkflow('regular-0');
+    });
+
+    const model = (mockSetRegularGuiWorkflow as Mock).mock.calls[0][0];
+    expect(yaml.load(guiToYaml(model))).not.toHaveProperty('name');
   });
 
   test('should update when unifiedWorkflows prop changes', () => {
@@ -397,39 +437,71 @@ describe('useWorkflowSelectionLogic', () => {
         })
       );
 
-    test('returns null when the YAML converts', () => {
+    const LOSSLESS_YAML =
+      'name: Test\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n';
+
+    const initialize = (subject: UnifiedWorkflowItem) => {
       const { result } = renderSubject();
-
-      let outcome: string | null = 'unset';
+      let outcome: GuiRefusal | null | 'unset' = 'unset';
       act(() => {
-        outcome = result.current.initializeWorkflowGUI(workflow());
+        outcome = result.current.initializeWorkflowGUI(subject);
       });
+      return outcome;
+    };
 
-      expect(outcome).toBeNull();
+    test('returns null when the GUI can edit the workflow without changing it', async () => {
+      await useRealConversion();
+
+      expect(initialize(workflow({ content: LOSSLESS_YAML }))).toBeNull();
       expect(mockSetRegularGuiWorkflow).toHaveBeenCalled();
     });
 
     test('returns the error when the YAML does not convert', () => {
       mockConversionFailure('bad indentation');
-      const { result } = renderSubject();
 
-      let outcome: string | null = null;
-      act(() => {
-        outcome = result.current.initializeWorkflowGUI(workflow({ content: 'name: [unclosed' }));
+      expect(initialize(workflow({ content: 'name: [unclosed' }))).toEqual({
+        reason: 'parse',
+        error: 'bad indentation'
       });
-
-      expect(outcome).toBe('bad indentation');
     });
 
     test('returns null for a new workflow with no content', () => {
-      const { result } = renderSubject();
+      expect(initialize(workflow({ content: '' }))).toBeNull();
+    });
 
-      let outcome: string | null = 'unset';
-      act(() => {
-        outcome = result.current.initializeWorkflowGUI(workflow({ content: '' }));
+    test('returns null for whitespace-only content, as for empty', () => {
+      expect(initialize(workflow({ content: '\n', isReusable: true, type: 'reusable' }))).toBeNull();
+    });
+
+    test('returns null for a new blank reusable workflow', async () => {
+      await useRealConversion();
+      const setRXWorkflows = vi.fn();
+      createBlankWorkflow('reusable', 'shared', [], vi.fn(), setRXWorkflows, vi.fn());
+      const [created] = (setRXWorkflows.mock.calls[0][0] as (prev: RXWorkflow[]) => RXWorkflow[])([]);
+
+      expect(initialize(workflow({ content: created.content, isReusable: true, type: 'reusable' }))).toBeNull();
+    });
+
+    // yamlToGuiResult can hand back the shared default template itself.
+    test('does not change the parsed model when giving a reusable workflow workflow_call', () => {
+      const events = DEFAULT_WORKFLOW_GUI.events;
+      mockConversion(DEFAULT_WORKFLOW_GUI);
+
+      initialize(workflow({ content: 'name: Shared\non: push', isReusable: true, type: 'reusable' }));
+
+      expect(DEFAULT_WORKFLOW_GUI.events).toBe(events);
+      expect(DEFAULT_WORKFLOW_GUI.events.map(e => e.type)).not.toContain('workflow_call');
+    });
+
+    // Checked on the model as set, so the workflow_call a reusable workflow is
+    // given counts as a change to its triggers.
+    test('returns the paths a GUI round trip would change', async () => {
+      await useRealConversion();
+
+      expect(initialize(workflow({ content: LOSSLESS_YAML, isReusable: true, type: 'reusable' }))).toEqual({
+        reason: 'lossy',
+        paths: ['on.push', 'on.workflow_call']
       });
-
-      expect(outcome).toBeNull();
     });
   });
 });

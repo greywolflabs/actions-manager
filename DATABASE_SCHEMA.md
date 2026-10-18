@@ -23,7 +23,7 @@ This document describes the database schema for ActionsManager, including all ta
 ### Core Tables
 
 #### accounts
-User accounts table with GitHub OAuth integration, optional encrypted personal access token storage, and marketplace billing metadata.
+User accounts table with GitHub OAuth integration, optional encrypted personal access token storage, and billing columns only the hosted build uses (see [Hosted-Only Columns](#hosted-only-columns)).
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|

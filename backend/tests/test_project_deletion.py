@@ -26,12 +26,31 @@ from project_deletion import (
     _process_repository_resources,
     _validate_repository_access,
     _build_deletion_summary,
-    _delete_project_workflows,
-    _delete_workflow_file,
-    _delete_github_resources_for_repository
+    _delete_github_resources_for_repository,
+    ALREADY_DELETING,
 )
-from models import Account, Project, Repo, Workflow, ProjectRepo, ProjectWorkflow
+import deliveries
+from authorization import PROJECT_DELETING, has_project_role
+from models import (
+    Account, Codeowners, CustomFile, FileDelivery, LinkedReusableWorkflow, Project, ProjectPRCampaign,
+    ProjectPullRequest, Repo, Workflow, ProjectRepo, ProjectWorkflow, WorkspaceMember,
+)
 from database import Base
+from tests.campaign_harness import (
+    BRANCH as HARNESS_BRANCH,
+    USER as HARNESS_USER,
+    FakeGitHub,
+    delete_project,
+    github,
+    press_close,
+    press_merge,
+    run_campaign,
+)
+from tests.delivery_records import record_pr_carries
+
+
+# Where project deletion's orphaned-workflow cleanup is looked up (workflows.delete_project_record).
+_ORPHAN_CLEANUP = 'workflows.cleanup_orphaned_workflows'
 
 
 def _make_empty_middleware_factory():
@@ -70,10 +89,11 @@ class TestProjectDeletionHelpers:
         mock_project.user_id = 1
         
         # Configure database queries
-        mock_db.query.return_value.filter.return_value.first.side_effect = [mock_user, mock_project]
-        
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_user
+
         # Test the function
-        user, project = _get_project_and_user("Test Project", "testuser", mock_db)
+        with patch("project_deletion.find_project_by_name", return_value=mock_project):
+            user, project = _get_project_and_user("Test Project", "testuser", mock_db)
         
         assert user == mock_user
         assert project == mock_project
@@ -97,9 +117,10 @@ class TestProjectDeletionHelpers:
         mock_user = Mock(spec=Account)
         mock_user.user_id = 1
         
-        mock_db.query.return_value.filter.return_value.first.side_effect = [mock_user, None]
-        
-        with pytest.raises(HTTPException) as exc_info:
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_user
+
+        with pytest.raises(HTTPException) as exc_info, \
+                patch("project_deletion.find_project_by_name", return_value=None):
             _get_project_and_user("Nonexistent Project", "testuser", mock_db)
         
         assert exc_info.value.status_code == 404
@@ -326,10 +347,14 @@ class TestProjectDeletionHelpers:
         env_vars = [{"name": "AM_TEST_VAR", "repository": "test/repo"}]
         environments = [{"name": "production", "repository": "test/repo"}]
         
+        targets = [{"repository": "test/repo", "branch": "main", "files": []}]
+
         summary = _build_deletion_summary(
-            mock_project, workflows, reusable_workflows, secrets, env_vars, environments
+            mock_project, workflows, reusable_workflows, secrets, env_vars, environments, {"removal_targets": targets}
         )
         
+        assert summary.removal_targets == targets
+        assert summary.removal_blocked_reason is None
         assert summary.project_name == "Test Project"
         assert summary.project_code == "TEST"
         assert len(summary.workflows) == 1
@@ -373,137 +398,447 @@ class TestProjectDeletionHelpers:
         assert environments == []
 
 
-class TestDeleteProjectWorkflows:
-    """Tests for _delete_project_workflows to verify no-prefix workflow name matching."""
+# --------------------------------------------------------------------------- #
+# Deleting a project with its files: a last PR Campaign, one pull request per #
+# (repo, branch) the delivery record holds any of them on.                    #
+# --------------------------------------------------------------------------- #
 
-    @patch('project_deletion.requests.get')
-    @patch('project_deletion.requests.delete')
-    def test_no_prefix_workflow_name_without_yml_extension_is_deleted(self, mock_delete, mock_get):
-        """
-        Regression test: workflow names stored without .yml extension in the database
-        must still match the .yml filename returned by the GitHub API.
-        """
-        # GitHub API response listing workflows in the repo
-        github_workflow_list_response = Mock()
-        github_workflow_list_response.status_code = 200
-        github_workflow_list_response.json.return_value = {
-            "workflows": [
-                {
-                    "name": "Build and Test",
-                    "path": ".github/workflows/build.yml"
-                }
-            ]
-        }
+DOOMED = "doomed"
+APP, WEB = "doomed-org/app", "doomed-org/web"
+RELEASE = "release/1"
+CI_PATH = ".github/workflows/AM_DMD_ci.yml"
+LIB_PATH = ".github/workflows/AM_DMD_lib.yml"
+SCRIPT, MOVED_SCRIPT = ".github/scripts/build.sh", ".github/scripts/ci/build.sh"
+OWNERS_PATH = ".github/CODEOWNERS"
+REMOVE_FILES = {"remove_files": True}
+CI, LIB, OPEN = "ci", "lib", "open"
+SHARED, CALLER = "doomed-org/shared", "caller"
 
-        # GitHub API response for the file content (needed to get SHA before deleting)
-        github_file_response = Mock()
-        github_file_response.status_code = 200
-        github_file_response.json.return_value = {"sha": "abc123"}
+_Session = _make_empty_middleware_factory()
+_engine = _Session.kw["bind"]
 
-        mock_get.side_effect = [github_workflow_list_response, github_file_response]
 
-        # Successful delete response
-        delete_response = Mock()
-        delete_response.status_code = 200
-        mock_delete.return_value = delete_response
+@pytest.fixture
+def db():
+    Base.metadata.create_all(bind=_engine)
+    session = _Session()
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(bind=_engine)
 
-        # Mock database: no-prefix project with workflow stored as "build" (no .yml)
-        mock_db = Mock(spec=Session)
-        mock_project = Mock(spec=Project)
-        mock_project.project_id = 1
-        mock_project.use_prefix = False
 
-        # New join query returns (workflow_name,) tuples directly
-        mock_db.query.return_value.join.return_value.filter.return_value.all.return_value = [("build",)]
+@pytest.fixture
+def client(db, authenticate_client):
+    from fastapi.testclient import TestClient
+    from database import get_db
+    from main import app
 
-        deletion_results = {"github_resources_deleted": [], "errors": []}
-        headers = {"Authorization": "token test-token"}
+    def override_get_db():
+        session = _Session()
+        try:
+            yield session
+        finally:
+            session.close()
 
-        _delete_project_workflows("owner/repo", headers, "", deletion_results, mock_project, mock_db)
+    app.dependency_overrides[get_db] = override_get_db
+    original_factory = app.state.middleware_db_factory
+    app.state.middleware_db_factory = _Session
+    try:
+        with patch("mode_validation.validate_startup_configuration"), TestClient(app) as test_client:
+            authenticate_client(test_client, HARNESS_USER, _Session)
+            yield test_client
+    finally:
+        app.state.middleware_db_factory = original_factory
+        app.dependency_overrides.pop(get_db, None)
 
-        # The workflow file should have been deleted
-        assert len(deletion_results["github_resources_deleted"]) == 1
-        assert "build.yml" in deletion_results["github_resources_deleted"][0]
-        assert len(deletion_results["errors"]) == 0
 
-    @patch('project_deletion.requests.get')
-    @patch('project_deletion.requests.delete')
-    def test_no_prefix_workflow_name_with_yml_extension_is_deleted(self, mock_delete, mock_get):
-        """
-        Workflow names already stored with .yml extension in the database
-        must also match correctly.
-        """
-        github_workflow_list_response = Mock()
-        github_workflow_list_response.status_code = 200
-        github_workflow_list_response.json.return_value = {
-            "workflows": [
-                {
-                    "name": "Deploy",
-                    "path": ".github/workflows/deploy.yml"
-                }
-            ]
-        }
+@pytest.fixture
+def fake():
+    return FakeGitHub()
 
-        github_file_response = Mock()
-        github_file_response.status_code = 200
-        github_file_response.json.return_value = {"sha": "def456"}
 
-        mock_get.side_effect = [github_workflow_list_response, github_file_response]
+def _add_project(db, name=DOOMED, code="DMD", project_type="standard", repos=(APP, WEB)):
+    owner = db.query(Account).filter_by(github_user=HARNESS_USER).first()
+    if owner is None:
+        owner = Account(github_user=HARNESS_USER, github_email="doomed@example.com", account_type="free")
+        db.add(owner)
+        db.flush()
+    project = Project(project_name=name, project_code=code, user_id=owner.user_id, project_type=project_type,
+                      use_prefix=True, branch_option="default", pr_state="draft")
+    db.add(project)
+    db.flush()
+    for repo_name in repos:
+        repo = db.query(Repo).filter_by(repo_name=repo_name).first() or Repo(repo_name=repo_name)
+        db.add(repo)
+        db.flush()
+        db.add(ProjectRepo(project_id=project.project_id, repo_id=repo.repo_id))
+    db.commit()
+    return project
 
-        delete_response = Mock()
-        delete_response.status_code = 200
-        mock_delete.return_value = delete_response
 
-        mock_db = Mock(spec=Session)
-        mock_project = Mock(spec=Project)
-        mock_project.project_id = 1
-        mock_project.use_prefix = False
+def _add_workflow(db, project, name, reusable=False):
+    workflow = Workflow(workflow_name=name, reusable_workflow=reusable, workflow_status="new",
+                        workflow_yaml="on: workflow_call\n" if reusable else "on: push\n")
+    db.add(workflow)
+    db.flush()
+    db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=workflow.workflow_id))
+    db.commit()
+    return workflow
 
-        # New join query returns (workflow_name,) tuples directly
-        mock_db.query.return_value.join.return_value.filter.return_value.all.return_value = [("deploy.yml",)]
 
-        deletion_results = {"github_resources_deleted": [], "errors": []}
-        headers = {"Authorization": "token test-token"}
+def _deliver(db, fake, project, repos, **selection):
+    """Deliver the selection to *repos* by a campaign whose pull requests all merged; then a clean slate of calls."""
+    for pr in run_campaign(db, fake, project, repos, **selection):
+        fake.merge(db, pr)
+    fake.calls.clear()
+    fake.deletes.clear()
 
-        _delete_project_workflows("owner/repo", headers, "", deletion_results, mock_project, mock_db)
 
-        assert len(deletion_results["github_resources_deleted"]) == 1
-        assert "deploy.yml" in deletion_results["github_resources_deleted"][0]
-        assert len(deletion_results["errors"]) == 0
+def _delivered_ci(db, fake):
+    """DOOMED with ``ci`` delivered to main of APP and WEB, and to APP's release branch the project no longer targets."""
+    project = _add_project(db)
+    _add_workflow(db, project, CI)
+    _deliver(db, fake, project, [APP, WEB])
+    fake.branch_config = [RELEASE]
+    _deliver(db, fake, project, [APP])
+    fake.branch_config = [HARNESS_BRANCH]
+    return project
 
-    @patch('project_deletion.requests.get')
-    @patch('project_deletion.requests.delete')
-    def test_no_prefix_untracked_workflow_is_not_deleted(self, mock_delete, mock_get):
-        """Workflows not tracked in the database for a no-prefix project must not be deleted."""
-        github_workflow_list_response = Mock()
-        github_workflow_list_response.status_code = 200
-        github_workflow_list_response.json.return_value = {
-            "workflows": [
-                {
-                    "name": "Other CI",
-                    "path": ".github/workflows/other-ci.yml"
-                }
-            ]
-        }
 
-        mock_get.return_value = github_workflow_list_response
+def _delivered_every_kind(db, fake):
+    """DOOMED with a workflow, a reusable workflow, a custom file and CODEOWNERS delivered to main of APP and WEB.
 
-        mock_db = Mock(spec=Session)
-        mock_project = Mock(spec=Project)
-        mock_project.project_id = 1
-        mock_project.use_prefix = False
+    The custom file has moved since, locally only.
+    """
+    project = _add_project(db)
+    _add_workflow(db, project, CI)
+    _add_workflow(db, project, LIB, reusable=True)
+    script = CustomFile(project_id=project.project_id, file_path=SCRIPT, file_content="echo build\n", file_status="new")
+    db.add_all([script, Codeowners(project_id=project.project_id, content="* @doomed-org/team\n", file_path=OWNERS_PATH)])
+    db.commit()
+    _deliver(db, fake, project, [APP, WEB], selected_workflows=[CI], selected_reusable_workflows=[LIB],
+             selected_custom_file_ids=[script.id], include_codeowners=True)
+    script.file_path, script.file_status = MOVED_SCRIPT, "committed_locally"
+    db.commit()
+    return project
 
-        # New join query returns (workflow_name,) tuples directly; "build" != "other-ci"
-        mock_db.query.return_value.join.return_value.filter.return_value.all.return_value = [("build",)]
 
-        deletion_results = {"github_resources_deleted": [], "errors": []}
-        headers = {"Authorization": "token test-token"}
+def _detail(response):
+    return response.json()["detail"]
 
-        _delete_project_workflows("owner/repo", headers, "", deletion_results, mock_project, mock_db)
 
-        # Should not delete untracked workflow
-        assert len(deletion_results["github_resources_deleted"]) == 0
-        mock_delete.assert_not_called()
+def _reason(refused):
+    """What a refusal says, for the user."""
+    return _detail(refused)["message"]
+
+
+def _deleted(response):
+    return response.json()["project_deleted"]
+
+
+def _file(kind, name, path):
+    """One file of the removal plan, as the summary lists it."""
+    return {"kind": kind, "name": name, "path": path}
+
+
+def _doomed(db):
+    db.expire_all()
+    return db.query(Project).filter_by(project_name=DOOMED).first()
+
+
+def _targets(prs):
+    return sorted((pr.repo_name, pr.target_branch) for pr in prs)
+
+
+def _on_target_branches(fake):
+    return sorted(key for key in fake.files if not key[1].startswith("actions-manager/"))
+
+
+def test_remove_files_opens_one_pr_per_recorded_repo_and_branch(db, client, fake):
+    _delivered_ci(db, fake)
+
+    response, prs = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert _deleted(response) is False
+    assert body["pr_state"] == PROJECT_DELETING
+    assert body["prs_created"] == 3
+    assert _targets(prs) == [(APP, HARNESS_BRANCH), (APP, RELEASE), (WEB, HARNESS_BRANCH)], \
+        "every (repo, branch) the record holds, the release branch the project no longer targets included"
+    assert {pr.campaign_id for pr in prs} == {body["campaign_id"]}
+    campaign = db.query(ProjectPRCampaign).filter_by(campaign_id=body["campaign_id"]).one()
+    assert campaign.campaign_name == f"Delete project {DOOMED}"
+    assert _doomed(db).pr_state == PROJECT_DELETING
+
+
+def test_each_pr_deletes_every_kind_at_its_delivered_path(db, client, fake):
+    _delivered_every_kind(db, fake)
+
+    response, prs = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    assert response.status_code == 200, response.text
+    assert _targets(prs) == [(APP, HARNESS_BRANCH), (WEB, HARNESS_BRANCH)]
+    every_kind = sorted([CI_PATH, LIB_PATH, SCRIPT, OWNERS_PATH])
+    for pr in prs:
+        removed = sorted(path for repo, branch, path in fake.deletes if (repo, branch) == (pr.repo_name, pr.branch_name))
+        assert removed == every_kind, "the custom file is removed where it was delivered, not where it is now"
+        assert fake.paths(pr.repo_name, pr.branch_name) == set()
+        assert OWNERS_PATH in pr.file_names
+
+
+def test_no_direct_commit_is_made_for_files(db, client, fake):
+    _delivered_every_kind(db, fake)
+    before = _on_target_branches(fake)
+
+    response, _prs = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    assert response.status_code == 200, response.text
+    assert _on_target_branches(fake) == before, "nothing leaves a target branch until its pull request merges"
+    assert {branch.split("/", 1)[0] for _verb, _repo, branch, _path in fake.calls} == {"actions-manager"}
+    assert {verb for verb, *_ in fake.calls} == {"DELETE"}, "the record's blob SHAs make each removal one call"
+
+
+def test_open_prs_block_remove_files(db, client, fake):
+    project = _add_project(db)
+    _add_workflow(db, project, CI)
+    [open_pr] = run_campaign(db, fake, project, [APP])
+    fake.calls.clear()
+
+    refused, opened = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+    summary = client.get(f"/api/projects/{DOOMED}/deletion-summary")
+
+    assert refused.status_code == 409, refused.text
+    detail = _detail(refused)
+    assert detail["open_prs"] == [{"repo_name": APP, "pr_number": open_pr.pr_number, "pr_url": open_pr.pr_url,
+                                   "target_branch": HARNESS_BRANCH}]
+    assert f"{APP}#{open_pr.pr_number}" in _reason(refused)
+    assert summary.json()["removal_blocked_reason"] == _reason(refused)
+    assert opened == []
+    assert fake.calls == []
+    assert _doomed(db).pr_state == OPEN
+
+
+def test_another_projects_open_pr_carrying_a_file_blocks_remove_files(db, client, fake):
+    project = _add_project(db)
+    workflow = _add_workflow(db, project, CI)
+    _deliver(db, fake, project, [APP])
+    other = _add_project(db, name="other", code="OTH", repos=(WEB,))
+    carrier = ProjectPullRequest(project_id=other.project_id, repo_name=APP, pr_number=41, pr_state=OPEN,
+                                 pr_url=f"https://github.com/{APP}/pull/41", branch_name="actions-manager/oth-main",
+                                 target_branch=HARNESS_BRANCH)
+    db.add(carrier)
+    db.commit()
+    record_pr_carries(db, carrier, workflow)
+
+    refused, _prs = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    assert refused.status_code == 409, refused.text
+    assert [pr["pr_number"] for pr in _detail(refused)["open_prs"]] == [41]
+
+
+def test_rwx_with_linked_callers_blocks_remove_files(db, client, fake):
+    shared = _add_project(db, name=DOOMED, code="DMD", project_type="rwx", repos=(SHARED,))
+    reusable = _add_workflow(db, shared, "build", reusable=True)
+    _deliver(db, fake, shared, [SHARED], selected_reusable_workflows=["build"])
+    caller = _add_project(db, name=CALLER, code="CLR", repos=(APP,))
+    db.add(LinkedReusableWorkflow(standard_project_id=caller.project_id, rwx_project_id=shared.project_id,
+                                  workflow_id=reusable.workflow_id))
+    db.commit()
+
+    refused, opened = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+    kept, _ = delete_project(client, fake, db, DOOMED, remove_files=False)
+
+    assert refused.status_code == 409, refused.text
+    assert _detail(refused)["linked_projects"] == [CALLER]
+    assert CALLER in _reason(refused)
+    assert opened == []
+    assert kept.status_code == 200, kept.text
+    assert _deleted(kept) is True, "deleting it and keeping its files stays allowed"
+    still_there = (SHARED, HARNESS_BRANCH, ".github/workflows/AM_DMD_build.yml")
+    assert still_there in fake.files
+
+
+def test_files_in_a_repository_no_longer_in_the_project_block_remove_files(db, client, fake):
+    project = _add_project(db)
+    _add_workflow(db, project, CI)
+    _deliver(db, fake, project, [APP, WEB])
+    web = db.query(Repo).filter_by(repo_name=WEB).one()
+    db.query(ProjectRepo).filter_by(project_id=project.project_id, repo_id=web.repo_id).delete()
+    db.commit()
+
+    refused, opened = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    assert refused.status_code == 409, refused.text
+    assert _detail(refused)["repositories"] == [WEB]
+    assert opened == []
+
+
+def test_nothing_delivered_deletes_immediately(db, client, fake):
+    project = _add_project(db)
+    _add_workflow(db, project, CI)
+
+    response, opened = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    assert response.status_code == 200, response.text
+    assert _deleted(response) is True
+    assert response.json()["pr_state"] is None
+    assert opened == []
+    assert fake.calls == []
+    assert _doomed(db) is None
+
+
+def test_files_already_gone_from_github_delete_immediately(db, client, fake):
+    _delivered_ci(db, fake)
+    for key in [key for key in fake.files if key[2] == CI_PATH]:
+        del fake.files[key]
+
+    response, opened = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    assert response.status_code == 200, response.text
+    assert _deleted(response) is True
+    assert opened == []
+    assert _doomed(db) is None
+
+
+def test_keep_files_touches_no_file(db, client, fake):
+    _delivered_every_kind(db, fake)
+    before = dict(fake.files)
+
+    response, opened = delete_project(client, fake, db, DOOMED, remove_files=False)
+
+    assert response.status_code == 200, response.text
+    assert _deleted(response) is True
+    assert response.json()["details"]["project_deleted"] is True
+    assert opened == []
+    assert fake.files == before
+    assert fake.calls == []
+    assert _doomed(db) is None
+
+
+SECRET = "AM_DMD_TOKEN"
+
+
+def _listing_secrets(fake):
+    fake.secrets = {APP: [SECRET], WEB: [SECRET]}
+    return patch("project_deletion.requests.get", side_effect=fake.actions_settings)
+
+
+@pytest.mark.parametrize("remove_files", [True, False])
+def test_secrets_option_is_direct_and_independent(db, client, fake, remove_files):
+    _delivered_ci(db, fake)
+
+    with _listing_secrets(fake):
+        response, opened = delete_project(client, fake, db, DOOMED, remove_files=remove_files,
+                                          delete_github_resources=True, delete_deployment_environments=False)
+
+    assert response.status_code == 200, response.text
+    assert sorted(fake.secrets_deleted) == [(APP, SECRET), (WEB, SECRET)]
+    assert response.json()["details"]["github_resources_deleted"] == [
+        f"Repository Secret: {SECRET} from {repo}" for repo in (APP, WEB)]
+    assert len(opened) == (3 if remove_files else 0), "files only ever go by pull request"
+
+
+def test_without_the_secrets_option_no_secret_is_touched(db, client, fake):
+    _delivered_ci(db, fake)
+
+    with _listing_secrets(fake) as secrets_read:
+        response, _prs = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    assert response.status_code == 200, response.text
+    assert fake.secrets_deleted == []
+    secrets_read.assert_not_called()
+
+
+def test_a_deleting_project_cannot_be_deleted_again(db, client, fake):
+    _delivered_ci(db, fake)
+    started, _prs = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+    fake.calls.clear()
+
+    again = [delete_project(client, fake, db, DOOMED, remove_files=choice)[0] for choice in (True, False)]
+
+    assert started.status_code == 200, started.text
+    assert [response.status_code for response in again] == [409, 409]
+    assert _detail(again[0]) == ALREADY_DELETING
+    assert fake.calls == []
+    assert _doomed(db).pr_state == PROJECT_DELETING
+
+
+def test_summary_lists_the_removal_plan_without_github_calls(db, client, fake):
+    project = _delivered_every_kind(db, fake)
+    never_recorded = _add_workflow(db, project, "legacy")
+    never_recorded.workflow_status = "synced_with_github"
+    db.commit()
+
+    with github(fake), patch("project_deletion.requests.get", return_value=Mock(status_code=404)) as github_read:
+        response = client.get(f"/api/projects/{DOOMED}/deletion-summary")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    every_kind = [
+        _file(deliveries.WORKFLOW, CI, CI_PATH),
+        _file(deliveries.WORKFLOW, LIB, LIB_PATH),
+        _file(deliveries.CUSTOM_FILE, MOVED_SCRIPT, SCRIPT),
+        _file(deliveries.CODEOWNERS, OWNERS_PATH, OWNERS_PATH),
+    ]
+    assert body["removal_targets"] == [
+        {"repository": repo, "branch": HARNESS_BRANCH, "files": every_kind} for repo in (APP, WEB)]
+    assert body["unrecorded_files"] == [
+        _file(deliveries.WORKFLOW, "legacy", ".github/workflows/AM_DMD_legacy.yml")]
+    assert body["removal_blocked_reason"] is None
+    assert fake.calls == [], "the plan is the record's alone"
+    assert [read.args[0] for read in github_read.call_args_list] == [
+        f"https://api.github.com/repos/{repo}" for repo in (APP, WEB)], "only the secrets listing reads GitHub"
+
+
+def test_errors_opening_every_pr_leave_the_project_untouched(db, client, fake):
+    project = _delivered_ci(db, fake)
+    state = project.pr_state
+    held = deliveries.project_delivered_repos(db, project.project_id)
+
+    fake.pr_refusal = "Resource not accessible by integration"
+
+    response, opened = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    assert response.status_code == 502, response.text
+    assert "was not deleted" in _reason(response)
+    assert opened == []
+    doomed = _doomed(db)
+    assert doomed.pr_state == state
+    assert db.query(ProjectPRCampaign).filter_by(campaign_name=f"Delete project {DOOMED}").count() == 0
+    assert deliveries.project_delivered_repos(db, doomed.project_id) == held
+
+
+def test_merging_every_removal_pr_deletes_the_project(db, client, fake):
+    _delivered_every_kind(db, fake)
+    _started, prs = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+    first, last = prs
+
+    merged = [press_merge(client, fake, DOOMED, first), press_merge(client, fake, DOOMED, last)]
+
+    assert [response.status_code for response in merged] == [200, 200], merged[-1].text
+    assert [_deleted(response) for response in merged] == [False, True]
+    assert _doomed(db) is None
+    assert db.query(Workflow).count() == 0
+    assert db.query(FileDelivery).count() == 0
+    assert _on_target_branches(fake) == [], "every file the project delivered is gone from GitHub"
+
+
+def test_closing_a_removal_pr_makes_the_project_editable_again(db, client, fake):
+    _delivered_ci(db, fake)
+    _started, prs = delete_project(client, fake, db, DOOMED, **REMOVE_FILES)
+
+    closed = press_close(client, fake, DOOMED, prs[0])
+
+    assert closed.status_code == 200, closed.text
+    project = _doomed(db)
+    owner = db.query(Account).filter_by(github_user=HARNESS_USER).one()
+    assert project.pr_state == OPEN, "called off, its other removal PRs now ordinary open PRs"
+    assert has_project_role(db, owner, project, "project_editor")
+    assert _on_target_branches(fake) == sorted(
+        [(APP, HARNESS_BRANCH, CI_PATH), (APP, RELEASE, CI_PATH), (WEB, HARNESS_BRANCH, CI_PATH)])
 
 
 class TestDeleteDeploymentEnvironmentsOptOut:
@@ -561,7 +896,11 @@ class TestCascadeDeletion:
     @patch('project_deletion.requests.get')
     @patch('project_deletion.requests.delete')
     def test_cascade_deletes_all_resource_types(self, mock_delete, mock_get):
-        """Deleting a project cascades to workflows, secrets, variables, and environments."""
+        """Deleting a project's GitHub resources cascades to secrets, variables and environments, never its files.
+
+        Files are removed only by pull request (workflows.start_project_removal),
+        so a workflow GitHub lists is left alone even where its name matches.
+        """
         def get_side_effect(url, headers=None, **kwargs):
             resp = Mock()
             if "/actions/workflows" in url:
@@ -618,7 +957,8 @@ class TestCascadeDeletion:
 
         # Verify multiple resource types were deleted
         deleted = deletion_results["github_resources_deleted"]
-        assert any("Workflow" in d for d in deleted)
+        assert not any("Workflow" in d for d in deleted)
+        assert mock_delete.call_count == len(deleted), "every DELETE was a secret, variable or environment"
         assert any("Repository Secret" in d for d in deleted)
         assert any("Repository Variable" in d for d in deleted)
         assert any("Deployment Environment" in d for d in deleted)
@@ -1033,53 +1373,13 @@ class TestPartialDeletionHandling:
         assert len(deletion_results["errors"]) == 1
         assert "staging" in deletion_results["errors"][0]
 
-    @patch('project_deletion.requests.get')
-    @patch('project_deletion.requests.delete')
-    def test_workflow_file_sha_missing_records_error(self, mock_delete, mock_get):
-        """Missing SHA in file metadata records error without crashing."""
-        from project_deletion import _delete_workflow_file
-
-        mock_get_response = Mock()
-        mock_get_response.status_code = 200
-        mock_get_response.json.return_value = {}  # No 'sha' key
-        mock_get.return_value = mock_get_response
-
-        deletion_results = {"github_resources_deleted": [], "errors": []}
-        headers = {"Authorization": "token test-token"}
-
-        _delete_workflow_file("owner/repo", headers, "ci.yml", ".github/workflows/ci.yml", deletion_results)
-
-        assert len(deletion_results["errors"]) == 1
-        assert "Missing SHA" in deletion_results["errors"][0]
-        mock_delete.assert_not_called()
-
-    @patch('project_deletion.requests.get')
-    @patch('project_deletion.requests.delete')
-    def test_workflow_file_get_failure_records_error(self, mock_delete, mock_get):
-        """HTTP error fetching workflow file metadata records error."""
-        from project_deletion import _delete_workflow_file
-
-        mock_get_response = Mock()
-        mock_get_response.status_code = 404
-        mock_get.return_value = mock_get_response
-
-        deletion_results = {"github_resources_deleted": [], "errors": []}
-        headers = {"Authorization": "token test-token"}
-
-        _delete_workflow_file("owner/repo", headers, "ci.yml", ".github/workflows/ci.yml", deletion_results)
-
-        assert len(deletion_results["errors"]) == 1
-        assert "HTTP 404" in deletion_results["errors"][0]
-        mock_delete.assert_not_called()
-
 
 class TestTransactionRollback:
     """Tests for transaction rollback behavior on errors."""
 
-    @patch('project_deletion.auth_module.assert_session_owns_user')
-    @patch('project_deletion.cleanup_orphaned_workflows')
+    @patch(_ORPHAN_CLEANUP)
     @patch('project_deletion.user_tokens', {"testuser": "test-token"})
-    def test_enhanced_delete_rolls_back_on_db_commit_failure(self, mock_cleanup, _mock_assert):
+    def test_enhanced_delete_rolls_back_on_db_commit_failure(self, mock_cleanup):
         """If db.commit() fails, transaction is rolled back and 500 is raised."""
         from fastapi.testclient import TestClient
         from main import app
@@ -1102,12 +1402,14 @@ class TestTransactionRollback:
         mock_db.rollback.return_value = None
         mock_db.close.return_value = None
 
+        from auth import current_account
         from database import get_db
 
         def override_get_db():
             yield mock_db
 
         app.dependency_overrides[get_db] = override_get_db
+        app.dependency_overrides[current_account] = lambda: mock_user
         original_middleware_factory = app.state.middleware_db_factory
         app.state.middleware_db_factory = _make_empty_middleware_factory()
         try:
@@ -1116,7 +1418,6 @@ class TestTransactionRollback:
                 "DELETE",
                 "/api/projects/Test%20Project/enhanced",
                 json={
-                    "github_user": "testuser",
                     "project_name": "Test Project",
                     "delete_github_resources": False,
                     "delete_deployment_environments": True
@@ -1124,16 +1425,16 @@ class TestTransactionRollback:
             )
 
             assert response.status_code == 500
-            assert "Error deleting project" in response.json()["detail"]
+            assert "Error deleting project" in _detail(response)
             mock_db.rollback.assert_called_once()
         finally:
             app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(current_account, None)
             app.state.middleware_db_factory = original_middleware_factory
 
-    @patch('project_deletion.auth_module.assert_session_owns_user')
-    @patch('project_deletion.cleanup_orphaned_workflows')
+    @patch(_ORPHAN_CLEANUP)
     @patch('project_deletion.user_tokens', {"testuser": "test-token"})
-    def test_enhanced_delete_closes_db_on_success(self, mock_cleanup, _mock_assert):
+    def test_enhanced_delete_closes_db_on_success(self, mock_cleanup):
         """Database session is closed even on successful deletion."""
         from fastapi.testclient import TestClient
         from main import app
@@ -1150,42 +1451,47 @@ class TestTransactionRollback:
         mock_project.user_id = 1
         mock_project.use_prefix = True
 
-        mock_db.query.return_value.filter.return_value.first.side_effect = [mock_user, mock_project]
+        # The caller's account, then their workspace row: the owner edits their own project.
+        mock_member = Mock(spec=WorkspaceMember)
+        mock_member.workspace_role = "member"
+        mock_db.query.return_value.filter.return_value.first.side_effect = [mock_user, mock_member]
         mock_db.delete.return_value = None
         mock_db.commit.return_value = None
         mock_db.close.return_value = None
 
+        from auth import current_account
         from database import get_db
 
         def override_get_db():
             yield mock_db
 
         app.dependency_overrides[get_db] = override_get_db
+        app.dependency_overrides[current_account] = lambda: mock_user
         original_middleware_factory = app.state.middleware_db_factory
         app.state.middleware_db_factory = _make_empty_middleware_factory()
         try:
             client = TestClient(app)
-            response = client.request(
-                "DELETE",
-                "/api/projects/Test%20Project/enhanced",
-                json={
-                    "github_user": "testuser",
-                    "project_name": "Test Project",
-                    "delete_github_resources": False,
-                    "delete_deployment_environments": True
-                }
-            )
+            with patch("project_deletion.find_project_by_name", return_value=mock_project):
+                response = client.request(
+                    "DELETE",
+                    "/api/projects/Test%20Project/enhanced",
+                    json={
+                        "project_name": "Test Project",
+                        "delete_github_resources": False,
+                        "delete_deployment_environments": True
+                    }
+                )
 
             assert response.status_code == 200
             mock_db.close.assert_called_once()
         finally:
             app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(current_account, None)
             app.state.middleware_db_factory = original_middleware_factory
 
-    @patch('project_deletion.auth_module.assert_session_owns_user')
-    @patch('project_deletion.cleanup_orphaned_workflows')
+    @patch(_ORPHAN_CLEANUP)
     @patch('project_deletion.user_tokens', {"testuser": "test-token"})
-    def test_enhanced_delete_closes_db_on_failure(self, mock_cleanup, _mock_assert):
+    def test_enhanced_delete_closes_db_on_failure(self, mock_cleanup):
         """Database session is closed even when deletion fails."""
         from fastapi.testclient import TestClient
         from main import app
@@ -1207,12 +1513,14 @@ class TestTransactionRollback:
         mock_db.rollback.return_value = None
         mock_db.close.return_value = None
 
+        from auth import current_account
         from database import get_db
 
         def override_get_db():
             yield mock_db
 
         app.dependency_overrides[get_db] = override_get_db
+        app.dependency_overrides[current_account] = lambda: mock_user
         original_middleware_factory = app.state.middleware_db_factory
         app.state.middleware_db_factory = _make_empty_middleware_factory()
         try:
@@ -1221,7 +1529,6 @@ class TestTransactionRollback:
                 "DELETE",
                 "/api/projects/Test%20Project/enhanced",
                 json={
-                    "github_user": "testuser",
                     "project_name": "Test Project",
                     "delete_github_resources": False,
                     "delete_deployment_environments": True
@@ -1232,6 +1539,7 @@ class TestTransactionRollback:
             mock_db.close.assert_called_once()
         finally:
             app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(current_account, None)
             app.state.middleware_db_factory = original_middleware_factory
 
 
@@ -1316,11 +1624,8 @@ class TestErrorRecovery:
         def get_side_effect(url, headers=None, **kwargs):
             call_count["get"] += 1
             resp = Mock()
-            if "repo1" in url and "/actions/workflows" in url:
+            if "repo1" in url and "/actions/secrets" in url:
                 raise Exception("repo1 network error")
-            elif "/actions/workflows" in url:
-                resp.status_code = 200
-                resp.json.return_value = {"workflows": []}
             elif "/actions/secrets" in url:
                 resp.status_code = 200
                 resp.json.return_value = {
@@ -1384,10 +1689,12 @@ class TestErrorRecovery:
 
         mock_project = Mock(spec=Project)
         mock_project.project_id = 1
+        mock_project.user_id = 1
 
-        mock_db.query.return_value.filter.return_value.first.side_effect = [mock_user, mock_project]
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_user
 
-        user, project = _get_project_and_user("Test Project", "  testuser  ", mock_db)
+        with patch("project_deletion.find_project_by_name", return_value=mock_project):
+            user, project = _get_project_and_user("Test Project", "  testuser  ", mock_db)
 
         assert user == mock_user
         assert project == mock_project
@@ -1419,7 +1726,7 @@ class TestErrorRecovery:
 class TestDeletionSummaryEndpointAuth:
     """The deletion-summary endpoint is session-authenticated.
 
-    Like its sibling /enhanced, this route calls assert_session_owns_user, so a
+    Like its sibling /enhanced, this route depends on auth.current_account, so a
     request that carries no session token is rejected before any project lookup.
     A frontend caller that does not send credentials therefore never sees the
     summary, and the delete dialog can only offer database-only deletion.
@@ -1445,51 +1752,17 @@ class TestDeletionSummaryEndpointAuth:
             app.state.middleware_db_factory = original_middleware_factory
 
     @patch("project_deletion.user_tokens", {})
-    @patch("project_deletion.auth_module.assert_session_owns_user")
-    def test_returns_the_summary_once_the_session_is_supplied(self, mock_assert):
+    def test_returns_the_summary_once_the_session_is_supplied(self, db, client):
         """Same request, authenticated - the endpoint itself works fine."""
-        from fastapi.testclient import TestClient
-        from main import app
-        from database import get_db
+        _add_project(db, name="Demo-Project2", code="DP2")
 
-        mock_user = Mock(spec=Account)
-        mock_user.user_id = 1
-        mock_user.github_user = "testuser"
+        response = client.get("/api/projects/Demo-Project2/deletion-summary")
 
-        mock_project = Mock(spec=Project)
-        mock_project.project_id = 1
-        mock_project.project_name = "Demo-Project2"
-        mock_project.project_code = "DP2"
-        mock_project.user_id = 1
-        mock_project.use_prefix = True
-
-        mock_db = Mock(spec=Session)
-        mock_db.query.return_value.filter.return_value.first.side_effect = [mock_user, mock_project]
-        mock_db.query.return_value.filter.return_value.all.return_value = []
-        mock_db.query.return_value.join.return_value.filter.return_value.all.return_value = []
-
-        def override_get_db():
-            yield mock_db
-
-        app.dependency_overrides[get_db] = override_get_db
-        original_middleware_factory = app.state.middleware_db_factory
-        app.state.middleware_db_factory = _make_empty_middleware_factory()
-        try:
-            client = TestClient(app)
-            response = client.get(
-                "/api/projects/Demo-Project2/deletion-summary",
-                params={"github_user": "testuser"},
-            )
-
-            assert response.status_code == 200
-            body = response.json()
-            assert body["project_name"] == "Demo-Project2"
-            assert body["project_code"] == "DP2"
-            assert body["workflows"] == []
-            mock_assert.assert_called_once()
-        finally:
-            app.dependency_overrides.pop(get_db, None)
-            app.state.middleware_db_factory = original_middleware_factory
+        assert response.status_code == 200
+        body = response.json()
+        assert body["project_name"] == "Demo-Project2"
+        assert body["project_code"] == "DP2"
+        assert body["workflows"] == []
 
 
 def _make_db_with_projects(project_names: list[str]):

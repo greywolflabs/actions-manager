@@ -3,8 +3,8 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom";
 import { vi } from "vitest";
-import DriftDetection from "./DriftDetection";
-import type { WorkflowDriftDetail, ProjectDriftSummary } from "../api/drift";
+import DriftDetection, { driftSummaryText } from "./DriftDetection";
+import type { CodeownersDriftDetail, CustomFileDriftDetail, WorkflowDriftDetail, ProjectDriftSummary } from "../api/drift";
 
 vi.mock("../api/drift", () => ({
   getProjectDrift: vi.fn(),
@@ -388,14 +388,14 @@ describe("DriftDetection", () => {
     const onDriftLoaded = vi.fn();
     render(<DriftDetection {...defaultProps} onDriftLoaded={onDriftLoaded} />);
     await waitFor(() => expect(screen.getByTestId("drift-banner")).toBeInTheDocument());
-    expect(onDriftLoaded).toHaveBeenCalledWith([mockDrift()]);
+    expect(onDriftLoaded).toHaveBeenCalledWith([mockDrift()], [], []);
   });
 
   test("shows the clean status row instead of the drift banner when the response reports no drift", async () => {
     vi.mocked(getProjectDrift).mockResolvedValue(mockSummary([]));
     const onDriftLoaded = vi.fn();
     render(<DriftDetection {...defaultProps} onDriftLoaded={onDriftLoaded} />);
-    await waitFor(() => expect(onDriftLoaded).toHaveBeenCalledWith([]));
+    await waitFor(() => expect(onDriftLoaded).toHaveBeenCalledWith([], [], []));
     expect(screen.queryByTestId("drift-banner")).not.toBeInTheDocument();
     expect(screen.getByTestId("drift-status-row")).toHaveTextContent("No drift detected");
   });
@@ -413,7 +413,7 @@ describe("DriftDetection", () => {
 
     await waitFor(() => expect(vi.mocked(getProjectDrift)).toHaveBeenCalledTimes(2));
     expect(screen.getByTestId("drift-banner")).toBeInTheDocument();
-    expect(onDriftLoaded).not.toHaveBeenLastCalledWith([]);
+    expect(onDriftLoaded).not.toHaveBeenLastCalledWith([], [], []);
   });
 
   test("ignores a stale response from a previously viewed project", async () => {
@@ -430,14 +430,14 @@ describe("DriftDetection", () => {
 
     vi.mocked(getProjectDrift).mockResolvedValueOnce(mockSummary([]));
     rerender(<DriftDetection {...defaultProps} projectId={2} onDriftLoaded={onDriftLoaded} />);
-    await waitFor(() => expect(onDriftLoaded).toHaveBeenCalledWith([]));
+    await waitFor(() => expect(onDriftLoaded).toHaveBeenCalledWith([], [], []));
 
     // The stale first-project response resolves after project 2's clean result already landed.
     resolveFirst(mockSummary([mockDrift()]));
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(onDriftLoaded).toHaveBeenLastCalledWith([]);
+    expect(onDriftLoaded).toHaveBeenLastCalledWith([], [], []);
     expect(screen.queryByTestId("drift-banner")).not.toBeInTheDocument();
   });
 
@@ -573,5 +573,168 @@ describe("DriftDetection", () => {
     await waitFor(() =>
       expect(screen.getByText("Branch protection blocked the push")).toBeInTheDocument());
     expect(screen.queryByText(/Request failed with status code 500/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("DriftDetection – CODEOWNERS", () => {
+  const codeownersDrift = (overrides: Partial<CodeownersDriftDetail> = {}): CodeownersDriftDetail => ({
+    file_path: ".github/CODEOWNERS",
+    repo: "org/repo",
+    repo_id: 3,
+    branch: "main",
+    has_drift: true,
+    actionsmanager_sha: "sha-a",
+    github_sha: "sha-b",
+    last_checked: "2026-01-01T00:00:00Z",
+    message: "CODEOWNERS content differs between local and org/repo",
+    ...overrides,
+  });
+
+  const withCodeowners = (workflows: WorkflowDriftDetail[], codeowners: CodeownersDriftDetail[]): ProjectDriftSummary => ({
+    ...mockSummary(workflows),
+    drift_count: workflows.length + codeowners.length,
+    drifted_codeowners: codeowners,
+    drift_status: "drifted",
+  });
+
+  beforeEach(() => {
+    vi.mocked(getProjectDrift).mockReset();
+  });
+
+  test.each([
+    [0, false, ""],
+    [0, true, "CODEOWNERS changed in GitHub"],
+    [1, false, "1 workflow changed in GitHub"],
+    [2, true, "2 workflows and CODEOWNERS changed in GitHub"],
+  ])("summarizes %i drifted workflows with CODEOWNERS drifted=%s", (count, codeowners, text) => {
+    expect(driftSummaryText(count, codeowners)).toBe(text);
+  });
+
+  test("a project whose only drift is CODEOWNERS shows the banner, not a clean status", async () => {
+    vi.mocked(getProjectDrift).mockResolvedValue(withCodeowners([], [codeownersDrift()]));
+    render(<DriftDetection {...defaultProps} />);
+
+    await waitFor(() => expect(screen.getByTestId("drift-banner")).toHaveTextContent("CODEOWNERS changed in GitHub"));
+    expect(screen.queryByTestId("drift-status-row")).not.toBeInTheDocument();
+  });
+
+  test("the seeded banner counts CODEOWNERS before the stored drift loads", () => {
+    vi.mocked(getProjectDrift).mockReturnValue(new Promise(() => {}));
+    render(<DriftDetection {...defaultProps} seededDriftNames={["Build"]} seededCodeownersDrift />);
+
+    expect(screen.getByText("1 workflow and CODEOWNERS changed in GitHub")).toBeInTheDocument();
+  });
+
+  test("hands the CODEOWNERS rows to the page alongside the workflow rows", async () => {
+    const onDriftLoaded = vi.fn();
+    const row = codeownersDrift();
+    vi.mocked(getProjectDrift).mockResolvedValue(withCodeowners([mockDrift()], [row]));
+    render(<DriftDetection {...defaultProps} onDriftLoaded={onDriftLoaded} />);
+
+    await waitFor(() => expect(onDriftLoaded).toHaveBeenCalledWith([mockDrift()], [row], []));
+  });
+
+  test("lists each drifted branch and opens the CODEOWNERS editor to resolve it", async () => {
+    const user = userEvent.setup();
+    const onOpenCodeowners = vi.fn();
+    vi.mocked(getProjectDrift).mockResolvedValue(withCodeowners([], [
+      codeownersDrift(),
+      codeownersDrift({ repo: "org/other", branch: "release/1", deleted_in_github: true, github_sha: null }),
+    ]));
+    render(<DriftDetection {...defaultProps} onOpenCodeowners={onOpenCodeowners} />);
+    await waitFor(() => expect(screen.getByTestId("review-drift-button")).toBeEnabled());
+
+    await user.click(screen.getByTestId("review-drift-button"));
+    const section = screen.getByTestId("codeowners-drift-section");
+
+    expect(screen.getByText("⚠️ Drift Detected")).toBeInTheDocument();
+    expect(section).toHaveTextContent("org/repomainChanged in GitHub");
+    expect(section).toHaveTextContent("org/otherrelease/1Deleted in GitHub");
+    // Only CODEOWNERS drifted, so there is no empty workflow table to read.
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+
+    await user.click(screen.getByTestId("open-codeowners-button"));
+    expect(onOpenCodeowners).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.queryByTestId("drift-modal")).not.toBeInTheDocument());
+  });
+});
+
+describe("DriftDetection – custom files", () => {
+  const customFileDrift = (overrides: Partial<CustomFileDriftDetail> = {}): CustomFileDriftDetail => ({
+    custom_file_id: 7,
+    file_path: "scripts/build.sh",
+    repo: "org/repo",
+    repo_id: 3,
+    branch: "main",
+    has_drift: true,
+    actionsmanager_sha: "sha-a",
+    github_sha: "sha-b",
+    last_checked: "2026-01-01T00:00:00Z",
+    message: "scripts/build.sh content differs between local and org/repo",
+    ...overrides,
+  });
+
+  const withCustomFiles = (workflows: WorkflowDriftDetail[], customFiles: CustomFileDriftDetail[]): ProjectDriftSummary => ({
+    ...mockSummary(workflows),
+    drift_count: workflows.length + customFiles.length,
+    drifted_custom_files: customFiles,
+    drift_status: "drifted",
+  });
+
+  beforeEach(() => {
+    vi.mocked(getProjectDrift).mockReset();
+  });
+
+  test.each([
+    [0, false, 1, "1 custom file changed in GitHub"],
+    [0, true, 2, "2 custom files and CODEOWNERS changed in GitHub"],
+    [1, true, 1, "1 workflow, 1 custom file and CODEOWNERS changed in GitHub"],
+    [3, false, 2, "3 workflows and 2 custom files changed in GitHub"],
+  ])("summarizes %i workflows, CODEOWNERS=%s and %i custom files", (workflows, codeowners, customFiles, text) => {
+    expect(driftSummaryText(workflows, codeowners, customFiles)).toBe(text);
+  });
+
+  test("a project whose only drift is a custom file shows the banner, counting files not branches", async () => {
+    vi.mocked(getProjectDrift).mockResolvedValue(withCustomFiles([], [
+      customFileDrift(), customFileDrift({ repo: "org/other" }),
+    ]));
+    render(<DriftDetection {...defaultProps} />);
+
+    await waitFor(() => expect(screen.getByTestId("drift-banner")).toHaveTextContent("1 custom file changed in GitHub"));
+    expect(screen.queryByTestId("drift-status-row")).not.toBeInTheDocument();
+  });
+
+  test("the seeded banner counts custom files before the stored drift loads", () => {
+    vi.mocked(getProjectDrift).mockReturnValue(new Promise(() => {}));
+    render(<DriftDetection {...defaultProps} seededCustomFileDriftCount={2} />);
+
+    expect(screen.getByText("2 custom files changed in GitHub")).toBeInTheDocument();
+  });
+
+  test("hands the custom-file rows to the page", async () => {
+    const onDriftLoaded = vi.fn();
+    const row = customFileDrift();
+    vi.mocked(getProjectDrift).mockResolvedValue(withCustomFiles([mockDrift()], [row]));
+    render(<DriftDetection {...defaultProps} onDriftLoaded={onDriftLoaded} />);
+
+    await waitFor(() => expect(onDriftLoaded).toHaveBeenCalledWith([mockDrift()], [], [row]));
+  });
+
+  test("lists each drifted file and branch in Review Drift", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getProjectDrift).mockResolvedValue(withCustomFiles([], [
+      customFileDrift(),
+      customFileDrift({ repo: "org/other", branch: "release/1", deleted_in_github: true, github_sha: null }),
+    ]));
+    render(<DriftDetection {...defaultProps} />);
+    await waitFor(() => expect(screen.getByTestId("review-drift-button")).toBeEnabled());
+
+    await user.click(screen.getByTestId("review-drift-button"));
+    const section = screen.getByTestId("custom-file-drift-section");
+
+    expect(screen.getByText("⚠️ Drift Detected")).toBeInTheDocument();
+    expect(section).toHaveTextContent("scripts/build.shorg/repomainChanged in GitHub");
+    expect(section).toHaveTextContent("scripts/build.shorg/otherrelease/1Deleted in GitHub");
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
   });
 });

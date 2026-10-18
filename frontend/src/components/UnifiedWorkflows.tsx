@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import UnifiedWorkflowList from './UnifiedWorkflowList';
 import UnifiedWorkflowEditor from './UnifiedWorkflowEditor';
 import WorkflowCreationDialog from './WorkflowCreationDialog';
@@ -6,17 +6,30 @@ import TemplateSelectionModal from './TemplateSelectionModal';
 import { handleWorkflowChange } from '../utils/workflowOperations';
 import { useUnifiedWorkflowsState } from '../hooks/useUnifiedWorkflowsState';
 import { useWorkflowOperations } from '../hooks/useWorkflowOperations';
-import { useWorkflowSelectionLogic } from '../hooks/useWorkflowSelectionLogic';
+import { useWorkflowSelectionLogic, GuiRefusal } from '../hooks/useWorkflowSelectionLogic';
 import { useParentCallbacks } from '../hooks/useParentCallbacks';
-import { UnifiedWorkflowsProps, UnifiedWorkflowItem } from '../types/workflow';
+import { UnifiedWorkflowsProps, UnifiedWorkflowItem, RXWorkflow, Workflow } from '../types/workflow';
 import { CustomFilePanel } from './CustomFiles';
 import CodeownersManager from './CodeownersManager';
 import { CustomFile } from '../api/customFiles';
 import { toast } from '../utils/toast';
+import { planWorkflowKindMoves, type WorkflowKindChange } from '../utils/workflowKindChanges';
 // eslint-disable-next-line no-restricted-imports -- Legacy: TODO migrate CSS file to Tailwind CSS classes
 import '../styles/UnifiedWorkflows.css';
 // eslint-disable-next-line no-restricted-imports -- Legacy: TODO migrate CSS file to Tailwind CSS classes
 import '../styles/TemplateModal.css';
+
+const MAX_NAMED_LOSSES = 3;
+
+function guiRefusalMessage(refusal: GuiRefusal): string {
+  if (refusal.reason === 'parse') {
+    return 'Fix the YAML errors before switching to GUI mode.';
+  }
+  const named = refusal.paths.slice(0, MAX_NAMED_LOSSES).join(', ');
+  const hidden = refusal.paths.length - MAX_NAMED_LOSSES;
+  const more = hidden > 0 ? ` +${hidden} more` : '';
+  return `GUI mode can't edit this workflow without changing it (${named}${more}). Keep editing in YAML.`;
+}
 
 const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   user,
@@ -25,15 +38,14 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   selectedRepos,
   regexPattern,
   accountType,
-  projectPRState = "new",
   usePrefix = true,
   isReadOnly = false,
-  branchOption = "default",
   workflows,
   setWorkflows,
   onRefreshStatus,
   onAddWorkflow,
   onClearModifiedStates,
+  onRegisterSelectionFollower,
   rxworkflows,
   setRXWorkflows,
   addWorkflowToMain,
@@ -49,15 +61,21 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   onImportExisting,
   refreshProjectsList,
   refreshProjectData,
+  refreshDrift,
   onProjectStateChange,
+  onReposDelivered,
   driftedWorkflowNames,
   customFiles = [],
   setCustomFiles,
   projectId,
   onCustomFilesChange,
-  codeownersRefreshCounter,
-  codeownersAggregateStatus,
+  customFileDrift = [],
+  driftedCustomFileIds,
+  codeowners,
+  codeownersDrift = [],
   onCodeownersSaved,
+  codeownersOpenRequested = false,
+  onCodeownersOpened,
   importedActions = [],
   actionGroups = [],
   secrets = [],
@@ -65,7 +83,7 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
 }) => {
   // Project Files: custom file and codeowners selection
   const [selectedCustomFileId, setSelectedCustomFileId] = useState<number | null>(null);
-  const [selectedCodeownersRepo, setSelectedCodeownersRepo] = useState<string | null>(null);
+  const [codeownersSelected, setCodeownersSelected] = useState<boolean>(false);
   // -1 sentinel = "add new custom file" mode
   const ADD_CUSTOM_FILE_SENTINEL = -1;
 
@@ -77,17 +95,56 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   // Use custom hooks for state management
   const state = useUnifiedWorkflowsState(workflows, setWorkflows, setRXWorkflows);
 
+  // Read after a save's await: by then the edits it carried have rendered.
+  const listsRef = useRef({ workflows, rxworkflows, selectedId: state.selectedWorkflowId });
+  listsRef.current = { workflows, rxworkflows, selectedId: state.selectedWorkflowId };
+
+  // Keeps the editor on the workflow it was showing when a save moves workflows
+  // between sections (#2318). Called before that move renders, so the lists
+  // here are still the ones the selection points into. The project save calls
+  // it too: it moves its own lists, since this may not be mounted to do it.
+  const { setSelectedWorkflowId } = state;
+  const followKindChanges = useCallback((changes: WorkflowKindChange[]) => {
+    const { workflows: regular, rxworkflows: reusable, selectedId } = listsRef.current;
+    const moves = planWorkflowKindMoves<Workflow>(regular, reusable, changes, selectedId);
+    if (moves) setSelectedWorkflowId(moves.selectedId);
+  }, [setSelectedWorkflowId]);
+
+  // The editor's own save moves the workflows here.
+  const applyKindChanges = useCallback((changes: WorkflowKindChange[]) => {
+    const { workflows: regular, rxworkflows: reusable } = listsRef.current;
+    const moves = planWorkflowKindMoves<Workflow>(regular, reusable, changes, null);
+    if (!moves) return;
+    followKindChanges(changes);
+    setWorkflows(prev => moves.nextRegular(prev));
+    // A workflow moved in from the regular section was just saved, so it has content.
+    setRXWorkflows(prev => moves.nextReusable(prev) as RXWorkflow[]);
+  }, [followKindChanges, setWorkflows, setRXWorkflows]);
+
+  useEffect(() => {
+    onRegisterSelectionFollower?.(followKindChanges);
+    return () => onRegisterSelectionFollower?.(null);
+  }, [onRegisterSelectionFollower, followKindChanges]);
+
   const handleSelectCustomFile = (id: number) => {
     setSelectedCustomFileId(id);
     state.setSelectedWorkflowId(null);
-    setSelectedCodeownersRepo(null);
+    setCodeownersSelected(false);
   };
 
-  const handleSelectCodeowners = (repo: string) => {
-    setSelectedCodeownersRepo(repo);
+  const handleSelectCodeowners = useCallback(() => {
+    setCodeownersSelected(true);
     state.setSelectedWorkflowId(null);
     setSelectedCustomFileId(null);
-  };
+  }, [state.setSelectedWorkflowId]);
+
+  // Asked for while this view may not have been mounted, so it is a flag the
+  // page clears once handled rather than a counter that only a change reveals.
+  useEffect(() => {
+    if (!codeownersOpenRequested) return;
+    handleSelectCodeowners();
+    onCodeownersOpened?.();
+  }, [codeownersOpenRequested, handleSelectCodeowners, onCodeownersOpened]);
   
   // Create unified workflow list
   const unifiedWorkflows: UnifiedWorkflowItem[] = [
@@ -169,8 +226,11 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
     setIsGeneratingTemplates: state.setIsGeneratingTemplates,
     refreshProjectsList,
     refreshProjectData,
+    refreshDrift,
     onProjectStateChange,
-    branchOption
+    onReposDelivered,
+    projectType,
+    applyKindChanges,
   });
 
   // Use workflow selection logic hook
@@ -181,11 +241,20 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
     setRegularGuiWorkflow: state.setRegularGuiWorkflow
   });
 
-  // Wrap to also clear non-workflow selections
+  // Wrap to also clear non-workflow selections.
+  //
+  // Selecting a workflow while already in GUI mode is also a way into GUI
+  // editing, so it gets the same refusal as the mode switch, by dropping to
+  // YAML. Linked workflows are exempt: they only ever render as read-only YAML.
   const handleSelectWorkflow = (workflowId: string) => {
     setSelectedCustomFileId(null);
-    setSelectedCodeownersRepo(null);
-    _handleSelectWorkflow(workflowId);
+    setCodeownersSelected(false);
+    const refusal = _handleSelectWorkflow(workflowId);
+    const isLinked = unifiedWorkflows.find(w => w.id === workflowId)?.type === 'linked';
+    if (refusal && state.editMode === 'gui' && !isLinked) {
+      state.setEditMode('yaml');
+      toast.error(guiRefusalMessage(refusal));
+    }
   };
 
   // The GUI model is only built when a workflow is selected, so entering GUI
@@ -193,13 +262,16 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   // workflow as it was at selection time, and the first GUI edit serialises that
   // stale model back over every YAML edit made since.
   //
-  // If the YAML no longer converts, stay put: entering GUI would load a default
-  // template that the next click would write over the document.
+  // Stay in, or drop to, YAML if the YAML no longer converts, or if the GUI
+  // can't represent all of it: the next GUI edit would write a default template,
+  // or a model missing those parts, over the document. Clicking GUI while
+  // already in GUI mode has just loaded that model, so it must drop too.
   const handleSetEditMode = (mode: 'yaml' | 'gui') => {
     if (mode === 'gui' && selectedWorkflow) {
-      const conversionError = initializeWorkflowGUI(selectedWorkflow);
-      if (conversionError) {
-        toast.error('Fix the YAML errors before switching to GUI mode.');
+      const refusal = initializeWorkflowGUI(selectedWorkflow);
+      if (refusal) {
+        state.setEditMode('yaml');
+        toast.error(guiRefusalMessage(refusal));
         return;
       }
     }
@@ -215,11 +287,6 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
       workflows,
       setWorkflows,
       setRXWorkflows,
-      editMode: state.editMode,
-      regularGuiWorkflow: state.regularGuiWorkflow,
-      guiWorkflow: state.guiWorkflow,
-      setRegularGuiWorkflow: state.setRegularGuiWorkflow,
-      setGuiWorkflow: state.setGuiWorkflow,
       markWorkflowAsModified: state.markWorkflowAsModified,
       setLinkedWorkflows,
     });
@@ -254,6 +321,80 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
     // Only run when selectedWorkflowId changes, not on every render
   }, [state.selectedWorkflowId]);
 
+  // Right panel — switches based on what is selected
+  let editorPanel: React.ReactNode;
+  if (selectedCustomFileId !== null) {
+    editorPanel = (
+      <div className="unified-workflows-editor">
+        <CustomFilePanel
+          cf={selectedCustomFileId === ADD_CUSTOM_FILE_SENTINEL
+            ? null
+            : (customFiles.find(f => f.id === selectedCustomFileId) ?? null)}
+          allFiles={customFiles}
+          projectId={projectId ?? 0}
+          githubUser={user}
+          onChange={handleCustomFilesChange}
+          onAfterAdd={(newId) => setSelectedCustomFileId(newId)}
+          onRemoved={() => setSelectedCustomFileId(null)}
+          onProjectStateChange={onProjectStateChange}
+          projectName={projectName}
+          selectedRepos={selectedRepos}
+          onReposDelivered={onReposDelivered}
+          drift={customFileDrift.filter(d => d.custom_file_id === selectedCustomFileId)}
+        />
+      </div>
+    );
+  } else if (codeownersSelected) {
+    editorPanel = (
+      <div className="unified-workflows-editor overflow-auto">
+        <CodeownersManager
+          user={user}
+          projectName={projectName}
+          projectId={projectId ?? 0}
+          selectedRepos={selectedRepos}
+          isReadOnly={isReadOnly}
+          codeowners={codeowners ?? null}
+          drift={codeownersDrift}
+          onSaved={onCodeownersSaved}
+          onReposDelivered={onReposDelivered}
+        />
+      </div>
+    );
+  } else {
+    editorPanel = (
+      <UnifiedWorkflowEditor
+        selectedWorkflow={selectedWorkflow}
+        editMode={state.editMode}
+        regularGuiWorkflow={state.regularGuiWorkflow}
+        guiWorkflow={state.guiWorkflow}
+        projectCode={projectCode}
+        usePrefix={usePrefix}
+        isReadOnly={isReadOnly}
+        user={user}
+        projectName={projectName}
+        selectedRepos={selectedRepos}
+        importedActions={importedActions}
+        actionGroups={actionGroups}
+        secrets={secrets}
+        envVars={envVars}
+        setEditMode={handleSetEditMode}
+        setRegularGuiWorkflow={state.setRegularGuiWorkflow}
+        setGuiWorkflow={state.setGuiWorkflow}
+        handleWorkflowChange={handleWorkflowChangeWrapper}
+        saveDraftWorkflow={operations.handleSaveDraftWorkflow}
+        saveDraftLinkedWorkflow={operations.handleSaveDraftLinkedWorkflow}
+        commitAndUpdatePR={operations.handleCommitAndUpdatePR}
+        commitAndUpdatePRLinked={operations.handleCommitAndUpdatePRLinked}
+        deleteWorkflow={operations.handleDeleteWorkflow}
+        unlinkWorkflow={operations.handleUnlinkWorkflow}
+        addWorkflowFn={operations.openWorkflowCreationDialog}
+        onImportExisting={onImportExisting}
+        projectType={projectType}
+        onVersionRestored={refreshDrift}
+      />
+    );
+  }
+
   return (
     <div className="unified-workflows-container">
       {/* Unified file list on the left — workflows + custom files + CODEOWNERS */}
@@ -263,8 +404,6 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
         isCollapsed={state.isCollapsed}
         projectCode={projectCode}
         usePrefix={usePrefix}
-        loadingStatuses={state.loadingStatuses}
-        workflowStatuses={state.workflowStatuses}
         selectedRepos={selectedRepos}
         projectType={projectType}
         setIsCollapsed={state.setIsCollapsed}
@@ -274,72 +413,14 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
         customFiles={customFiles}
         selectedCustomFileId={selectedCustomFileId}
         onSelectCustomFile={handleSelectCustomFile}
-        codeownersRepos={selectedRepos}
-        selectedCodeownersRepo={selectedCodeownersRepo}
+        driftedCustomFileIds={driftedCustomFileIds}
+        codeowners={codeowners}
+        codeownersSelected={codeownersSelected}
+        codeownersDrifted={codeownersDrift.length > 0}
         onSelectCodeowners={handleSelectCodeowners}
-        codeownersAggregateStatus={codeownersAggregateStatus}
       />
 
-      {/* Right panel — switches based on what is selected */}
-      {selectedCustomFileId !== null ? (
-        <div className="unified-workflows-editor">
-          <CustomFilePanel
-            cf={selectedCustomFileId === ADD_CUSTOM_FILE_SENTINEL
-              ? null
-              : (customFiles.find(f => f.id === selectedCustomFileId) ?? null)}
-            allFiles={customFiles}
-            projectId={projectId ?? 0}
-            githubUser={user}
-            onChange={handleCustomFilesChange}
-            onAfterAdd={(newId) => setSelectedCustomFileId(newId)}
-            onRemoved={() => setSelectedCustomFileId(null)}
-            onProjectStateChange={onProjectStateChange}
-          />
-        </div>
-      ) : selectedCodeownersRepo !== null ? (
-        <div className="unified-workflows-editor overflow-auto">
-          <CodeownersManager
-            user={user}
-            projectName={projectName}
-            selectedRepos={selectedRepos}
-            isReadOnly={isReadOnly}
-            initialRepo={selectedCodeownersRepo}
-            refreshCounter={codeownersRefreshCounter}
-            onSave={onCodeownersSaved}
-          />
-        </div>
-      ) : (
-        <UnifiedWorkflowEditor
-          selectedWorkflow={selectedWorkflow}
-          editMode={state.editMode}
-          regularGuiWorkflow={state.regularGuiWorkflow}
-          guiWorkflow={state.guiWorkflow}
-          projectCode={projectCode}
-          projectPRState={projectPRState}
-          usePrefix={usePrefix}
-          isReadOnly={isReadOnly}
-          user={user}
-          projectName={projectName}
-          selectedRepos={selectedRepos}
-          importedActions={importedActions}
-          actionGroups={actionGroups}
-          secrets={secrets}
-          envVars={envVars}
-          setEditMode={handleSetEditMode}
-          setRegularGuiWorkflow={state.setRegularGuiWorkflow}
-          setGuiWorkflow={state.setGuiWorkflow}
-          handleWorkflowChange={handleWorkflowChangeWrapper}
-          saveDraftWorkflow={operations.handleSaveDraftWorkflow}
-          saveDraftLinkedWorkflow={operations.handleSaveDraftLinkedWorkflow}
-          commitAndUpdatePR={operations.handleCommitAndUpdatePR}
-          commitAndUpdatePRLinked={operations.handleCommitAndUpdatePRLinked}
-          deleteWorkflow={operations.handleDeleteWorkflow}
-          unlinkWorkflow={operations.handleUnlinkWorkflow}
-          addWorkflowFn={operations.openWorkflowCreationDialog}
-          onImportExisting={onImportExisting}
-          projectType={projectType}
-        />
-      )}
+      {editorPanel}
       
       {/* Workflow Creation Dialog */}
       <WorkflowCreationDialog
@@ -354,7 +435,6 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
         existingWorkflowNames={[...workflows.map(workflow => workflow.name), ...rxworkflows.map(workflow => workflow.name)]}
         selectedRepos={selectedRepos}
         onAddCustomFile={() => handleSelectCustomFile(ADD_CUSTOM_FILE_SENTINEL)}
-        codeownersRepos={selectedRepos}
         onSelectCodeowners={handleSelectCodeowners}
         setShowWorkflowCreationDialog={state.setShowWorkflowCreationDialog}
         selectWorkflowType={operations.selectWorkflowType}

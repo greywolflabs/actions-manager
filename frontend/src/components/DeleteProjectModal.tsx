@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { getProjectDeletionSummary } from "../api/projectDeletion";
 import { errorDetail } from "../api/errorDetail";
-import { workflowDisplayFilename } from "../utils/workflowFilename";
-import type { ProjectDeletionSummary } from "../api/projectDeletion";
+import type { DeleteProjectOptions, ProjectDeletionSummary, RemovalFile, RemovalTarget } from "../api/projectDeletion";
 import {
   Dialog,
   DialogContent,
@@ -16,317 +15,273 @@ import { Button } from "./ui/button";
 interface DeleteProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onConfirmDelete: (deleteGitHubResources: boolean, deleteDeploymentEnvironments: boolean) => void;
+  onConfirmDelete: (options: Required<DeleteProjectOptions>) => void;
   projectName: string;
   githubUser: string;
-  /** Naming mode, so the list names the files that get deleted from GitHub. */
-  projectCode?: string;
-  usePrefix?: boolean;
 }
 
-const DeleteProjectModal: React.FC<DeleteProjectModalProps> = ({ 
-  isOpen, 
-  onClose, 
+const KEEP_FILES_LABEL = "Delete the project, keep its files in GitHub";
+const REMOVE_FILES_LABEL =
+  "Delete the project and remove its files from GitHub (opens a pull request per repository and branch)";
+const DELETE_SECRETS_LABEL = "Also delete secrets and variables now";
+
+const SUMMARY_ERROR = "Could not load what this project holds in GitHub. You can still delete it and keep its files.";
+
+interface FileChoiceProps {
+  label: string;
+  selected: boolean;
+  disabled?: boolean;
+  onSelect: () => void;
+  children: React.ReactNode;
+}
+
+const FileChoice: React.FC<FileChoiceProps> = ({ label, selected, disabled, onSelect, children }) => (
+  <div className={`border rounded-lg border-slate-200 dark:border-slate-600 ${disabled ? "opacity-60" : ""}`}>
+    <label className={`flex items-start p-4 ${disabled ? "cursor-not-allowed" : "cursor-pointer"}`}>
+      {/* Named on the input: the label wraps an explanation that would otherwise become its name. */}
+      <input
+        type="radio"
+        name="projectFiles"
+        aria-label={label}
+        checked={selected}
+        disabled={disabled}
+        onChange={onSelect}
+        className="mt-1 mr-3 shrink-0"
+      />
+      <div className="flex-1 text-sm text-slate-600 dark:text-slate-400 space-y-2">
+        <strong className="block text-base text-slate-900 dark:text-slate-100">{label}</strong>
+        {children}
+      </div>
+    </label>
+  </div>
+);
+
+const FileList: React.FC<{ files: RemovalFile[] }> = ({ files }) => (
+  <ul className="ml-4 list-disc">
+    {files.map((file) => (
+      <li key={`${file.kind}:${file.path}`}>
+        <code className="font-mono text-xs">{file.path}</code>
+      </li>
+    ))}
+  </ul>
+);
+
+const RemovalPlan: React.FC<{ targets: RemovalTarget[]; unrecorded: RemovalFile[] }> = ({ targets, unrecorded }) => (
+  <div className="space-y-2" data-testid="removal-plan">
+    {targets.length === 0 ? (
+      <p>
+        ActionsManager has no record of delivering any of its files, so there is nothing to remove and the
+        project is deleted now.
+      </p>
+    ) : (
+      <>
+        <p className="font-medium text-slate-800 dark:text-slate-200">Pull requests to open ({targets.length}):</p>
+        <ul className="space-y-2">
+          {targets.map((target) => (
+            <li key={`${target.repository}@${target.branch}`}>
+              <code className="font-mono text-xs text-slate-800 dark:text-slate-200">
+                {target.repository}@{target.branch}
+              </code>
+              <FileList files={target.files} />
+            </li>
+          ))}
+        </ul>
+      </>
+    )}
+    {unrecorded.length > 0 && (
+      <div>
+        <p>Not removed, because ActionsManager has no record of where they were delivered:</p>
+        <FileList files={unrecorded} />
+      </div>
+    )}
+  </div>
+);
+
+interface SecretsOptionProps {
+  summary: ProjectDeletionSummary;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  keepEnvironments: boolean;
+  onKeepEnvironmentsChange: (keep: boolean) => void;
+}
+
+const SecretsOption: React.FC<SecretsOptionProps> = ({
+  summary,
+  checked,
+  onChange,
+  keepEnvironments,
+  onKeepEnvironmentsChange,
+}) => {
+  const environments = summary.deployment_environments.length;
+  const nothingFound = summary.secrets.length + summary.environment_variables.length + environments === 0;
+  return (
+    <div className="border rounded-lg border-slate-200 p-4 space-y-2 text-sm text-slate-600 dark:border-slate-600 dark:text-slate-400">
+      <label className="flex items-start cursor-pointer">
+        <input
+          type="checkbox"
+          aria-label={DELETE_SECRETS_LABEL}
+          checked={checked}
+          disabled={nothingFound}
+          onChange={(e) => onChange(e.target.checked)}
+          className="mt-1 mr-3 shrink-0"
+        />
+        <span>
+          <strong className="block text-base text-slate-900 dark:text-slate-100">{DELETE_SECRETS_LABEL}</strong>
+          {nothingFound ? (
+            <span>No secrets, variables or deployment environments were found for this project.</span>
+          ) : (
+            <span>
+              Deletes its {summary.secrets.length} secret(s) and {summary.environment_variables.length} variable(s)
+              from its repositories immediately, without a pull request. This cannot be undone, and it is not
+              undone if the deletion is called off.
+            </span>
+          )}
+        </span>
+      </label>
+      {checked && environments > 0 && (
+        <label className="flex items-center ml-7">
+          <input
+            type="checkbox"
+            checked={keepEnvironments}
+            onChange={(e) => onKeepEnvironmentsChange(e.target.checked)}
+            className="mr-2"
+          />
+          Keep deployment environments (otherwise all {environments} in its repositories are deleted too)
+        </label>
+      )}
+    </div>
+  );
+};
+
+const RemovalDetail: React.FC<{ summary: ProjectDeletionSummary }> = ({ summary }) => {
+  if (summary.removal_blocked_reason) {
+    return (
+      <p className="text-amber-800 dark:text-amber-200" data-testid="removal-blocked-reason">
+        Not available: {summary.removal_blocked_reason}
+      </p>
+    );
+  }
+  return <RemovalPlan targets={summary.removal_targets ?? []} unrecorded={summary.unrecorded_files ?? []} />;
+};
+
+const confirmLabel = (removing: boolean, summary: ProjectDeletionSummary | null): string => {
+  if (removing && (summary?.removal_targets?.length ?? 0) > 0) return "Delete and open pull requests";
+  return "Delete project";
+};
+
+const DeleteProjectModal: React.FC<DeleteProjectModalProps> = ({
+  isOpen,
+  onClose,
   onConfirmDelete,
-  projectName, 
+  projectName,
   githubUser,
-  projectCode,
-  usePrefix,
 }) => {
   const [summary, setSummary] = useState<ProjectDeletionSummary | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [deleteGitHubResources, setDeleteGitHubResources] = useState<boolean>(false);
+  const [removeFiles, setRemoveFiles] = useState<boolean>(false);
+  const [deleteSecrets, setDeleteSecrets] = useState<boolean>(false);
   const [keepDeploymentEnvironments, setKeepDeploymentEnvironments] = useState<boolean>(false);
 
   const fetchDeletionSummary = useCallback(async (): Promise<void> => {
     setLoading(true);
     setError(null);
     try {
-      console.log(`🔍 Fetching deletion summary for project: ${projectName}, user: ${githubUser}`);
-      const summaryData = await getProjectDeletionSummary(githubUser, projectName);
-      console.log("📊 Resource counts:", {
-        workflows: summaryData.workflows?.length || 0,
-        reusable_workflows: summaryData.reusable_workflows?.length || 0,
-        secrets: summaryData.secrets?.length || 0,
-        environment_variables: summaryData.environment_variables?.length || 0,
-        deployment_environments: summaryData.deployment_environments?.length || 0
-      });
-
-      setSummary(summaryData);
+      setSummary(await getProjectDeletionSummary(githubUser, projectName));
     } catch (err) {
-      const errorMsg = "Failed to load project deletion summary. You can still delete the project from the database only.";
-      setError(errorMsg);
+      setError(SUMMARY_ERROR);
       console.error("❌ Error fetching deletion summary:", errorDetail(err));
     } finally {
       setLoading(false);
     }
   }, [projectName, githubUser]);
 
+  // Each opening starts from the choice that changes nothing in GitHub.
   useEffect(() => {
     if (isOpen && projectName && githubUser) {
+      setSummary(null);
+      setRemoveFiles(false);
+      setDeleteSecrets(false);
+      setKeepDeploymentEnvironments(false);
       fetchDeletionSummary();
     }
   }, [isOpen, projectName, githubUser, fetchDeletionSummary]);
 
+  // Never while blocked, nor before the summary says what it would remove.
+  const removing = removeFiles && !!summary && !summary.removal_blocked_reason;
+
   const handleDeleteConfirm = (): void => {
-    // keepDeploymentEnvironments is the user-facing "keep" checkbox; the API takes a
-    // "delete" flag, so the polarity is inverted here.
-    onConfirmDelete(deleteGitHubResources, !keepDeploymentEnvironments);
+    onConfirmDelete({
+      removeFiles: removing,
+      deleteSecrets,
+      // The dialog asks whether to keep them; the API takes whether to delete them.
+      deleteDeploymentEnvironments: !keepDeploymentEnvironments,
+    });
   };
-
-  const resetState = (): void => {
-    setSummary(null);
-    setError(null);
-    setDeleteGitHubResources(false);
-    setKeepDeploymentEnvironments(false);
-  };
-
-  const handleClose = (): void => {
-    resetState();
-    onClose();
-  };
-
-  const totalGitHubResources = summary ? 
-    summary.workflows.length + 
-    summary.reusable_workflows.length + 
-    summary.secrets.length + 
-    summary.environment_variables.length + 
-    summary.deployment_environments.length : 0;
 
   return (
-    <Dialog open={isOpen} onOpenChange={(open) => !open && handleClose()}>
+    <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle className="text-red-600 dark:text-red-400">
-            🗑️ Delete Project: {projectName}
-          </DialogTitle>
-          <DialogDescription className="sr-only">
-            Review and confirm project deletion with options to delete database only or include GitHub resources
-          </DialogDescription>
+          <DialogTitle className="text-red-600 dark:text-red-400">Delete project {projectName}</DialogTitle>
+          <DialogDescription>Choose what happens to the project's files in GitHub.</DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4">
-          {loading && (
-            <div className="text-center py-10">
-              <p className="text-lg text-slate-600 dark:text-slate-400">
-                🔍 Analyzing project resources...
-              </p>
-            </div>
-          )}
+          {loading && <p className="text-slate-600 dark:text-slate-400">Loading what the project holds…</p>}
 
           {error && (
-            <div className="bg-amber-50 border border-amber-200 rounded-lg p-5 dark:bg-amber-950 dark:border-amber-800">
-              <p className="text-amber-800 font-medium dark:text-amber-200">
-                ⚠️ {error}
-              </p>
-            </div>
+            <p className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-amber-800 dark:bg-amber-950 dark:border-amber-800 dark:text-amber-200">
+              {error}
+            </p>
           )}
 
+          <FileChoice label={KEEP_FILES_LABEL} selected={!removing} onSelect={() => setRemoveFiles(false)}>
+            <p>
+              ActionsManager deletes the project now and stops managing it. Its workflows, reusable workflows, custom
+              files and CODEOWNERS stay in your repositories as they are.
+            </p>
+          </FileChoice>
+
           {summary && (
-            <div className="space-y-6">
-              <div className="bg-slate-50 border-l-4 border-blue-500 rounded-lg p-4 dark:bg-slate-800 dark:border-blue-400">
-                <h3 className="text-blue-600 text-lg font-semibold mb-2 dark:text-blue-400">
-                  📊 Deletion Summary
-                </h3>
-                <p className="text-slate-700 leading-relaxed dark:text-slate-300">
-                  This project <strong>"{summary.project_name}"</strong> (Code: <code className="bg-slate-200 px-2 py-0.5 rounded font-mono text-sm text-pink-600 font-semibold dark:bg-slate-700 dark:text-pink-400">{summary.project_code}</code>) 
-                  contains the following GitHub resources that can be deleted:
+            <>
+              <FileChoice
+                label={REMOVE_FILES_LABEL}
+                selected={removing}
+                disabled={!!summary.removal_blocked_reason}
+                onSelect={() => setRemoveFiles(true)}
+              >
+                <p>
+                  Each pull request removes every file ActionsManager delivered to that branch. The project is
+                  read-only while they are open, and is deleted once all of them have merged. Closing any of them
+                  calls the deletion off and keeps the project.
                 </p>
-                <div className="bg-cyan-50 border border-cyan-200 rounded-md p-3 mt-3 dark:bg-cyan-950 dark:border-cyan-800">
-                  <p className="text-cyan-800 text-sm font-medium dark:text-cyan-200">
-                    ℹ️ <strong>Note:</strong> Repositories themselves are never deleted - only specific resources within them (workflows, secrets, environments).
-                  </p>
-                </div>
-              </div>
-
-              <div className="space-y-5">
-                <div>
-                  <h4 className="text-base font-semibold text-slate-900 pb-1 border-b border-slate-200 mb-2 dark:text-slate-100 dark:border-slate-700">
-                    ⚙️ Workflows ({summary.workflows.length})
-                  </h4>
-                  {summary.workflows.length > 0 ? (
-                    <ul className="space-y-1">
-                      {summary.workflows.map((workflow, index) => (
-                        <li key={index} className="bg-white border border-slate-200 rounded-md p-2 px-3 flex items-center justify-between text-slate-800 font-medium hover:bg-slate-50 dark:bg-slate-700 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-600">
-                          🔧 {workflowDisplayFilename(workflow.name, projectCode, usePrefix)}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="text-slate-500 italic text-center bg-slate-50 p-3 rounded-md dark:bg-slate-800 dark:text-slate-400">
-                      No regular workflows in this project.
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <h4 className="text-base font-semibold text-slate-900 pb-1 border-b border-slate-200 mb-2 dark:text-slate-100 dark:border-slate-700">
-                    🔄 Reusable Workflows ({summary.reusable_workflows.length})
-                  </h4>
-                  {summary.reusable_workflows.length > 0 ? (
-                    <ul className="space-y-1">
-                      {summary.reusable_workflows.map((workflow, index) => (
-                        <li key={index} className="bg-white border border-slate-200 rounded-md p-2 px-3 flex items-center justify-between text-slate-800 font-medium hover:bg-slate-50 dark:bg-slate-700 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-600">
-                          🔁 {workflowDisplayFilename(workflow.name, projectCode, usePrefix)}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="text-slate-500 italic text-center bg-slate-50 p-3 rounded-md dark:bg-slate-800 dark:text-slate-400">
-                      No reusable workflows in this project.
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <h4 className="text-base font-semibold text-slate-900 pb-1 border-b border-slate-200 mb-2 dark:text-slate-100 dark:border-slate-700">
-                    🔐 GitHub Secrets ({summary.secrets.length})
-                  </h4>
-                  {summary.secrets.length > 0 ? (
-                    <ul className="space-y-1">
-                      {summary.secrets.map((secret, index) => (
-                        <li key={index} className="bg-white border border-slate-200 rounded-md p-2 px-3 flex items-center justify-between text-slate-800 font-medium hover:bg-slate-50 dark:bg-slate-700 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-600">
-                          <span>🔑 {secret.name}</span>
-                          <span className="bg-slate-600 text-white px-2 py-0.5 rounded-full text-xs font-medium">
-                            in {secret.repository}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="text-slate-500 italic text-center bg-slate-50 p-3 rounded-md dark:bg-slate-800 dark:text-slate-400">
-                      No GitHub secrets found for this project.
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <h4 className="text-base font-semibold text-slate-900 pb-1 border-b border-slate-200 mb-2 dark:text-slate-100 dark:border-slate-700">
-                    🌍 Environment Variables ({summary.environment_variables.length})
-                  </h4>
-                  {summary.environment_variables.length > 0 ? (
-                    <ul className="space-y-1">
-                      {summary.environment_variables.map((envVar, index) => (
-                        <li key={index} className="bg-white border border-slate-200 rounded-md p-2 px-3 flex items-center justify-between text-slate-800 font-medium hover:bg-slate-50 dark:bg-slate-700 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-600">
-                          <span>🔧 {envVar.name}</span>
-                          <span className="bg-slate-600 text-white px-2 py-0.5 rounded-full text-xs font-medium">
-                            in {envVar.repository}/{envVar.environment}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="text-slate-500 italic text-center bg-slate-50 p-3 rounded-md dark:bg-slate-800 dark:text-slate-400">
-                      No environment variables found for this project.
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <h4 className="text-base font-semibold text-slate-900 pb-1 border-b border-slate-200 mb-2 dark:text-slate-100 dark:border-slate-700">
-                    🚀 Deployment Environments ({summary.deployment_environments.length})
-                  </h4>
-                  {summary.deployment_environments.length > 0 ? (
-                    <ul className="space-y-1">
-                      {summary.deployment_environments.map((env, index) => (
-                        <li key={index} className="bg-white border border-slate-200 rounded-md p-2 px-3 flex items-center justify-between text-slate-800 font-medium hover:bg-slate-50 dark:bg-slate-700 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-600">
-                          <span>🌐 {env.name}</span>
-                          <span className="bg-slate-600 text-white px-2 py-0.5 rounded-full text-xs font-medium">
-                            in {env.repository}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="text-slate-500 italic text-center bg-slate-50 p-3 rounded-md dark:bg-slate-800 dark:text-slate-400">
-                      No deployment environments found for this project.
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div className="bg-slate-50 border border-slate-200 rounded-lg p-5 space-y-4 dark:bg-slate-800 dark:border-slate-700">
-                <h3 className="text-red-600 text-lg font-semibold dark:text-red-400">
-                  🎯 Deletion Options
-                </h3>
-                
-                <div className="border-2 border-slate-200 rounded-lg transition-all hover:border-blue-500 dark:border-slate-600 dark:hover:border-blue-400">
-                  <label className="flex items-start p-4 cursor-pointer" aria-label="Database Only">
-                    <input
-                      type="radio"
-                      name="deletionType"
-                      checked={!deleteGitHubResources}
-                      onChange={() => setDeleteGitHubResources(false)}
-                      className="mt-1 mr-3 flex-shrink-0"
-                    />
-                    <div className="flex-1">
-                      <strong className="block text-base text-slate-900 mb-1 dark:text-slate-100">
-                        🏠 Database Only
-                      </strong>
-                      <p className="text-slate-600 text-sm leading-relaxed dark:text-slate-400">
-                        Remove the project from ActionsManager database only. All GitHub resources (workflows, secrets, environments) will remain untouched in your repositories.
-                      </p>
-                    </div>
-                  </label>
-                </div>
-
-                <div className={`border-2 rounded-lg transition-all ${totalGitHubResources === 0 ? 'opacity-60 cursor-not-allowed border-slate-200 dark:border-slate-600' : 'border-slate-200 hover:border-blue-500 dark:border-slate-600 dark:hover:border-blue-400'}`}>
-                  <label className={`flex items-start p-4 ${totalGitHubResources === 0 ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
-                    <input
-                      type="radio"
-                      name="deletionType"
-                      checked={deleteGitHubResources}
-                      onChange={() => setDeleteGitHubResources(true)}
-                      disabled={totalGitHubResources === 0}
-                      className="mt-1 mr-3 flex-shrink-0"
-                    />
-                    <div className="flex-1">
-                      <strong className="block text-base text-slate-900 mb-1 dark:text-slate-100">
-                        💥 Everything (Database + GitHub Resources)
-                      </strong>
-                      <p className="text-slate-600 text-sm leading-relaxed dark:text-slate-400">
-                        Remove the project from database AND delete {totalGitHubResources - (keepDeploymentEnvironments ? summary.deployment_environments.length : 0)} GitHub resources from your repositories (workflows, secrets, environments, environment variables).
-                        {totalGitHubResources === 0 && " (No GitHub resources to delete)"}
-                      </p>
-                      {deleteGitHubResources && summary.deployment_environments.length > 0 && (
-                        <label className="flex items-center mt-3 text-sm text-slate-700 dark:text-slate-300">
-                          <input
-                            type="checkbox"
-                            checked={keepDeploymentEnvironments}
-                            onChange={(e) => setKeepDeploymentEnvironments(e.target.checked)}
-                            className="mr-2"
-                          />{' '}
-                          Keep deployment environments (don't delete them from GitHub)
-                        </label>
-                      )}
-                      {deleteGitHubResources && totalGitHubResources > 0 && (
-                        <div className="bg-amber-50 border border-amber-200 rounded-md p-3 mt-3 dark:bg-amber-950 dark:border-amber-800">
-                          <p className="text-amber-800 text-sm dark:text-amber-200">
-                            ⚠️ <strong>Warning:</strong> This action cannot be undone! GitHub resources will be permanently deleted from your repositories.
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                  </label>
-                </div>
-              </div>
-            </div>
+                <RemovalDetail summary={summary} />
+              </FileChoice>
+              <SecretsOption
+                summary={summary}
+                checked={deleteSecrets}
+                onChange={setDeleteSecrets}
+                keepEnvironments={keepDeploymentEnvironments}
+                onKeepEnvironmentsChange={setKeepDeploymentEnvironments}
+              />
+            </>
           )}
         </div>
 
-        <DialogFooter className="bg-slate-50 rounded-b-lg dark:bg-slate-800">
+        <DialogFooter>
           <div className="flex justify-end gap-3 w-full">
-            <Button variant="outline" onClick={handleClose}>
+            <Button type="button" variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button 
+            <Button
+              type="button"
               variant="destructive"
               onClick={handleDeleteConfirm}
               disabled={loading}
               className="min-w-[160px]"
             >
-              {deleteGitHubResources ? "🗑️ Delete Everything" : "🗑️ Delete Project Only"}
+              {confirmLabel(removing, summary)}
             </Button>
           </div>
         </DialogFooter>

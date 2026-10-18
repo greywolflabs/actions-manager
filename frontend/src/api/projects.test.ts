@@ -1,14 +1,25 @@
 import apiClient from "./apiClient";
-import { saveProject, updateProjectColor, updateProjectName } from "./projects";
+import {
+  fetchProjectRepoBranchConfigs,
+  fetchProjects,
+  getAvailableRwxWorkflows,
+  resetProjectRepoBranchConfig,
+  saveProject,
+  updateProjectColor,
+  updateProjectName,
+  updateProjectRepoBranchConfig,
+} from "./projects";
 import config from "../config";
 
 import type { Mocked } from 'vitest';
 vi.mock("./apiClient", () => ({
   __esModule: true,
   default: {
+    get: vi.fn(),
     post: vi.fn(),
     put: vi.fn(),
     patch: vi.fn(),
+    delete: vi.fn(),
   },
 }));
 
@@ -181,5 +192,28 @@ describe("projects API", () => {
     mockedApiClient.patch.mockRejectedValueOnce(err);
 
     await expect(updateProjectName("user", 1, "Name")).rejects.toThrow("Network error");
+  });
+
+  it("sends no github_user to routes that take the caller from the session (#2241)", async () => {
+    mockedApiClient.get.mockResolvedValue({ data: [] });
+    mockedApiClient.patch.mockResolvedValue({ data: {} });
+    mockedApiClient.delete.mockResolvedValue({ data: {} });
+    const update = { branch_config_mode: "override" as const, branch_option: "default" as const };
+
+    await fetchProjects("someone-else");
+    await fetchProjectRepoBranchConfigs(7);
+    await updateProjectRepoBranchConfig(7, 3, update);
+    await resetProjectRepoBranchConfig(7, 3);
+    await getAvailableRwxWorkflows("Std");
+
+    expect(mockedApiClient.get).toHaveBeenNthCalledWith(1, "/api/projects/");
+    expect(mockedApiClient.get).toHaveBeenNthCalledWith(2, "/api/projects/7/repo-branch-configs");
+    expect(mockedApiClient.patch).toHaveBeenCalledWith("/api/projects/7/repos/3/branch-config", update);
+    expect(mockedApiClient.delete).toHaveBeenCalledWith("/api/projects/7/repos/3/branch-config");
+    expect(mockedApiClient.get).toHaveBeenNthCalledWith(
+      3,
+      `${config.BACKEND_URL}/api/rwx-workflows`,
+      { params: { standard_project_name: "Std" } },
+    );
   });
 });

@@ -17,7 +17,7 @@ import RenameImpactDialog from './RenameImpactDialog';
 import { useRenameConfirmation, collectRenames } from '../hooks/useRenameConfirmation';
 import { Dialog, DialogContent, DialogTitle } from './ui/dialog';
 import { WorkflowGUI, guiToYaml } from '../utils/workflowGuiConversion';
-import { UnifiedWorkflowItem, ProjectPRState } from '../types/workflow';
+import { UnifiedWorkflowItem } from '../types/workflow';
 import { ActionsProject } from '../api/actionsProjects';
 import { ActionGroup } from '../api/actionGroups';
 import {
@@ -26,6 +26,7 @@ import {
   workflowDisplayFilename,
 } from '../utils/workflowFilename';
 import { getDocsUrl } from '../help/helpLinks';
+import { UnlockOverlay, UnlockUnderReviewDialog } from './UnlockUnderReview';
 
 /**
  * Builds a GitHub URL pointing directly to the workflow file inside a repository.
@@ -138,7 +139,6 @@ interface UnifiedWorkflowEditorProps {
   regularGuiWorkflow: WorkflowGUI;
   guiWorkflow: WorkflowGUI;
   projectCode: string | null;
-  projectPRState?: ProjectPRState;
   usePrefix?: boolean;
   isReadOnly?: boolean;
   user: string;
@@ -170,6 +170,8 @@ interface UnifiedWorkflowEditorProps {
   onImportExisting?: () => void;
   /** Project type, so a reusable workflow inside a caller project can be flagged. */
   projectType?: 'standard' | 'rwx';
+  /** Called once a version restore is saved, which resolves the workflow's drift. */
+  onVersionRestored?: () => void;
 }
 
 /**
@@ -207,7 +209,6 @@ interface WorkflowEditorHeaderProps {
   /** Names the caller on that request; it answers 401 unidentified. */
   user: string;
   editMode: 'yaml' | 'gui';
-  projectPRState?: ProjectPRState;
   usePrefix?: boolean;
   isReadOnly?: boolean;
   isUnlockedPR?: boolean;
@@ -254,7 +255,6 @@ const WorkflowEditorHeader: React.FC<WorkflowEditorHeaderProps> = ({
   projectName,
   user,
   editMode,
-  projectPRState = "new",
   usePrefix = true,
   isReadOnly = false,
   isUnlockedPR = false,
@@ -373,10 +373,10 @@ const WorkflowEditorHeader: React.FC<WorkflowEditorHeaderProps> = ({
 
     if (isLocked) {
       return {
-        text: '🔒 Unlock to Commit',
+        text: '💾 Commit Locally',
         onClick: () => {},
         disabled: true,
-        title: "Unlock the workflow below to commit changes",
+        title: "Locked while its pull request is open. Unlock the workflow below to edit it.",
         className: 'btn btn-primary'
       };
     }
@@ -392,18 +392,13 @@ const WorkflowEditorHeader: React.FC<WorkflowEditorHeaderProps> = ({
     }
 
     if (!isLinked) {
-      const saveButtonText = projectPRState === "open" ? "💾 Commit Locally (Update PR)" : "💾 Commit Locally";
-      const saveButtonTitle = projectPRState === "open"
-        ? "Commit this workflow to local database (will update open PRs when pushed to GitHub)"
-        : "Commit this workflow to local database";
-
       return {
-        text: saveButtonText,
+        text: "💾 Commit Locally",
         onClick: () => {
           saveDraftWorkflow(selectedWorkflow.originalIndex, editableType);
         },
         disabled: !selectedWorkflow.name || !selectedWorkflow.content,
-        title: saveButtonTitle,
+        title: "Commit this workflow to local database",
         className: 'btn btn-primary'
       };
     }
@@ -698,13 +693,6 @@ const WorkflowEditorHeader: React.FC<WorkflowEditorHeaderProps> = ({
             </div>
           )}
 
-          {/* Drift/sync status — derived from workflow state */}
-          {stateBadge?.text === 'Synced' && (
-            <div className="status-item">
-              <span className="status-value">No drift detected</span>
-            </div>
-          )}
-
           {/* One right-aligned cluster for everything interactive in this row.
               Previously the mode selector and the Help link each carried their
               own margin-left:auto; flex splits free space across every auto
@@ -955,17 +943,12 @@ const EditorSurface: React.FC<EditorSurfaceProps> = ({
         actionGroups={actionGroups}
       />
       {showLockOverlay && (
-        <div className="workflow-lock-overlay" data-testid="workflow-lock-overlay">
-          <button
-            className="workflow-lock-btn"
-            onClick={onRequestUnlock}
-            title="This workflow has an open pull request. Click to unlock editing."
-            data-testid="unlock-workflow-button"
-          >
-            <span className="workflow-lock-icon">🔒</span>
-            <span className="workflow-lock-label">Unlock to Edit</span>
-          </button>
-        </div>
+        <UnlockOverlay
+          title="This workflow has an open pull request. Click to unlock editing."
+          onRequestUnlock={onRequestUnlock}
+          overlayTestId="workflow-lock-overlay"
+          buttonTestId="unlock-workflow-button"
+        />
       )}
       {isReadOnly && !showLockOverlay && (
         <div className="workflow-lock-overlay">
@@ -1065,10 +1048,6 @@ const ExpandedEditorDialog: React.FC<ExpandedEditorDialogProps> = ({
 
 type PendingWorkflowDelete = { index: number; type: 'regular' | 'reusable'; name: string };
 
-const REUSABLE_NOT_OURS_REASON =
-  "This reusable workflow lives in its Reusable Workflow Project's repository, not this " +
-  "project's, so it cannot be deleted from GitHub here. Delete it from the project that owns it.";
-
 /**
  * The removal-scope dialog for a workflow. Renders nothing until one is pending,
  * so the editor does not carry the decision itself.
@@ -1078,17 +1057,10 @@ const WorkflowRemovalDialog: React.FC<{
   // Widened to match displayFilenameFor, which the editor may hand either.
   projectCode?: string | null;
   usePrefix: boolean;
-  projectType?: 'standard' | 'rwx';
   onConfirm: (index: number, type: 'regular' | 'reusable', scope: RemovalScope, delivery: RemovalDelivery) => void;
   onClose: () => void;
-}> = ({ pending, projectCode, usePrefix, projectType, onConfirm, onClose }) => {
+}> = ({ pending, projectCode, usePrefix, onConfirm, onClose }) => {
   if (!pending) return null;
-
-  // A reusable workflow in a caller project lives in the Reusable Workflow
-  // Project's repository, not one of this project's. Deleting it there would
-  // remove the copy every other caller linking that project depends on, so the
-  // server refuses — say so rather than offering an option that cannot work.
-  const notOurRepo = pending.type === 'reusable' && projectType !== 'rwx';
 
   return (
     <RemovalScopeDialog
@@ -1098,10 +1070,11 @@ const WorkflowRemovalDialog: React.FC<{
       // applies to the file this removes.
       title={`Remove workflow "${displayFilenameFor({ name: pending.name }, projectCode, usePrefix)}"?`}
       githubLocation="your project's repositories"
-      githubScopeDisabledReason={notOurRepo ? REUSABLE_NOT_OURS_REASON : undefined}
-      // Reusable workflows keep the single-question dialog: their GitHub option
-      // is disabled, so there is no delivery to choose.
-      offerDelivery={pending.type === 'regular'}
+      // Everything this dialog removes lives in the project's own repositories:
+      // a reusable workflow a caller project owns is delivered there (#2309),
+      // and an RWX project's repository is its own. Every one of them can be
+      // removed by a PR Campaign or by a direct commit.
+      offerDelivery
       // Workflows have no Restore button — custom files do. Closing the pull
       // request is what cancels the removal, and the server unmarks the
       // workflow when it does.
@@ -1118,7 +1091,6 @@ const UnifiedWorkflowEditor: React.FC<UnifiedWorkflowEditorProps> = ({
   regularGuiWorkflow,
   guiWorkflow,
   projectCode,
-  projectPRState = "new",
   usePrefix = true,
   isReadOnly = false,
   user,
@@ -1140,7 +1112,8 @@ const UnifiedWorkflowEditor: React.FC<UnifiedWorkflowEditorProps> = ({
   unlinkWorkflow,
   addWorkflowFn,
   onImportExisting,
-  projectType = 'standard'
+  projectType = 'standard',
+  onVersionRestored
 }) => {
   const [showVersionHistory, setShowVersionHistory] = useState(false);
   const [isUnlocked, setIsUnlocked] = useState(false);
@@ -1191,6 +1164,7 @@ const UnifiedWorkflowEditor: React.FC<UnifiedWorkflowEditorProps> = ({
   const handleRestoreVersion = (content: string) => {
     handleWorkflowChange('content', content);
     setShowVersionHistory(false);
+    onVersionRestored?.();
   };
 
   // Wrapper for commit-and-update-PR: re-locks on success, stays unlocked on failure.
@@ -1306,7 +1280,6 @@ const UnifiedWorkflowEditor: React.FC<UnifiedWorkflowEditorProps> = ({
           projectName={projectName}
           user={user}
           editMode={editMode}
-          projectPRState={projectPRState}
           usePrefix={usePrefix}
           isReadOnly={isReadOnly}
           isUnlockedPR={isUnlockedPR}
@@ -1378,44 +1351,17 @@ const UnifiedWorkflowEditor: React.FC<UnifiedWorkflowEditorProps> = ({
       )}
 
       {showUnlockModal && (
-        <div className="workflow-lock-modal-backdrop">
-          <button
-            type="button"
-            aria-label="Dismiss unlock dialog"
-            onClick={() => setShowUnlockModal(false)}
-            className="absolute inset-0 cursor-default border-0 bg-transparent p-0"
-          />
-          <div className="workflow-lock-modal relative">
-            <div className="workflow-lock-modal-header">
-              <span className="workflow-lock-modal-icon">🔒</span>
-              <h3 className="workflow-lock-modal-title">Open Pull Request Detected</h3>
-            </div>
-            <p className="workflow-lock-modal-body">
-              This workflow already has an open pull request. If you continue editing, your changes will be added to the existing pull request instead of creating a separate one.
-            </p>
-            <div className="workflow-lock-modal-actions">
-              <button
-                className="btn btn-secondary"
-                onClick={() => setShowUnlockModal(false)}
-              >
-                Cancel
-              </button>
-              <button
-                className="btn btn-primary"
-                onClick={() => { setIsUnlocked(true); setShowUnlockModal(false); }}
-              >
-                Unlock and Edit
-              </button>
-            </div>
-          </div>
-        </div>
+        <UnlockUnderReviewDialog
+          subject="workflow"
+          onCancel={() => setShowUnlockModal(false)}
+          onUnlock={() => { setIsUnlocked(true); setShowUnlockModal(false); }}
+        />
       )}
 
       <WorkflowRemovalDialog
         pending={pendingDelete}
         projectCode={projectCode}
         usePrefix={usePrefix}
-        projectType={projectType}
         onConfirm={deleteWorkflow}
         onClose={() => setPendingDelete(null)}
       />

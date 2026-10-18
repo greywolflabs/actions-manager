@@ -22,7 +22,7 @@ This guide covers frontend development for Actions Manager, including React, Typ
 
 - **React 19** - UI framework with hooks and functional components
 - **TypeScript 4.9.5** - Type safety (gradual migration in progress)
-- **Tailwind CSS v3** - Utility-first CSS framework
+- **Tailwind CSS v4** - Utility-first CSS framework
 - **React Router** - Client-side routing
 - **CodeMirror 6** - Code editor for YAML workflow editing
 - **Axios** - HTTP client for API calls
@@ -96,7 +96,6 @@ frontend/
 │       └── ...
 │
 ├── package.json              # Dependencies
-├── tailwind.config.js        # Tailwind configuration
 ├── postcss.config.js         # PostCSS configuration
 └── tsconfig.json             # TypeScript configuration
 ```
@@ -259,36 +258,27 @@ const Button: React.FC<ButtonProps> = ({
 
 ### Overview
 
-Tailwind CSS v3 is configured alongside existing CSS variables for gradual migration. Both styling approaches work during the transition period.
+Tailwind CSS v4 is configured alongside existing CSS variables for gradual migration. Both styling approaches work during the transition period.
 
 ### Configuration
 
-**tailwind.config.js** extends the default theme with custom colors matching the design system:
+Tailwind v4 is configured in CSS, in `src/index.css`; there is no `tailwind.config.js`. The `@theme` block there extends the default theme with custom colors matching the design system, and `dark:` is bound to the `.dark-theme` class:
 
-```javascript
-module.exports = {
-  darkMode: 'class',
-  content: ['./src/**/*.{js,jsx,ts,tsx}'],
-  theme: {
-    extend: {
-      colors: {
-        // Custom colors from design system
-        primary: 'var(--color-primary)',
-        secondary: 'var(--color-secondary)',
-        success: 'var(--color-success)',
-        danger: 'var(--color-danger)',
-        warning: 'var(--color-warning)',
-        // Background colors
-        background: 'var(--color-background)',
-        container: 'var(--color-container)',
-        // Text colors
-        'text-primary': 'var(--color-text-primary)',
-        'text-secondary': 'var(--color-text-secondary)',
-      },
-    },
-  },
-};
+```css
+@custom-variant dark (&:where(.dark-theme, .dark-theme *));
+
+@theme inline {
+  --color-primary: #0066cc;
+  --color-primary-dark: #3b82f6;
+  --color-background: #f8fafc;
+  --color-background-dark: #0f172a;
+  --color-text-primary: #0f172a;
+  --color-text-primary-dark: #f8fafc;
+  /* ... */
+}
 ```
+
+Classes are found by scanning the source automatically, so there are no content paths to maintain. `src/index.css` also carries a few commented compatibility rules that keep v3's rendering where v4 changed a default, and `src/styles/tailwind-v3-palette.css` keeps v3's color palette.
 
 ### Using Tailwind Classes
 

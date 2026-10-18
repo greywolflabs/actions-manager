@@ -10,7 +10,7 @@ Provides guided import flow for existing GitHub Actions workflows:
 All imported workflows use existing state model values:
 - workflow_status: new → committed_locally → under_review → synced_with_github
 - project.pr_state: new → draft → open → synced
-- workflow_git_hash remains null/zeros until a real GitHub baseline is established
+- workflow_git_hash remains null until a commit to GitHub stamps its blob
 """
 
 import re
@@ -20,7 +20,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Annotated, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, Query, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -31,9 +31,10 @@ from auth import user_tokens
 from reusable_workflow_detection import is_reusable_workflow_yaml
 from models import (
     Workflow, ProjectWorkflow, Account, Project, Repo, ProjectRepo,
-    WorkflowVersion, WorkspaceMember,
+    WorkflowVersion,
 )
 from workflows import (
+    _SHOWN_GITHUB_ERRORS,
     _find_project_by_name,
     create_or_update_workflow,
     get_all_workflow_shas,
@@ -44,7 +45,8 @@ from workflows import (
     X_API_VERSION,
     GITHUB_TIMEOUT_SECONDS,
 )
-from authorization import check_project_access
+from authorization import has_project_role
+from error_detail import failure_kind
 
 router = APIRouter()
 
@@ -56,6 +58,7 @@ _ERROR_RESPONSES = {
     401: {"description": "Not authenticated"},
     403: {"description": "Access denied"},
     404: {"description": "Not found"},
+    409: {"description": "More than one project has this name"},
     502: {"description": "Upstream GitHub request failed"},
 }
 
@@ -97,15 +100,6 @@ class DiscoveryResponse(BaseModel):
     cross_repo_matches: List[dict] = Field(default_factory=list)
 
 
-class PreviewRequest(BaseModel):
-    """Query parameters for previewing a workflow."""
-    github_user: str
-    project_name: str
-    repo_name: str
-    branch: str
-    workflow_path: str
-
-
 class PreviewResponse(BaseModel):
     """Response from the workflow preview endpoint."""
     repo_name: str
@@ -127,7 +121,6 @@ class ImportWorkflowItem(BaseModel):
 
 class ImportRequest(BaseModel):
     """Request body for importing workflows."""
-    github_user: str
     project_name: str
     workflows: List[ImportWorkflowItem]
     import_mode: str = "save_local_only"  # save_local_only | save_and_create_pr_campaign
@@ -221,47 +214,43 @@ def _validate_repo_format(repo_name: str) -> tuple:
     return parts[0], parts[1]
 
 
-def _get_authenticated_user_and_project(request: Request, db: Session, github_user: str, project_name: str, require_write: bool = False):
+def _get_authenticated_user_and_project(
+    db: Session,
+    account: Account,
+    project_name: str,
+    require_write: bool = False,
+    project_id: Optional[int] = None,
+):
     """Validate authentication and project access. Returns (token, project).
 
-    ``github_user`` is a client-supplied query parameter, so it is checked
-    against the server-issued session before it is used to select any data.
+    *account* is the session's caller (#2241), never a name the request carries.
 
     When require_write=True, ensures the user has at least project_editor access.
     Read-only / project_viewer users are rejected for write operations.
-    """
-    auth_module.assert_session_owns_user(github_user, request, db)
 
+    *project_id*, which these routes carry in their path, picks between
+    same-named projects of different owners (#2240).
+    """
+    github_user = account.github_user
     if github_user not in user_tokens:
         raise HTTPException(status_code=401, detail="User not authenticated")
 
-    project = _find_project_by_name(db, github_user, project_name)
+    project = _find_project_by_name(db, github_user, project_name, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or access denied")
 
     # Enforce write permission when required (import, PR creation)
-    if require_write:
-        account = db.query(Account).filter_by(github_user=github_user).first()
-        if not account:
-            raise HTTPException(status_code=401, detail="User not authenticated")
-
-        # Always allow project owner, otherwise require project_editor/project_admin.
-        if account.user_id != project.user_id:
-            member = db.query(WorkspaceMember).filter(
-                WorkspaceMember.user_id == account.user_id
-            ).first()
-            effective_role = check_project_access(db, member, project.project_id) if member else None
-            if effective_role not in ("project_editor", "project_admin"):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Insufficient permissions. Import requires project editor or admin access."
-                )
+    if require_write and not has_project_role(db, account, project, "project_editor"):
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions. Import requires project editor or admin access."
+        )
 
     token = user_tokens[github_user]
     return token, project
 
 
-def _resolve_import_destination(request: Request, db: Session, payload: "ImportRequest", project):
+def _resolve_import_destination(db: Session, account: Account, payload: "ImportRequest", project):
     """Resolve which project the imported workflow rows are written to.
 
     Defaults to the project being viewed. When the caller picks a different
@@ -288,7 +277,8 @@ def _resolve_import_destination(request: Request, db: Session, payload: "ImportR
 
     try:
         _token, destination = _get_authenticated_user_and_project(
-            request, db, payload.github_user, candidate.project_name, require_write=True
+            db, account, candidate.project_name, require_write=True,
+            project_id=requested_id,
         )
     except HTTPException as exc:
         if exc.status_code in (403, 404):
@@ -464,12 +454,11 @@ def _flag_reusable_workflows(pending: List[tuple], headers: dict) -> None:
 # Discover endpoint
 # ---------------------------------------------------------------------------
 
-@router.get("/api/projects/{project_id}/workflow-import/discover", responses=_responses(400, 401, 403, 404))
+@router.get("/api/projects/{project_id}/workflow-import/discover", responses=_responses(400, 401, 403, 404, 409))
 def discover_workflows(
     project_id: int,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
     project_name: Annotated[str, Query(..., description="Project name")],
 ):
     """
@@ -477,7 +466,8 @@ def discover_workflows(
     
     Uses Git Trees API for efficient batch SHA lookup.
     """
-    token, project = _get_authenticated_user_and_project(request, db, github_user, project_name)
+    github_user = account.github_user
+    token, project = _get_authenticated_user_and_project(db, account, project_name, project_id=project_id)
 
     # Validate project_id matches
     if project.project_id != project_id:
@@ -512,17 +502,27 @@ def discover_workflows(
         
         try:
             branch = get_default_branch(owner, repo_name_short, headers, user=github_user, db=db)
-        except Exception:
-            branch = "main"
+        except Exception as e:
+            # Guessing "main" scanned a branch that may not exist and reported
+            # "no workflow files" for a repo that has them.
+            print(f"❌ Could not read the default branch of {repo.repo_name}: {e}")
+            results.append(DiscoveryRepoResult(
+                repo_name=repo.repo_name,
+                branch="",
+                workflows=[],
+                error=f"Could not read the repository's default branch: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}",
+            ))
+            continue
 
         try:
             shas = get_all_workflow_shas(owner, repo_name_short, branch, token)
         except Exception as e:
+            print(f"❌ Failed to scan {repo.repo_name}@{branch}: {e}")
             results.append(DiscoveryRepoResult(
                 repo_name=repo.repo_name,
                 branch=branch,
                 workflows=[],
-                error=f"Failed to scan repository: {str(e)}",
+                error=f"Failed to scan repository: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}",
             ))
             continue
 
@@ -607,12 +607,11 @@ def discover_workflows(
 # Preview endpoint
 # ---------------------------------------------------------------------------
 
-@router.get("/api/projects/{project_id}/workflow-import/preview", responses=_responses(400, 401, 403, 404, 502))
+@router.get("/api/projects/{project_id}/workflow-import/preview", responses=_responses(400, 401, 403, 404, 409, 502))
 def preview_workflow(
     project_id: int,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
-    github_user: Annotated[str, Query(..., description="GitHub username")],
+    account: auth_module.CurrentAccount,
     project_name: Annotated[str, Query(..., description="Project name")],
     repo_name: Annotated[str, Query(..., description="Repository in owner/repo format")],
     branch: Annotated[str, Query(..., description="Branch name")],
@@ -621,7 +620,7 @@ def preview_workflow(
     """
     Preview a specific workflow file content from GitHub before importing.
     """
-    token, project = _get_authenticated_user_and_project(request, db, github_user, project_name)
+    token, project = _get_authenticated_user_and_project(db, account, project_name, project_id=project_id)
 
     if project.project_id != project_id:
         raise HTTPException(status_code=403, detail=_ERR_PROJECT_ID_MISMATCH)
@@ -653,7 +652,8 @@ def preview_workflow(
     try:
         response = requests.get(file_url, headers=headers, timeout=GITHUB_TIMEOUT_SECONDS)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"GitHub API request failed: {str(e)}")
+        print(f"❌ GitHub API request failed: {e}")
+        raise HTTPException(status_code=502, detail="GitHub API request failed")
 
     if response.status_code == 404:
         raise HTTPException(status_code=404, detail=f"Workflow file not found: {validated_path}")
@@ -682,12 +682,12 @@ def preview_workflow(
 # Import endpoint
 # ---------------------------------------------------------------------------
 
-@router.post("/api/projects/{project_id}/workflow-import", responses=_responses(400, 401, 403, 404))
+@router.post("/api/projects/{project_id}/workflow-import", responses=_responses(400, 401, 403, 404, 409))
 def import_workflows(
     project_id: int,
     payload: ImportRequest,
-    request: Request,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
 ):
     """
     Import one or more existing GitHub workflow files into ActionsManager.
@@ -696,8 +696,9 @@ def import_workflows(
     - save_local_only: Saves workflow locally, does NOT write to GitHub, does NOT create drift.
     - save_and_create_pr_campaign: Saves locally and creates PRs for target repositories.
     """
+    github_user = account.github_user
     token, project = _get_authenticated_user_and_project(
-        request, db, payload.github_user, payload.project_name, require_write=True
+        db, account, payload.project_name, require_write=True, project_id=project_id
     )
 
     if project.project_id != project_id:
@@ -709,7 +710,7 @@ def import_workflows(
     if not payload.workflows:
         raise HTTPException(status_code=400, detail="At least one workflow must be specified for import")
 
-    destination = _resolve_import_destination(request, db, payload, project)
+    destination = _resolve_import_destination(db, account, payload, project)
     redirected = destination.project_id != project.project_id
 
     headers = {
@@ -792,11 +793,15 @@ def import_workflows(
             workflow_schema = WorkflowSchema(name=workflow_stem, content=content)
             is_reusable = is_reusable_workflow_yaml(content)
 
-            create_or_update_workflow(
+            saved = create_or_update_workflow(
                 db, workflow_schema, destination.project_id,
                 is_reusable=is_reusable,
-                last_modified_by=payload.github_user,
+                last_modified_by=github_user,
             )
+            # The kind it was saved as, which the trigger alone does not decide:
+            # an unchanged re-import keeps its kind, and a Reusable Workflow
+            # Project's stay reusable (#2318). The campaign below routes by it.
+            is_reusable = bool(saved.reusable_workflow) if saved is not None else is_reusable
 
             # Store import metadata in version metadata.
             # Case-insensitive equality rather than ILIKE: '_' is a single-char
@@ -854,11 +859,12 @@ def import_workflows(
                 message=he.detail,
             ))
         except Exception as e:
+            print(f"❌ Failed to import {item.workflow_path!r}: {e}")
             import_results.append(ImportResult(
                 workflow_path=item.workflow_path,
                 source_repo=item.source_repo,
                 status="error",
-                message=f"Unexpected error: {str(e)}",
+                message=f"Failed to import: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}",
             ))
 
     success_count = sum(1 for r in import_results if r.status == "success")
@@ -869,7 +875,7 @@ def import_workflows(
     # the destination when the import was redirected to an RWX project.
     if success_count > 0 and destination.pr_state in ("new", "synced"):
         destination.pr_state = "draft"
-        destination.last_modified_by = payload.github_user
+        destination.last_modified_by = github_user
         db.commit()
         db.refresh(destination)
 
@@ -906,8 +912,8 @@ def import_workflows(
                     n for n in successful_workflow_names if n in reusable_stems
                 ]
                 pr_payload = CreatePullRequestsRequest(
-                    github_user=payload.github_user,
                     project_name=payload.project_name,
+                    project_id=project.project_id,
                     selected_repos=effective_target_repos,
                     selected_workflows=regular_names or None,
                     selected_reusable_workflows=reusable_names or None,
@@ -918,17 +924,20 @@ def import_workflows(
                 # explicitly. async_mode defaults False, so BackgroundTasks()
                 # is never used.
                 pr_response = create_pull_requests(
-                    pr_payload, BackgroundTasks(), db, github_user=payload.github_user
+                    pr_payload, BackgroundTasks(), db, github_user=github_user
                 )
                 pr_results = pr_response
                 # Refresh project state after PR creation
                 db.refresh(project)
-            except Exception as e:
+            except HTTPException as he:
+                # Written for the user (the preflight gate, a missing permission).
+                pr_results = {"error": str(he.detail)}
+            except Exception:
                 # This reported a signature error to the user as a campaign
                 # failure and to the logs not at all, which is how the call
                 # above stayed broken (#2070).
                 traceback.print_exc()
-                pr_results = {"error": str(e)}
+                pr_results = {"error": "Error creating the import pull requests"}
 
     error_count = sum(1 for r in import_results if r.status == "error")
 

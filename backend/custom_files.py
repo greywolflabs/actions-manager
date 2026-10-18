@@ -12,6 +12,7 @@ Endpoints:
   PUT    /api/projects/{project_id}/custom-files/{file_id}  – update
   DELETE /api/projects/{project_id}/custom-files/{file_id}  – remove from the project, optionally from GitHub too
   POST   /api/projects/{project_id}/custom-files/{file_id}/restore – cancel pending delete
+  GET    /api/projects/{project_id}/custom-files/{file_id}/github  – its copy on one (repo, branch), to load
 
 Security: path validation is enforced server-side on every create/update.
 File content is never logged.
@@ -20,14 +21,17 @@ File content is never logged.
 from typing import Annotated, List, Optional
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+import auth as auth_module
 from auth import user_tokens
 from database import get_db
-from models import Account, CustomFile, Project, ProjectMembership, ProjectRepo, WorkspaceMember
-from authorization import check_project_access, is_project_admin
+import deliveries
+from drift_notifications import drop_drift, resolve_drift_for_local_edit
+from models import Account, CustomFile, Project, ProjectRepo
+from authorization import has_project_role, project_role
 
 router = APIRouter()
 
@@ -103,21 +107,15 @@ def _responses(*codes: int) -> dict:
     return {code: _ERROR_RESPONSES[code] for code in codes}
 
 
-def _resolve_user(
-    x_github_user: Optional[str],
-    github_user_query: Optional[str],
-) -> str:
-    """Return the authenticated github username, raising 401 if not found."""
-    user = x_github_user or github_user_query
-    if not user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if user not in user_tokens:
+def _resolve_user(account) -> str:
+    """The session's caller (#2241), raising 401 when no GitHub token is held for them."""
+    if account.github_user not in user_tokens:
         raise HTTPException(status_code=401, detail="User not authenticated")
-    return user
+    return account.github_user
 
 
 def _get_project_for_user(db: Session, project_id: int, github_user: str) -> Project:
-    """Return the project if the caller has access, else raise 403/404."""
+    """Return the project if the caller may see it, else raise 401/404/403 (see authorization.project_role)."""
     account = db.query(Account).filter_by(github_user=github_user).first()
     if not account:
         raise HTTPException(status_code=401, detail="User not authenticated")
@@ -126,18 +124,7 @@ def _get_project_for_user(db: Session, project_id: int, github_user: str) -> Pro
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    workspace_member = db.query(WorkspaceMember).filter_by(user_id=account.user_id).first()
-    has_access = (
-        (workspace_member and is_project_admin(workspace_member))
-        or project.user_id == account.user_id
-        or bool(db.query(ProjectMembership).filter_by(user_id=account.user_id, project_id=project_id).first())
-        # A full workspace member reads every project in this single-workspace
-        # model. Safe to widen only because every write behind this helper now
-        # carries its own project_editor gate; until this change it *was* the
-        # gate for create, update and restore.
-        or bool(workspace_member and workspace_member.workspace_role == "member")
-    )
-    if not has_access:
+    if project_role(db, account, project) is None:
         raise HTTPException(status_code=403, detail="Access denied")
     return project
 
@@ -147,30 +134,9 @@ _ERR_NOT_EDITOR = "Editor access to this project is required to change it on Git
 
 
 def _require_project_editor(db: Session, project: Project, github_user: str) -> None:
-    """Require project_editor before a removal is allowed to reach GitHub.
-
-    ``_get_project_for_user`` proves only that the caller can *see* the project:
-    it accepts any ProjectMembership row, and project_viewer is documented as
-    read-only access. That was enough while a GitHub-scoped delete merely set
-    pending_delete on the row — a reversible database change. It is not enough
-    now that the same request commits the deletion to the target branches, or
-    opens a campaign to.
-
-    Mirrors ``workflows._require_project_editor``, which exists for this exact
-    reason on the other path that writes to GitHub directly.
-    """
+    """Require project_editor before a removal is allowed to reach GitHub (see authorization.project_role)."""
     account = db.query(Account).filter_by(github_user=github_user).first()
-    if not account:
-        raise HTTPException(status_code=403, detail=_ERR_NOT_EDITOR)
-
-    # Owning the project is full rights, and owners need no membership row.
-    if project.user_id == account.user_id:
-        return
-
-    member = db.query(WorkspaceMember).filter_by(user_id=account.user_id).first()
-    if not member:
-        raise HTTPException(status_code=403, detail=_ERR_NOT_EDITOR)
-    if check_project_access(db, member, project.project_id) not in ("project_editor", "project_admin"):
+    if not has_project_role(db, account, project, "project_editor"):
         raise HTTPException(status_code=403, detail=_ERR_NOT_EDITOR)
 
 # ── Project state helper ─────────────────────────────────────────────────────
@@ -226,7 +192,6 @@ def _serialize(cf: CustomFile) -> dict:
 # ── Request schemas ───────────────────────────────────────────────────────────
 
 class CreateCustomFileRequest(BaseModel):
-    github_user: Optional[str] = None
     display_name: Optional[str] = None
     file_path: str
     file_content: str = ""
@@ -234,7 +199,6 @@ class CreateCustomFileRequest(BaseModel):
 
 
 class UpdateCustomFileRequest(BaseModel):
-    github_user: Optional[str] = None
     display_name: Optional[str] = None
     file_path: Optional[str] = None
     file_content: Optional[str] = None
@@ -247,10 +211,9 @@ class UpdateCustomFileRequest(BaseModel):
 def list_custom_files(
     project_id: int,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-    github_user: Optional[str] = None,
+    account: auth_module.CurrentAccount,
 ):
-    user = _resolve_user(x_github_user, github_user)
+    user = _resolve_user(account)
     _get_project_for_user(db, project_id, user)
     files = db.query(CustomFile).filter_by(project_id=project_id).all()
     return {"custom_files": [_serialize(f) for f in files]}
@@ -261,9 +224,9 @@ def create_custom_file(
     project_id: int,
     payload: CreateCustomFileRequest,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
-    user = _resolve_user(x_github_user, payload.github_user)
+    user = _resolve_user(account)
     _project = _get_project_for_user(db, project_id, user)
 
     # Creating, editing and restoring a custom file all change what this
@@ -300,15 +263,34 @@ def create_custom_file(
     return {"custom_file": _serialize(cf)}
 
 
+def _move_custom_file(db: Session, cf: CustomFile, project_id: int, file_path: Optional[str]) -> bool:
+    """Move *cf* to *file_path* when that is a new path; returns whether it moved."""
+    if file_path is None or file_path.strip() == cf.file_path:
+        return False
+    path_error = validate_file_path(file_path)
+    if path_error:
+        raise HTTPException(status_code=400, detail=path_error)
+    conflict = db.query(CustomFile).filter_by(
+        project_id=project_id, file_path=file_path.strip()
+    ).filter(CustomFile.id != cf.id).first()
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A custom file already exists at path '{file_path}' in this project",
+        )
+    cf.file_path = file_path.strip()
+    return True
+
+
 @router.put("/api/projects/{project_id}/custom-files/{file_id}", responses=_responses(400, 401, 403, 404, 409))
 def update_custom_file(
     project_id: int,
     file_id: int,
     payload: UpdateCustomFileRequest,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
+    account: auth_module.CurrentAccount,
 ):
-    user = _resolve_user(x_github_user, payload.github_user)
+    user = _resolve_user(account)
     _project = _get_project_for_user(db, project_id, user)
 
     # Creating, editing and restoring a custom file all change what this
@@ -320,19 +302,8 @@ def update_custom_file(
     if not cf:
         raise HTTPException(status_code=404, detail=_ERR_NOT_FOUND)
 
-    if payload.file_path is not None and payload.file_path.strip() != cf.file_path:
-        path_error = validate_file_path(payload.file_path)
-        if path_error:
-            raise HTTPException(status_code=400, detail=path_error)
-        conflict = db.query(CustomFile).filter_by(
-            project_id=project_id, file_path=payload.file_path.strip()
-        ).filter(CustomFile.id != file_id).first()
-        if conflict:
-            raise HTTPException(
-                status_code=409,
-                detail=f"A custom file already exists at path '{payload.file_path}' in this project",
-            )
-        cf.file_path = payload.file_path.strip()
+    # Whether the path changed is knowable only before the new one is assigned.
+    moved = _move_custom_file(db, cf, project_id, payload.file_path)
 
     if payload.display_name is not None:
         cf.display_name = payload.display_name
@@ -343,7 +314,7 @@ def update_custom_file(
     if content_changed:
         cf.file_content = payload.file_content
 
-    if content_changed or (payload.file_path is not None and payload.file_path.strip() != cf.file_path):
+    if content_changed or moved:
         cf.file_status = "committed_locally"
         cf.git_hash = None
 
@@ -351,13 +322,17 @@ def update_custom_file(
     cf.updated_at = datetime.now(timezone.utc)
 
     db.commit()
+    if content_changed:
+        # Resolves only drift whose GitHub copy the edit now is, e.g. Load GitHub version then Commit Locally.
+        resolve_drift_for_local_edit(db, _project, deliveries.CUSTOM_FILE, cf.id, cf.file_content)
     db.refresh(cf)
     _mark_project_draft(db, project_id)
     return {"custom_file": _serialize(cf)}
 
 
-def _hard_delete(db: Session, cf: CustomFile, targets: Optional[List[dict]] = None) -> dict:
+def _hard_delete(db: Session, project: Project, cf: CustomFile, targets: Optional[List[dict]] = None) -> dict:
     project_id = cf.project_id
+    drop_drift(db, project, deliveries.CUSTOM_FILE, cf.id)
     db.delete(cf)
     db.commit()
     response = {
@@ -368,29 +343,6 @@ def _hard_delete(db: Session, cf: CustomFile, targets: Optional[List[dict]] = No
     if targets is not None:
         response["targets"] = targets
     return response
-
-
-def _assert_name_resolves_to(db: Session, project: Project, user: str) -> None:
-    """Refuse to run the campaign if the project name would resolve elsewhere.
-
-    ``create_pull_requests`` takes a project *name*, and ``_find_project_by_name``
-    falls back to a global name match for privileged workspace members. This route
-    resolved its project by id, so for an admin acting on someone else's project
-    while owning a same-named project of their own, the campaign would silently
-    target the wrong repositories. Fail loudly instead of guessing.
-    """
-    from workflows import _find_project_by_name
-
-    resolved = _find_project_by_name(db, user, project.project_name)
-    if resolved is None or resolved.project_id != project.project_id:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"More than one project is named '{project.project_name}' and the "
-                "deletion campaign would target a different one. Rename one of them "
-                "first, or remove the file from ActionsManager only."
-            ),
-        )
 
 
 def _campaign_errors(results: dict) -> List[str]:
@@ -406,50 +358,39 @@ def _campaign_errors(results: dict) -> List[str]:
 def _delete_via_campaign(db: Session, project: Project, cf: CustomFile, user: str) -> dict:
     """Run a PR Campaign whose only change is removing this file.
 
-    The campaign machinery already knows how to deliver a pending_delete custom
-    file: it cuts the AM branch, removes the file on it, opens the PR and records
-    a ProjectPRCampaign linking them. Going through it rather than opening loose
-    pull requests is what puts the deletion in the PR Campaigns view with the
-    grouping, status and merge that every other delivery gets.
+    Each pull request removes the file where the delivery record says it is,
+    wherever it was moved since, and a ProjectPRCampaign links them
+    (``workflows._run_removal_campaign``). Going through a campaign rather than
+    opening loose pull requests is what puts the deletion in the PR Campaigns
+    view with the grouping, status and merge that every other delivery gets.
 
     The row stays until those PRs merge — that is what Restore cancels and what
     the campaign's synced_with_github transition cleans up.
     """
-    from fastapi import BackgroundTasks
-    from workflows import CreatePullRequestsRequest, create_pull_requests
-
-    # Before anything is written: a rejection after the mark would leave the file
-    # pending_delete for a campaign that never ran.
-    _assert_name_resolves_to(db, project, user)
+    from workflows import ACCEPT_HEADER, X_API_VERSION, _removal_targets, _run_removal_campaign
 
     # A project with no repositories has nowhere to deliver to, so a campaign
     # would have no target and fail with "nothing was selected". There is no
     # GitHub copy this project can reach: drop the record.
     if not db.query(ProjectRepo).filter_by(project_id=project.project_id).first():
-        return _hard_delete(db, cf)
+        return _hard_delete(db, project, cf)
 
-    # Committed before the campaign runs: it selects the file out of the database,
-    # and pending_delete is what tells it to remove rather than upsert.
+    # _resolve_user saw this token.
+    headers = {"Accept": ACCEPT_HEADER, "X-GitHub-Api-Version": X_API_VERSION, "Authorization": f"token {user_tokens[user]}"}
+    # Before the mark below: its status reads as a delivery made before the
+    # record existed, and a rejection after it would leave the file
+    # pending_delete for a campaign that never ran.
+    targets, failures = _removal_targets(db, project, [cf], user, headers)
+    if not targets and not failures:
+        # The record holds no copy anywhere, so there is nothing to review.
+        return _hard_delete(db, project, cf)
+
     previous_status = cf.file_status
     cf.pending_delete = True
     cf.file_status = "committed_locally"
     cf.last_modified_by = user
     cf.updated_at = datetime.now(timezone.utc)
     db.commit()
-
-    payload = CreatePullRequestsRequest(
-        project_name=project.project_name,
-        github_user=user,
-        # Scoped to this one deletion. Empty lists rather than None: None means
-        # "everything changed", which would sweep unrelated work into a campaign
-        # the user asked for by clicking Delete.
-        selected_workflows=[],
-        selected_reusable_workflows=[],
-        selected_custom_file_ids=[cf.id],
-        selected_codeowners_repos=[],
-        campaign_name=f"Remove {cf.file_path}",
-        campaign_description=f"Removes {cf.file_path} from {project.project_name}.",
-    )
 
     def _unmark():
         # Leaving the row marked for a deletion that never got delivered would
@@ -460,35 +401,36 @@ def _delete_via_campaign(db: Session, project: Project, cf: CustomFile, user: st
         db.commit()
 
     try:
-        campaign = create_pull_requests(payload, BackgroundTasks(), db, github_user=user)
+        campaign = _run_removal_campaign(db, project, cf, targets, failures, user, headers)
     except Exception:
         _unmark()
         raise
 
-    # A campaign can return 200 having opened nothing — every target failing
-    # branch creation, say. The campaign marks its custom files under_review
-    # either way, so without this the file sits pending_delete with no pull
-    # request that will ever remove it.
-    if not campaign.get("prs_created"):
+    # A campaign can open nothing — every target failing branch creation, say.
+    # Without this the file would sit pending_delete with no pull request that
+    # will ever remove it.
+    if not campaign["prs_created"]:
         _unmark()
         raise HTTPException(
             status_code=502,
             detail={
                 "message": f"No pull request was opened to remove '{cf.file_path}'",
-                "errors": _campaign_errors(campaign.get("results") or {}),
-                "targets": campaign.get("results") or {},
+                "errors": _campaign_errors(campaign["results"]),
+                "targets": campaign["results"],
             },
         )
 
+    # The check skips a file on its way out, so drift it found before would stay counted.
+    drop_drift(db, project, deliveries.CUSTOM_FILE, cf.id)
     db.refresh(cf)
     return {
         "deleted": False,
         "pending_delete": True,
         "custom_file": _serialize(cf),
         "pr_state": _current_pr_state(db, project.project_id),
-        "campaign_id": campaign.get("campaign_id"),
+        "campaign_id": campaign["campaign_id"],
         "prs_created": campaign["prs_created"],
-        "results": campaign.get("results", {}),
+        "results": campaign["results"],
     }
 
 
@@ -497,12 +439,11 @@ def delete_custom_file(
     project_id: int,
     file_id: int,
     db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
     scope: Annotated[str, Query(description="'project' or 'project_and_github'")] = _SCOPE_PROJECT_AND_GITHUB,
     delivery: Annotated[str, Query(description="'campaign' or 'direct'; only used when scope includes GitHub")] = _DELIVERY_CAMPAIGN,
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-    github_user: Optional[str] = None,
 ):
-    user = _resolve_user(x_github_user, github_user)
+    user = _resolve_user(account)
     project = _get_project_for_user(db, project_id, user)
 
     if scope not in _VALID_SCOPES:
@@ -528,7 +469,7 @@ def delete_custom_file(
     # created but never saved to GitHub has no copy there to chase, so both drop
     # the row outright without touching GitHub.
     if scope == _SCOPE_PROJECT or cf.file_status == "new":
-        return _hard_delete(db, cf)
+        return _hard_delete(db, project, cf)
 
     if delivery == _DELIVERY_CAMPAIGN:
         return _delete_via_campaign(db, project, cf, user)
@@ -538,7 +479,7 @@ def delete_custom_file(
     # risk for one call.
     from workflows import delete_custom_file_directly
 
-    outcome = delete_custom_file_directly(db, project, cf.file_path, user)
+    outcome = delete_custom_file_directly(db, project, cf, user)
 
     if outcome["errors"]:
         # Keep the row. Dropping it here would leave the file in the repositories
@@ -552,7 +493,7 @@ def delete_custom_file(
             },
         )
 
-    return _hard_delete(db, cf, outcome["targets"])
+    return _hard_delete(db, project, cf, outcome["targets"])
 
 
 @router.post("/api/projects/{project_id}/custom-files/{file_id}/restore", responses=_responses(401, 403, 404))
@@ -560,10 +501,9 @@ def restore_custom_file(
     project_id: int,
     file_id: int,
     db: Annotated[Session, Depends(get_db)],
-    x_github_user: Annotated[Optional[str], Header(alias="X-GitHub-User")] = None,
-    github_user: Optional[str] = None,
+    account: auth_module.CurrentAccount,
 ):
-    user = _resolve_user(x_github_user, github_user)
+    user = _resolve_user(account)
     _project = _get_project_for_user(db, project_id, user)
 
     # Creating, editing and restoring a custom file all change what this
@@ -581,3 +521,45 @@ def restore_custom_file(
     db.commit()
     db.refresh(cf)
     return {"custom_file": _serialize(cf)}
+
+
+@router.get("/api/projects/{project_id}/custom-files/{file_id}/github", responses=_responses(401, 403, 404, 502))
+def get_custom_file_on_github(
+    project_id: int,
+    file_id: int,
+    repo: Annotated[str, Query(description="The repository's owner/name or repo_id; one of the project's")],
+    branch: Annotated[str, Query(description="The branch to read, e.g. the one a drift row names")],
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
+):
+    """GitHub's copy of a custom file on one (repo, branch), to load into the editor.
+
+    Read where its drift check reads it, so Load GitHub version shows the copy
+    that drifted. One contents call with the caller's token; seeing the
+    project is enough, as reading its stored files is.
+    """
+    # Lazily: codeowners and workflows both import this module.
+    from codeowners import _resolve_repo_in_project
+    from workflows import DriftCheckUnavailable, custom_file_on_github
+
+    user = _resolve_user(account)
+    project = _get_project_for_user(db, project_id, user)
+    cf = db.query(CustomFile).filter_by(id=file_id, project_id=project_id).first()
+    if not cf:
+        raise HTTPException(status_code=404, detail=_ERR_NOT_FOUND)
+    target_repo = _resolve_repo_in_project(db, project, repo)
+    try:
+        found, path = custom_file_on_github(db, cf, target_repo, branch, user_tokens[user])
+    except DriftCheckUnavailable as e:
+        raise HTTPException(status_code=502, detail=f"GitHub could not be read (HTTP {e.status_code})") from e
+    return {
+        "repo_id": target_repo.repo_id,
+        "repo_name": target_repo.repo_name,
+        "branch": branch,
+        "github": {
+            "exists": found is not None,
+            "content": found["content"] if found else None,
+            "sha": found["sha"] if found else None,
+            "path": path,
+        },
+    }

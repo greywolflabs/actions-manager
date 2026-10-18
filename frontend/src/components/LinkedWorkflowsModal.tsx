@@ -41,7 +41,7 @@ const LinkedWorkflowsModal: React.FC<LinkedWorkflowsModalProps> = ({
     setLoading(true);
     setError(null);
     setSelectedIds(new Set());
-    getAvailableRwxWorkflows(user, projectName)
+    getAvailableRwxWorkflows(projectName)
       .then((data) => setWorkflows(data))
       .catch(() => setError('Failed to load reusable workflows.'))
       .finally(() => setLoading(false));

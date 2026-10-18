@@ -206,6 +206,34 @@ describe("CreatePRModal", () => {
       }
     });
 
+    it("seeds a synced reusable workflow the project owns, but not a linked one (#2309)", () => {
+      const { container } = render(
+        <CreatePRModal
+          {...baseProps}
+          preselectAllWorkflows
+          workflows={mixedWorkflows}
+          reusableWorkflows={[
+            { name: "owned-shared", status: "synced_with_github", deliversToProjectRepos: true },
+            { name: "linked-shared", status: "synced_with_github", sourceRepo: "owner/rwx", isLinked: true },
+          ]}
+        />
+      );
+
+      fireEvent.click(screen.getAllByText(/show unchanged workflows/i)[0]);
+      const checkedFor = (label: string) =>
+        Array.from(container.querySelectorAll(".repo-item"))
+          .filter((row) => row.querySelector(".repo-name")?.textContent === label)
+          .map((row) => (row.querySelector("input[type='checkbox']") as HTMLInputElement).checked);
+      // A repo just added to the project needs the owned one; the linked one
+      // lives in its RWX project's repo, so it stays changed-only.
+      const owned = checkedFor("owned-shared.yml");
+      const linked = checkedFor("linked-shared.yml");
+      expect(owned.length).toBeGreaterThan(0);
+      expect(owned.every(Boolean)).toBe(true);
+      expect(linked.length).toBeGreaterThan(0);
+      expect(linked.some(Boolean)).toBe(false);
+    });
+
     it("defaults off, keeping the changed-only selection", () => {
       render(<CreatePRModal {...baseProps} workflows={mixedWorkflows} />);
 
@@ -562,11 +590,11 @@ describe("CreatePRModal", () => {
         <CreatePRModal
           {...baseProps}
           workflows={[{ name: "build", status: "committed_locally" }]}
-          codeownersRepos={["owner/repo-a", "owner/repo-b"]}
+          codeowners={{ filePath: ".github/CODEOWNERS", status: "committed_locally" }}
         />
       );
 
-      // 2 caller repos + CODEOWNERS selected for both = 2 PRs, 1 workflow, 1 file (CODEOWNERS)
+      // 2 caller repos, each also getting CODEOWNERS = 2 PRs, 1 workflow, 1 file (CODEOWNERS)
       expect(screen.getByRole("button", { name: /create 2 pr.*1 workflow.*1 file/i })).toBeInTheDocument();
     });
 
@@ -579,12 +607,68 @@ describe("CreatePRModal", () => {
             { id: 1, file_path: ".github/scripts/setup.sh", file_status: "committed_locally", pending_delete: false },
             { id: 2, file_path: ".github/myfiles/test.txt", file_status: "committed_locally", pending_delete: false },
           ]}
-          codeownersRepos={["owner/repo-a"]}
+          codeowners={{ filePath: ".github/CODEOWNERS", status: "committed_locally" }}
         />
       );
 
       // 2 workflows selected=1, 2 custom files selected by default + 1 CODEOWNERS = 3 files
       expect(screen.getByRole("button", { name: /create 2 pr.*1 workflow.*3 file/i })).toBeInTheDocument();
+    });
+  });
+
+  describe("CODEOWNERS", () => {
+    const codeowners = (status: string) => ({ filePath: ".github/CODEOWNERS", status });
+    const checkbox = () => screen.getByRole("checkbox", { name: /\.github\/CODEOWNERS/ });
+
+    it("rides the campaign to every caller repository as one file", async () => {
+      const onSuccess = vi.fn();
+      (pullRequestApi.createPullRequests as Mock).mockResolvedValue({
+        message: "ok", results: { "owner/repo-a on main": { status: "pr_created" } }, prs_created: 1,
+      });
+
+      render(<CreatePRModal {...baseProps} workflows={[]} codeowners={codeowners("committed_locally")} onSuccess={onSuccess} />);
+      expect(checkbox()).toBeChecked();
+      expect(screen.getByText("every caller repository")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /create 2 pr.*1 file/i }));
+
+      await waitFor(() => expect(onSuccess).toHaveBeenCalled());
+      expect((pullRequestApi.createPullRequests as Mock).mock.calls[0][2]).toMatchObject({
+        selectedRepos: ["owner/repo-a", "owner/repo-b"],
+        includeCodeowners: true,
+      });
+      expect(onSuccess.mock.calls[0][3]).toBe(true);
+    });
+
+    it("leaves a synced file out unless asked, to put it back where it drifted", async () => {
+      (pullRequestApi.createPullRequests as Mock).mockResolvedValue({ message: "ok", results: {}, prs_created: 0 });
+
+      render(<CreatePRModal {...baseProps} workflows={[]} codeowners={codeowners("synced_with_github")} />);
+      expect(checkbox()).not.toBeChecked();
+      expect(screen.getByTestId("confirm-create-prs")).toBeDisabled();
+
+      fireEvent.click(checkbox());
+      fireEvent.click(screen.getByTestId("confirm-create-prs"));
+
+      await waitFor(() => expect(pullRequestApi.createPullRequests).toHaveBeenCalled());
+      expect((pullRequestApi.createPullRequests as Mock).mock.calls[0][2].includeCodeowners).toBe(true);
+    });
+
+    it("is included for a newly added repository, which needs every file", () => {
+      render(<CreatePRModal {...baseProps} preselectAllWorkflows codeowners={codeowners("synced_with_github")} />);
+
+      expect(checkbox()).toBeChecked();
+    });
+
+    it("needs a caller repository to go to", () => {
+      render(<CreatePRModal {...baseProps} repositories={[]} workflows={[]} codeowners={codeowners("committed_locally")} />);
+
+      expect(screen.getByTestId("confirm-create-prs")).toBeDisabled();
+    });
+
+    it("is not offered when the project has none", () => {
+      render(<CreatePRModal {...baseProps} />);
+
+      expect(screen.queryByRole("checkbox", { name: /CODEOWNERS/ })).not.toBeInTheDocument();
     });
   });
 

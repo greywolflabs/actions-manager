@@ -319,6 +319,51 @@ class TestSavedGitHubTokenEndpoints:
         assert data["github_token"]["token_type"] == "fine_grained_pat"
         assert "token" not in str(data["github_token"]).lower() or "configured" in data["github_token"]["message"].lower()
 
+    def test_a_saved_token_that_cannot_be_decrypted_is_not_reported_as_configured(self, test_user, test_db):
+        """#2060: the drift remedy sends the user here, so this must see the problem too."""
+        test_user.github_pat_token_encrypted = "encrypted-under-an-old-secret-key"
+        test_user.github_pat_status = "valid"
+        test_db.commit()
+        auth.user_tokens._pat_cache["testuser"] = (auth.INVALID_SAVED_TOKEN_SENTINEL, float("inf"))
+
+        for path, key in (("/api/user/testuser/github-token", None), ("/api/user/testuser", "github_token")):
+            response = client.get(path, headers=auth_headers(test_user))
+            assert response.status_code == 200
+            payload = response.json()[key] if key else response.json()
+            assert payload["configured"] is True
+            assert payload["status"] == "unreadable"
+            assert payload["message"] != "Token configured."
+            assert "save the personal access token again" in payload["message"]
+            assert auth.INVALID_SAVED_TOKEN_SENTINEL not in str(payload)
+
+    def test_a_readable_saved_token_is_still_reported_as_configured(self, test_user, test_db):
+        test_user.github_pat_token_encrypted = "encrypted-token"
+        test_user.github_pat_status = "valid"
+        test_db.commit()
+        auth.user_tokens._pat_cache["testuser"] = ("ghp_readable_saved_token", float("inf"))
+
+        response = client.get("/api/user/testuser/github-token", headers=auth_headers(test_user))
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "valid"
+        assert response.json()["message"] == "Token configured."
+        assert "ghp_readable_saved_token" not in response.text
+
+    def test_a_saved_token_whose_check_did_not_complete_is_not_reported_as_configured(self, test_user, test_db):
+        """#2308: unknown_error means the permission check never finished, so nothing is known to work."""
+        test_user.github_pat_token_encrypted = "encrypted-token"
+        test_user.github_pat_status = "unknown_error"
+        test_db.commit()
+        auth.user_tokens._pat_cache["testuser"] = ("ghp_readable_saved_token", float("inf"))
+
+        response = client.get("/api/user/testuser/github-token", headers=auth_headers(test_user))
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "unknown_error"
+        assert response.json()["message"] != "Token configured."
+        assert "could not be checked" in response.json()["message"]
+        assert "ghp_readable_saved_token" not in response.text
+
     @patch("auth._encrypt_saved_token", return_value="encrypted-token")
     @patch("auth._validate_github_token")
     def test_save_github_token_validates_and_persists_masked_state(self, mock_validate, mock_encrypt, test_user, test_db):

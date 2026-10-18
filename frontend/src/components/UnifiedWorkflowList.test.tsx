@@ -57,8 +57,6 @@ const baseProps = {
   selectedWorkflowId: null,
   isCollapsed: false,
   projectCode: 'PROJ',
-  loadingStatuses: false,
-  workflowStatuses: {},
   selectedRepos: [],
   setIsCollapsed: vi.fn(),
   handleSelectWorkflow: vi.fn(),
@@ -214,7 +212,7 @@ describe('UnifiedWorkflowList', () => {
       expect(onSelectCustomFile).toHaveBeenCalledWith(7);
     });
 
-    it('calls onSelectCodeowners with the first repo when the CODEOWNERS row is clicked', async () => {
+    it('opens the project\'s CODEOWNERS when its row is clicked', async () => {
       const user = userEvent.setup();
       const onSelectCodeowners = vi.fn();
 
@@ -222,13 +220,48 @@ describe('UnifiedWorkflowList', () => {
         <UnifiedWorkflowList
           {...baseProps}
           unifiedWorkflows={[]}
-          codeownersRepos={['owner/repo', 'owner/other']}
+          selectedRepos={['owner/repo', 'owner/other']}
           onSelectCodeowners={onSelectCodeowners}
         />
       );
 
       await user.click(screen.getByRole('button', { name: '.github/CODEOWNERS, No status' }));
-      expect(onSelectCodeowners).toHaveBeenCalledWith('owner/repo');
+      expect(onSelectCodeowners).toHaveBeenCalledWith();
+    });
+
+    it('shows the CODEOWNERS file\'s own path, status and drift', () => {
+      render(
+        <UnifiedWorkflowList
+          {...baseProps}
+          unifiedWorkflows={[]}
+          selectedRepos={['owner/repo']}
+          onSelectCodeowners={vi.fn()}
+          codeowners={{
+            id: 1, project_id: 1, content: '* @a', file_path: 'CODEOWNERS', git_hash: null,
+            status: 'synced_with_github', last_modified_by: null, created_at: null, updated_at: null,
+          }}
+          codeownersDrifted
+        />
+      );
+
+      expect(screen.getByRole('button', { name: 'CODEOWNERS, Synced, Drift detected' })).toBeInTheDocument();
+    });
+
+    it('shows a drifted custom file\'s drift as the CODEOWNERS row does', () => {
+      const other = { ...customFile, id: 8, file_path: 'scripts/build.sh' };
+      render(
+        <UnifiedWorkflowList
+          {...baseProps}
+          unifiedWorkflows={[]}
+          customFiles={[customFile, other]}
+          driftedCustomFileIds={new Set([7])}
+        />
+      );
+
+      const drifted = screen.getByRole('button', { name: '.github/dependabot.yml, Committed Locally, Drift detected' });
+      expect(within(drifted).getByTestId('drift-badge')).toBeInTheDocument();
+      const clean = screen.getByRole('button', { name: 'scripts/build.sh, Committed Locally' });
+      expect(within(clean).queryByTestId('drift-badge')).not.toBeInTheDocument();
     });
   });
 
@@ -367,7 +400,8 @@ describe('UnifiedWorkflowList', () => {
           {...baseProps}
           unifiedWorkflows={[regularWorkflow, reusableWorkflow, linkedWorkflowItem]}
           customFiles={[customFile]}
-          codeownersRepos={['owner/repo']}
+          selectedRepos={['owner/repo']}
+          onSelectCodeowners={vi.fn()}
         />
       );
 
@@ -632,7 +666,7 @@ describe('UnifiedWorkflowList', () => {
         <UnifiedWorkflowList
           {...baseProps}
           unifiedWorkflows={[]}
-          codeownersRepos={['owner/repo']}
+          selectedRepos={['owner/repo']}
           onSelectCodeowners={vi.fn()}
         />
       );
@@ -691,7 +725,12 @@ describe('UnifiedWorkflowList', () => {
 
     it('does not mark the CODEOWNERS row selected when no selection is supplied', () => {
       render(
-        <UnifiedWorkflowList {...baseProps} unifiedWorkflows={[]} codeownersRepos={['owner/repo']} />
+        <UnifiedWorkflowList
+          {...baseProps}
+          unifiedWorkflows={[]}
+          selectedRepos={['owner/repo']}
+          onSelectCodeowners={vi.fn()}
+        />
       );
 
       expect(
@@ -700,7 +739,7 @@ describe('UnifiedWorkflowList', () => {
     });
 
     it('hides the CODEOWNERS section when no repos are configured', () => {
-      render(<UnifiedWorkflowList {...baseProps} unifiedWorkflows={[]} codeownersRepos={[]} />);
+      render(<UnifiedWorkflowList {...baseProps} unifiedWorkflows={[]} selectedRepos={[]} onSelectCodeowners={vi.fn()} />);
 
       expect(screen.queryByRole('region', { name: 'CODEOWNERS' })).not.toBeInTheDocument();
     });

@@ -73,7 +73,7 @@ export interface OnboardingState {
 
 export interface GitHubTokenStatus {
   configured: boolean;
-  status: "not_configured" | "configured" | "valid" | "missing_scopes" | "missing_repo_access" | "missing_org_approval" | "insufficient_repo_permissions" | "token_invalid" | "unknown_error";
+  status: "not_configured" | "configured" | "unreadable" | "valid" | "missing_scopes" | "missing_repo_access" | "missing_org_approval" | "insufficient_repo_permissions" | "token_invalid" | "unknown_error";
   message: string;
   token_type?: "oauth_token" | "classic_pat" | "fine_grained_pat" | "github_app_user" | "github_app_installation" | "unknown" | null;
   checked_at?: string | null;

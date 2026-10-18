@@ -5,11 +5,12 @@ follow-up, part of #1789).
 Root cause: the project page showed every workflow as "Synced" on load, then
 flipped drifted ones to "Drift Detected" a moment later once the client-side
 live drift check (DriftDetection component, GET /api/projects/{id}/drift)
-resolved. WorkflowDriftState (issue #1793) already persists per-workflow
-drift state on every check, but nothing surfaced it in the initial
+resolved. Every check already persisted per-workflow drift state (issue
+#1793), but nothing surfaced it in the initial
 project-load response, so the frontend always started from "nothing is
 drifted". This field is the read-side fix: on first paint the badge can now
-reflect the last known state instead of a hardcoded default.
+reflect the last known state instead of a hardcoded default. That state now
+lives on the delivery record (file_deliveries).
 """
 
 import sys
@@ -22,9 +23,10 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from models import Base, Account, Project, Workflow, ProjectWorkflow, Repo, WorkflowDriftState
+from models import Base, Account, Project, Workflow, ProjectWorkflow  # noqa: E402
 from main import app
 from projects import get_db as projects_get_db
+from tests.delivery_records import record_drift  # noqa: E402
 
 TEST_PROJECT_NAME = "drift_badge_project"
 TEST_GITHUB_USER = "driftbadgeuser"
@@ -50,9 +52,10 @@ def setup_and_teardown_db():
 
 
 @pytest.fixture
-def client():
+def client(authenticate_client):
     app.dependency_overrides[projects_get_db] = override_get_db
     with TestClient(app) as c:
+        authenticate_client(c, TEST_GITHUB_USER, TestingSessionLocal)
         yield c
     app.dependency_overrides.pop(projects_get_db, None)
 
@@ -82,16 +85,8 @@ def test_drifted_workflow_included_in_initial_load(client):
         account, project = _make_project(db)
         drifted_wf = _add_workflow(db, project, "deploy.yml")
         clean_wf = _add_workflow(db, project, "ci.yml")
-        repo = Repo(repo_name="driftbadgeuser/widgets")
-        db.add(repo)
-        db.flush()
-        db.add(WorkflowDriftState(
-            project_id=project.project_id, workflow_id=drifted_wf.workflow_id, repo_id=repo.repo_id, has_drift=True,
-        ))
-        db.add(WorkflowDriftState(
-            project_id=project.project_id, workflow_id=clean_wf.workflow_id, repo_id=repo.repo_id, has_drift=False,
-        ))
-        db.commit()
+        record_drift(db, drifted_wf, "driftbadgeuser/widgets")
+        record_drift(db, clean_wf, "driftbadgeuser/widgets", has_drift=False)
     finally:
         db.close()
 
@@ -124,13 +119,8 @@ def test_resolved_drift_no_longer_listed(client):
     try:
         account, project = _make_project(db)
         wf = _add_workflow(db, project, "deploy.yml")
-        repo = Repo(repo_name="driftbadgeuser/widgets")
-        db.add(repo)
-        db.flush()
-        db.add(WorkflowDriftState(
-            project_id=project.project_id, workflow_id=wf.workflow_id, repo_id=repo.repo_id, has_drift=False,
-        ))
-        db.commit()
+        record_drift(db, wf, "driftbadgeuser/widgets")
+        record_drift(db, wf, "driftbadgeuser/widgets", has_drift=False)
     finally:
         db.close()
 

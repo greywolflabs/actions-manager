@@ -1,9 +1,10 @@
 """
 Authorization tests for the rulesets API.
 
-Three routes take the caller's name from the client: DELETE as a `github_user`
-query parameter, apply and sync-status as a body field. In every case the name
-selects whose GitHub token is used, so it has to be proven, not trusted.
+The caller picks whose GitHub token is used, or whose account a new ruleset is
+stored under, so it comes from the session (#2241). Routes that took it as a
+`github_user` query parameter still accept one and refuse any other name; a
+`github_user` form or body field is ignored.
 
 `DELETE /api/rulesets/{ruleset_id}` takes the caller's name as a `github_user`
 query parameter. Scoping the lookup to that account is not access control — the
@@ -56,6 +57,14 @@ def ruleset_id():
         db.close()
 
 
+def _ruleset_count() -> int:
+    db = TestingSessionLocal()
+    try:
+        return db.query(Ruleset).count()
+    finally:
+        db.close()
+
+
 def _ruleset_exists(rid: int) -> bool:
     db = TestingSessionLocal()
     try:
@@ -84,6 +93,14 @@ class TestDeleteRulesetAuthorization:
         assert resp.json()["success"] is True
         assert not _ruleset_exists(ruleset_id)
 
+    def test_allows_the_owner_naming_nobody(self, ruleset_id, authenticate_client):
+        authenticate_client(client, OWNER, TestingSessionLocal)
+
+        resp = client.delete(f"/api/rulesets/{ruleset_id}")
+
+        assert resp.status_code == 200, resp.text
+        assert not _ruleset_exists(ruleset_id)
+
     def test_missing_ruleset_returns_404_not_500(self, ruleset_id, authenticate_client):
         """The route's catch-all used to swallow its own 404 and report a 500."""
         authenticate_client(client, OWNER, TestingSessionLocal)
@@ -94,9 +111,9 @@ class TestDeleteRulesetAuthorization:
 
 
 class TestApplyRulesetAuthorization:
-    """`github_user` in the body picks whose token creates the ruleset."""
+    """`github_user` in the body used to pick whose token creates the ruleset."""
 
-    def test_rejects_a_caller_naming_someone_else(self, ruleset_id, authenticate_client):
+    def test_naming_someone_else_borrows_nothing_of_theirs(self, ruleset_id, authenticate_client):
         authenticate_client(client, OTHER, TestingSessionLocal)
 
         resp = client.post(
@@ -104,9 +121,10 @@ class TestApplyRulesetAuthorization:
             json={"repo_names": ["victim-org/prod"], "github_user": OWNER},
         )
 
-        # Without the assertion this reached GitHub with OWNER's token and
-        # created the ruleset on a repository OTHER named.
-        assert resp.status_code == 403
+        # Before the session check this reached GitHub with OWNER's token and
+        # created the ruleset on a repository OTHER named. Acting as OTHER, the
+        # ruleset is OWNER's alone and does not exist for them.
+        assert resp.status_code == 404
         assert _ruleset_exists(ruleset_id)
 
     def test_missing_ruleset_returns_404_not_500(self, ruleset_id, authenticate_client):
@@ -124,7 +142,7 @@ class TestApplyRulesetAuthorization:
 class TestSyncStatusAuthorization:
     """Reads another account's rulesets and spends their rate limit."""
 
-    def test_rejects_a_caller_naming_someone_else(self, ruleset_id, authenticate_client):
+    def test_naming_someone_else_borrows_nothing_of_theirs(self, ruleset_id, authenticate_client):
         authenticate_client(client, OTHER, TestingSessionLocal)
 
         resp = client.post(
@@ -132,4 +150,59 @@ class TestSyncStatusAuthorization:
             json={"repo_names": ["victim-org/prod"], "github_user": OWNER},
         )
 
+        assert resp.status_code == 404
+
+
+class TestCreateRulesetAuthorization:
+    """With no project_name, nothing but the session decides whose ruleset it is."""
+
+    def _create(self, github_user):
+        return client.post(
+            "/api/rulesets/create",
+            params={"github_user": github_user},
+            json={"name": "planted", "ruleset_json": {"name": "planted", "target": "branch"}},
+        )
+
+    def _owned_by(self, username):
+        db = TestingSessionLocal()
+        try:
+            account = db.query(Account).filter_by(github_user=username).one()
+            return [r.ruleset_name for r in db.query(Ruleset).filter_by(user_id=account.user_id)]
+        finally:
+            db.close()
+
+    def test_rejects_a_caller_naming_someone_else(self, ruleset_id, authenticate_client):
+        authenticate_client(client, OTHER, TestingSessionLocal)
+
+        resp = self._create(OWNER)
+
         assert resp.status_code == 403
+        assert _ruleset_count() == 1
+
+    def test_allows_a_caller_naming_themselves(self, ruleset_id, authenticate_client):
+        authenticate_client(client, OWNER, TestingSessionLocal)
+
+        resp = self._create(OWNER)
+
+        assert resp.status_code == 200, resp.text
+        assert sorted(self._owned_by(OWNER)) == ["planted", "require-reviews"]
+
+    def test_accepts_the_callers_name_in_another_case(self, ruleset_id, authenticate_client):
+        """The session check ignores case, so the account lookup after it must too."""
+        authenticate_client(client, OWNER, TestingSessionLocal)
+
+        resp = self._create(OWNER.upper())
+
+        assert resp.status_code == 200, resp.text
+        assert sorted(self._owned_by(OWNER)) == ["planted", "require-reviews"]
+
+    def test_naming_nobody_creates_it_for_the_caller(self, ruleset_id, authenticate_client):
+        authenticate_client(client, OWNER, TestingSessionLocal)
+
+        resp = client.post(
+            "/api/rulesets/create",
+            json={"name": "planted", "ruleset_json": {"name": "planted", "target": "branch"}},
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert sorted(self._owned_by(OWNER)) == ["planted", "require-reviews"]

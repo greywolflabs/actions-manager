@@ -591,10 +591,6 @@ export async function installApiMocks(
     (route) => jsonResponse(route, buildCampaignsResponse(state)),
   );
   await page.route(
-    apiPath((p) => p === "/api/project-pr-history"),
-    (route) => jsonResponse(route, { history: [] }),
-  );
-  await page.route(
     apiPath((p) => p === "/api/campaign-rollback-preview"),
     (route) =>
       jsonResponse(
@@ -973,10 +969,13 @@ export async function mockDriftResponse(
     staleReason?: string;
     /** When the reported state was established. Rendered as "Last checked …". */
     lastChecked?: string;
+    /** The project's CODEOWNERS on each (repo, branch) where it drifted. */
+    driftedCodeowners?: Array<{ repo: string; branch?: string; deleted_in_github?: boolean }>;
   } = {},
 ): Promise<void> {
   const {
     driftedWorkflows = [],
+    driftedCodeowners = [],
     failWithStatus,
     delayMs,
     staleReason,
@@ -1014,15 +1013,29 @@ export async function mockDriftResponse(
         affected_repo_count: 0,
         affected_repos: [],
       }));
+      const drifted_codeowners = driftedCodeowners.map((c, idx) => ({
+        file_path: ".github/CODEOWNERS",
+        repo: c.repo,
+        repo_id: idx + 1,
+        branch: c.branch ?? "main",
+        has_drift: true,
+        actionsmanager_sha: "abc123",
+        github_sha: c.deleted_in_github ? null : "def456",
+        last_checked: lastChecked,
+        message: `CODEOWNERS content differs between local and ${c.repo}`,
+        deleted_in_github: c.deleted_in_github ?? false,
+      }));
+      const driftCount = drifted_workflows.filter((w) => w.has_drift).length + drifted_codeowners.length;
       return jsonResponse(route, {
         project_id: 1,
         project_name: "test-project",
-        drift_count: drifted_workflows.filter((w) => w.has_drift).length,
+        drift_count: driftCount,
         drifted_workflows: drifted_workflows.filter((w) => w.has_drift),
+        drifted_codeowners,
         last_checked: lastChecked,
         stale_reason: staleReason ?? null,
         // The status row only shows the green check for an explicit "clean".
-        drift_status: drifted_workflows.some((w) => w.has_drift) ? "drifted" : "clean",
+        drift_status: driftCount > 0 ? "drifted" : "clean",
       });
     },
   );

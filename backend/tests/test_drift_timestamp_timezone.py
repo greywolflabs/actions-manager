@@ -30,9 +30,9 @@ from workflows import get_db as real_get_db  # noqa: E402
 from projects import get_db as projects_get_db  # noqa: E402
 from models import (  # noqa: E402
     Base, Account, Project, Repo, ProjectRepo, Workflow, ProjectWorkflow,
-    WorkflowDriftState,
 )
 from auth import user_tokens  # noqa: E402
+from tests.delivery_records import record_delivered, record_drift  # noqa: E402
 
 engine = create_engine(
     "sqlite:///:memory:",
@@ -75,10 +75,11 @@ def state(authenticate_client):
                       workflow_status="synced_with_github")
         db.add(wf); db.commit(); db.refresh(wf)
         db.add(ProjectWorkflow(project_id=project.project_id, workflow_id=wf.workflow_id)); db.commit()
+        record_delivered(db, wf, "acme/api", "main", sha="sha-local")
         user_tokens["alice"] = "tok"
         authenticate_client(client, "alice", TestingSessionLocal)
         yield {"project_id": project.project_id, "workflow_id": wf.workflow_id,
-               "repo_id": repo.repo_id, "db": db}
+               "repo_id": repo.repo_id, "db": db, "workflow": wf}
     finally:
         db.close()
         Base.metadata.drop_all(bind=engine)
@@ -124,14 +125,7 @@ def test_reloading_after_a_manual_check_shows_that_check(_tree, _branch, state):
 
 def test_stored_drift_row_timestamp_carries_utc(state):
     checked_at = datetime(2026, 9, 15, 22, 46, 10, tzinfo=timezone.utc)
-    db = state["db"]
-    db.add(WorkflowDriftState(
-        project_id=state["project_id"], workflow_id=state["workflow_id"],
-        repo_id=state["repo_id"], branch="main", has_drift=True,
-        content_hash="h", drift_cycle_count=1, github_sha="sha-remote",
-        last_checked_at=checked_at,
-    ))
-    db.commit()
+    record_drift(state["db"], state["workflow"], "acme/api", "main", github_sha="sha-remote", at=checked_at)
 
     resp = client.get(f"/api/projects/{state['project_id']}/drift",
                       params={"github_user": "alice"})
