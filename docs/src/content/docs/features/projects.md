@@ -16,7 +16,7 @@ Instead of managing workflows repository by repository, you group related reposi
 
 ## Project Types
 
-ActionsManager uses two project types that reflect the two sides of GitHub Actions reusability:
+ActionsManager uses two workflow project types that reflect the two sides of GitHub Actions reusability:
 
 ### Caller Workflow Project
 
@@ -40,9 +40,28 @@ Use this project type when you want to:
 
 The real power of ActionsManager comes from managing both project types together. When a reusable workflow changes in a producer project, ActionsManager identifies which caller projects are affected and can roll out the update across the entire consumer fleet.
 
+### Managed Files Project
+
+A **Managed Files project** manages one repository file, such as CODEOWNERS, for a group of
+repositories, with one project per repository for each kind of file. These projects are listed in
+their own section; see [Managed Files](managed-files.html).
+
+## The Projects Page
+
+![The Projects page: a project card showing its type, status, workflow count, repository visibility and naming mode, followed by a dashed New project box](../assets/screenshots/walkthrough/07-project-dashboard-created.png)
+
+Each project is a card:
+
+- **The header** has the project's identity color, its name, its type ("Caller Workflow Project" or "Reusable Workflow Project") under the name, and its status beside the three-dot menu. A drift chip appears beside the status when there is something to report about drift.
+- **The body** below the divider shows the workflow count, whether the project uses **Public repos** or **Private repos**, and **Prefix** or **No prefix** naming. Under that are when the project was last updated and by whom, and when drift was last checked.
+
+Click anywhere on a card to open the project. Cards are laid out three to a row on wide screens, two on medium and one on narrow ones. [Managed Files](managed-files.html) uses the same card layout, grid and dashed **New project** box.
+
+The last item in the grid is a dashed **New project** box. It shows how many projects your plan has room for ("2 of 3 remaining", counted across both project types) and is hidden once you reach your limit. Beside the **New Project** button, a small meter shows your usage: one figure when your plan has a single project limit, or Caller and Reusable figures when it limits each type. Your plan's name, with an **Upgrade** link when it has one, is a chip beside your avatar in the app header on every page.
+
 ## Creating a Project
 
-1. Click **New Project** in the dashboard
+1. Click **New Project** in the dashboard, or the dashed **New project** box
 2. Choose a project type (Caller Workflow or Reusable Workflow)
 3. Name the project
 4. Add repositories to the project
@@ -54,21 +73,23 @@ Within a project you can:
 - **Remove repositories** — take a repository out of scope without deleting its workflows
 - **Configure per-repository settings** — specify branches, labels, and delivery preferences
 
-### Adding a Repository to a Project That Already Has Workflows
+### Adding a Repository to a Project That Already Has Files
 
 Adding a repository does not push anything to it. The repository joins the project's scope, but
-the project's existing workflows are not in it yet — and because nothing has ever been delivered
-there, it is [not reported as drift](drift-detection.html#what-counts-as-drift)
-either. Without a prompt, a newly added repository could sit empty indefinitely with nothing
-saying so.
+the project's existing files (its workflows and custom files, or a Managed Files project's file)
+are not in it yet — and
+because nothing has ever been delivered there, it is
+[not reported as drift](drift-detection.html#what-counts-as-drift) either. Without a prompt, a
+newly added repository could sit empty indefinitely with nothing saying so.
 
 So when you press **Save** in **Repositories & Branches** having added one or more repositories,
-ActionsManager asks how to apply the project's workflows to them:
+ActionsManager asks how to deliver the project's workflows to them (a Managed Files project's
+file, for one of those):
 
 | Choice | What happens |
 |--------|--------------|
-| **Save locally only** | Nothing is pushed. The repository stays in the project, and no drift is reported. Deliver whenever you're ready from the Workflows section. |
-| **Create pull requests** | Opens a [PR campaign](pr-campaigns.html) limited to the repositories you just added. Every workflow in the project is pre-selected, because the new repository has none of them. |
+| **Save locally only** | Nothing is pushed. The repository stays in the project, and no drift is reported. Deliver whenever you're ready from **Project Files** (in a Managed Files project, from the file's own item, such as **CODEOWNERS**). |
+| **Create pull requests** | Opens a [PR campaign](pr-campaigns.html) limited to the repositories you just added. Every workflow and custom file in the project, or a Managed Files project's file, is pre-selected, because the new repository has none of them. A custom file changed on GitHub is offered unticked, so overwriting that change stays your choice. |
 
 Dismissing the prompt is the same as choosing **Save locally only** — the repository was already
 saved before the prompt appeared, so nothing is lost either way.
@@ -78,7 +99,8 @@ saved before the prompt appeared, so nothing is lost either way.
 ### Keeping Track of What's Still Waiting
 
 Choosing **Save locally only** is not the end of the story, so ActionsManager keeps a standing
-reminder until the workflows land. It appears in three places, each a different level of detail:
+reminder until the workflows (or a Managed Files project's file) land. It appears in three places, each a
+different level of detail:
 
 - **A count beside Repositories & Branches** in the sidebar, so the reminder is reachable from
   anywhere in the project.
@@ -90,16 +112,18 @@ None of it is styled as a warning, because nothing is wrong — the repository s
 the files yet. All three clear themselves: opening a pull request pauses the reminder while it is in
 review, and merging it removes the repository from the list for good.
 
-The reminder only appears for repositories ActionsManager has genuinely never delivered to. It stays
-quiet on a project that has never been [drift-checked](drift-detection.html),
+The reminder only appears for repositories ActionsManager has genuinely never delivered to. In a
+project with workflows that means its workflows: a repository that received only a custom file
+is still waiting for them. A Managed Files project waits on its
+file instead. It stays quiet on a project that has never been [drift-checked](drift-detection.html),
 because until the first check there is no evidence either way, and guessing would mean telling you
 that repositories you delivered to months ago are still waiting.
 
-Two things the campaign does *not* carry:
+While a repository is waiting, **Create Pull Requests** stays available even when the project is
+synced, and opens the campaign for the waiting repositories, so you can deliver to them at any time.
 
-- **Custom files that are already synced elsewhere.** A campaign only offers custom files with
-  pending changes, so a file already delivered to the project's other repositories is not
-  automatically copied to the new one. Edit it to include it in a campaign.
+One thing the campaign does *not* carry:
+
 - **Linked reusable workflows.** Those are delivered to the repository of the Reusable Workflow
   Project that owns them, not to caller repositories, so a new caller repository does not need
   them pushed to it.
@@ -133,7 +157,7 @@ window. Everything else in the project keeps the project setting.
 ## Ordering Projects
 
 The Projects dashboard keeps the arrangement you choose. Drag a card by its grip
-handle (to the left of the three-dot menu) and drop it anywhere in the grid.
+handle (to the left of the three-dot menu, shown when you hover over the card or focus the handle, and always visible on touch screens) and drop it anywhere in the grid.
 
 - **Opening or editing a project no longer moves its card.** The dashboard used to
   sort by last-updated time, so simply viewing a project pushed it to the front.
@@ -184,7 +208,8 @@ always qualify.
 ## Deleting a Project
 
 Delete a project from **Project Configs → Danger Zone**. The dialog asks what happens to the
-project's files in GitHub: its workflows, reusable workflows, custom files and CODEOWNERS.
+project's files in GitHub: its workflows, reusable workflows and custom files, or a Managed Files
+project's file.
 
 | Choice | What happens |
 |--------|--------------|

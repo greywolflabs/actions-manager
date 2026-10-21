@@ -35,6 +35,16 @@ export function getProjectColorOptionsForType(
   return PROJECT_COLOR_OPTIONS.filter((option) => !RWX_ONLY_PROJECT_COLOR_KEYS.includes(option.key));
 }
 
+/**
+ * How a project without a color renders wherever a project color would: a
+ * slate tile and no accent. Managed Files projects have no color (#2367), and
+ * must never fall back to normalizeProjectColorKey's blue.
+ */
+export const NEUTRAL_PROJECT_STYLE = {
+  icon: 'text-slate-600 dark:text-slate-300',
+  iconBg: 'bg-slate-500/10 dark:bg-slate-400/10',
+} as const;
+
 export function normalizeProjectColorKey(value: unknown): ProjectColorKey {
   if (typeof value !== 'string') return 'blue';
   const normalized = value.trim().toLowerCase();

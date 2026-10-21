@@ -16,6 +16,11 @@ export interface CustomFile {
   updated_at: string | null;
 }
 
+/** A custom file with a change no campaign has delivered yet: an edit, or its removal.
+ * The server locks only these for review when a campaign carries them. */
+export const hasLocalChange = (file: Pick<CustomFile, "file_status" | "pending_delete">): boolean =>
+  file.file_status !== "synced_with_github" || file.pending_delete;
+
 export interface CreateCustomFilePayload {
   github_user?: string;
   display_name?: string;

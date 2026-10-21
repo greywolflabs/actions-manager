@@ -1231,6 +1231,7 @@ describe('rollback result reporting', () => {
         repo_name: 'org/repo', target_branch: 'main', pr_number: 42,
         pr_url: 'https://github.com/org/repo/pull/42', workflow_names: 'ci',
         invertible: true, reason: null,
+        left_alone: [],
         files: [{ path: '.github/workflows/ci.yml', action: 'restore', before: 'a\n', after: 'b\n' }],
       }],
     });

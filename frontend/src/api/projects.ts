@@ -28,6 +28,15 @@ export interface WorkflowSaveData {
   isReusable?: boolean;
 }
 
+/** Every project type the server stores: the two workflow types and Managed Files (#2367). */
+export type ProjectTypeValue = "standard" | "rwx" | "managed_files";
+
+/**
+ * Which projects GET /api/projects/ lists: the Projects page's workflow
+ * projects (the default), the Managed Files section's, or both.
+ */
+export type ProjectListSection = "workflows" | "managed_files" | "all";
+
 // Project interface supports multiple property naming conventions used across different components
 // - project_id/id: Backend uses project_id, frontend components use id
 // - project_name/name: Backend uses project_name, frontend components use name
@@ -54,7 +63,17 @@ export interface Project {
   reusable_workflows_enabled?: boolean;
   use_prefix?: boolean;
   pr_state?: "new" | "draft" | "open" | "synced" | "deleting";
-  project_type?: "standard" | "rwx";
+  project_type?: ProjectTypeValue;
+  /** The file a Managed Files project manages (a kind from GET /api/managed-files). */
+  file_kind?: string | null;
+  /** Managed Files list entries only: the owner's GitHub login. */
+  owner?: string;
+  /** Managed Files list entries only. */
+  repo_count?: number;
+  /** Managed Files list entries only: where the file is stored, null before it is saved. */
+  file_path?: string | null;
+  /** Managed Files list entries only: repositories where the last check found drift. */
+  drifted_repos?: string[];
   /** Saved backend repository visibility scope ("public" | "private"). */
   repository_visibility_scope?: "public" | "private";
   /** User-selected project identity color key used as a decorative accent. */
@@ -88,7 +107,9 @@ export interface SaveProjectData {
   use_prefix: boolean;
   project_id?: string | number | null;
   custom_project_key?: string | null;
-  project_type?: "standard" | "rwx";
+  project_type?: ProjectTypeValue;
+  /** Required for a Managed Files project, refused for any other. */
+  file_kind?: string;
   repository_visibility_scope?: "public" | "private";
   project_color?: ProjectColorKey | null;
   validation_repo?: string | null;
@@ -184,7 +205,7 @@ export interface LoadProjectResponse extends Project {
   codeowners_drifted?: boolean;
   /** Ids of the custom files the last drift check found changed on GitHub. */
   drifted_custom_file_ids?: number[];
-  /** Repositories in the project that have never received any of its workflows,
+  /** Repositories in the project that have never received any of its files,
    * so the UI can remind the user to deliver them. Empty while a project has
    * never been drift-checked — see `_pending_delivery_repo_names`. */
   pending_delivery_repos?: string[];
@@ -192,19 +213,30 @@ export interface LoadProjectResponse extends Project {
 
 // ===== API Functions =====
 
-// Fetch all projects
-export const fetchProjects = async (user: string | undefined): Promise<Project[]> => {
+/**
+ * The projects of one section, the Projects page's by default. Throws on
+ * failure, so a page can tell a failed load from an empty list; fetchProjects
+ * is the forgiving one.
+ */
+export const listProjects = async (section: ProjectListSection = "workflows"): Promise<Project[]> => {
+  // The caller comes from the session (#2241); naming anyone else is refused.
+  const response: AxiosResponse<Project[]> = section === "workflows"
+    ? await apiClient.get(`/api/projects/`)
+    : await apiClient.get(`/api/projects/`, { params: { section } });
+  return response.data;
+};
+
+// Fetch the projects of one section; an empty list when that fails
+export const fetchProjects = async (
+  user: string | undefined,
+  section: ProjectListSection = "workflows",
+): Promise<Project[]> => {
   try {
     if (!user) {
       console.error("❌ Error: GitHub user is missing!");
       return [];
     }
-
-
-    // The caller comes from the session (#2241); naming anyone else is refused.
-    const response: AxiosResponse<Project[]> = await apiClient.get(`/api/projects/`);
-
-    return response.data;
+    return await listProjects(section);
   } catch (error) {
     const axiosError = error as AxiosError;
     console.error("❌ Error fetching projects:", axiosError.response?.data || axiosError);
@@ -271,6 +303,7 @@ export const saveProject = async (projectData: SaveProjectData): Promise<SavePro
       reusable_workflows_enabled: projectData.reusable_workflows_enabled,
       use_prefix: projectData.use_prefix,
       project_type: projectData.project_type || "standard",
+      ...(projectData.file_kind ? { file_kind: projectData.file_kind } : {}),
       ...(projectData.custom_project_key !== undefined
         ? { custom_project_key: projectData.custom_project_key }
         : {}),
@@ -407,6 +440,23 @@ export interface RepoBranchConfigUpdate {
   branch_regex?: string | null;
   branch_max_age_days?: number | null;
 }
+
+export interface PendingDeliveryResponse {
+  pending_delivery_repos: string[];
+  /** False when the project has never been drift-checked: the empty list then
+   * means "cannot tell yet" rather than "nothing is waiting". */
+  pending_delivery_known: boolean;
+}
+
+/** The repos waiting for their first delivery, as the project load reports them.
+ * Re-read after a campaign, a push onto its PR, a CODEOWNERS save or a PR
+ * settling, which can change the answer. */
+export const fetchPendingDelivery = async (projectId: number | string): Promise<PendingDeliveryResponse> => {
+  const response: AxiosResponse<PendingDeliveryResponse> = await apiClient.get(
+    `/api/projects/${projectId}/pending-delivery`
+  );
+  return response.data;
+};
 
 /** Fetch all selected repos in a project plus their effective branch config. */
 export const fetchProjectRepoBranchConfigs = async (

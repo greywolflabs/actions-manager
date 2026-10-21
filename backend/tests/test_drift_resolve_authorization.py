@@ -3,17 +3,18 @@ Authorization and stale-write protection for drift resolution.
 
 Three hardening fixes are covered here:
 
-  * Resolving drift writes to GitHub ("Restore Directly" force-pushes over the
-    default branch), so it requires project_editor. Previously the endpoints
-    only proved the caller could *see* the project — _find_project_by_name
-    never reads ProjectMembership.project_role — so a project_viewer could
-    force-push.
+  * Resolving drift writes to GitHub (it opens pull requests), so it requires
+    project_editor. Previously the endpoints only proved the caller could
+    *see* the project — _find_project_by_name never reads
+    ProjectMembership.project_role — so a project_viewer could write.
   * The target repo must belong to the project. Previously only the string
     shape was validated, so `repo` was effectively caller-chosen and any repo
-    the caller's token could write to would receive a commit.
-  * A direct push carries the blob SHA the drift was computed against and is
-    refused with 409 if GitHub moved on, so a stale page cannot silently revert
-    a colleague's fix.
+    the caller's token could write to would receive a pull request.
+  * Adopting GitHub's version carries the blob SHA the drift was computed
+    against and is refused with 409 if GitHub moved on, so a stale page cannot
+    adopt content the user never saw.
+
+Drift is fixed only through pull requests: a direct commit is refused.
 """
 
 import os
@@ -123,7 +124,7 @@ def _as(user):
     return {"X-GitHub-User": user, "Authorization": f"Bearer {token}"}
 
 
-def _resolve(state, user, *, repo="alice/repo1", expected_sha=None, mode="direct"):
+def _resolve(state, user, *, repo="alice/repo1", expected_sha=None, mode="pr"):
     body = {
         "repo": repo,
         "branch": "main",
@@ -138,12 +139,12 @@ def _resolve(state, user, *, repo="alice/repo1", expected_sha=None, mode="direct
     )
 
 
-def _bulk(state, user, *, repo="alice/repo1"):
+def _bulk(state, user, *, repo="alice/repo1", mode="pr"):
     return client.post(
         f"/api/projects/{state['project_id']}/drift/bulk-resolve",
         json={
             "resolution": "restore_actionsmanager",
-            "delivery_mode": "direct",
+            "delivery_mode": mode,
             "items": [{"workflow_id": state["workflow_id"], "repo": repo, "branch": "main"}],
         },
         headers=_as(user),
@@ -152,8 +153,8 @@ def _bulk(state, user, *, repo="alice/repo1"):
 
 class TestEditorRoleRequired:
     def test_project_viewer_cannot_resolve_drift(self, db_state):
-        # The headline fix: a read-only member could previously force-push.
-        with patch("workflows._direct_push_workflow_to_branch") as push:
+        # The headline fix: a read-only member could previously write to GitHub.
+        with patch("workflows.create_pull_requests") as push:
             resp = _resolve(db_state, VIEWER)
 
         assert resp.status_code == 403
@@ -161,15 +162,14 @@ class TestEditorRoleRequired:
         push.assert_not_called()
 
     def test_project_viewer_cannot_bulk_resolve(self, db_state):
-        with patch("workflows._direct_push_workflow_to_branch") as push:
+        with patch("workflows.create_pull_requests") as push:
             resp = _bulk(db_state, VIEWER)
 
         assert resp.status_code == 403
         push.assert_not_called()
 
     def test_project_editor_can_resolve_drift(self, db_state):
-        with patch("workflows._direct_push_workflow_to_branch",
-                   return_value={"status_code": 200, "sha": "sha-new"}) as push:
+        with patch("workflows.create_pull_requests", return_value={"prs_created": 1}) as push:
             resp = _resolve(db_state, EDITOR)
 
         assert resp.status_code == 200, resp.text
@@ -177,8 +177,7 @@ class TestEditorRoleRequired:
 
     def test_project_owner_can_resolve_drift(self, db_state):
         # Owners hold no ProjectMembership row, so they must pass on ownership.
-        with patch("workflows._direct_push_workflow_to_branch",
-                   return_value={"status_code": 200, "sha": "sha-new"}) as push:
+        with patch("workflows.create_pull_requests", return_value={"prs_created": 1}) as push:
             resp = _resolve(db_state, OWNER)
 
         assert resp.status_code == 200, resp.text
@@ -195,12 +194,12 @@ class TestCallerComesFromTheSession:
             f"/api/workflows/{state['workflow_id']}/resolve-drift",
             params=params,
             json={"github_user": body_user, "repo": "alice/repo1", "branch": "main",
-                  "resolution": "restore_actionsmanager", "delivery_mode": "direct"},
+                  "resolution": "restore_actionsmanager", "delivery_mode": "pr"},
             headers=headers,
         )
 
     def test_a_viewer_naming_the_owner_in_the_body_is_still_a_viewer(self, db_state):
-        with patch("workflows._direct_push_workflow_to_branch") as push:
+        with patch("workflows.create_pull_requests") as push:
             resp = self._post_signed_in_as(db_state, VIEWER, body_user=OWNER)
 
         assert resp.status_code == 403, resp.text
@@ -208,7 +207,7 @@ class TestCallerComesFromTheSession:
 
     def test_naming_someone_else_in_the_query_is_refused(self, db_state):
         """auth.current_account owns the legacy github_user query parameter."""
-        with patch("workflows._direct_push_workflow_to_branch") as push:
+        with patch("workflows.create_pull_requests") as push:
             resp = self._post_signed_in_as(
                 db_state, OWNER, body_user=OWNER, params={"github_user": VIEWER}
             )
@@ -220,7 +219,7 @@ class TestCallerComesFromTheSession:
 class TestTargetRepoMustBelongToProject:
     def test_repo_outside_the_project_is_rejected(self, db_state):
         # Exists in the repos table, but is not one of this project's repos.
-        with patch("workflows._direct_push_workflow_to_branch") as push:
+        with patch("workflows.create_pull_requests") as push:
             resp = _resolve(db_state, OWNER, repo="someone-else/private-repo")
 
         assert resp.status_code == 400
@@ -228,21 +227,21 @@ class TestTargetRepoMustBelongToProject:
         push.assert_not_called()
 
     def test_unknown_repo_is_rejected(self, db_state):
-        with patch("workflows._direct_push_workflow_to_branch") as push:
+        with patch("workflows.create_pull_requests") as push:
             resp = _resolve(db_state, OWNER, repo="attacker/never-seen")
 
         assert resp.status_code == 400
         push.assert_not_called()
 
     def test_malformed_repo_is_rejected(self, db_state):
-        with patch("workflows._direct_push_workflow_to_branch") as push:
+        with patch("workflows.create_pull_requests") as push:
             resp = _resolve(db_state, OWNER, repo="not-a-repo")
 
         assert resp.status_code == 400
         push.assert_not_called()
 
     def test_bulk_rejects_repo_outside_the_project(self, db_state):
-        with patch("workflows._direct_push_workflow_to_branch") as push:
+        with patch("workflows.create_pull_requests") as push:
             resp = _bulk(db_state, OWNER, repo="someone-else/private-repo")
 
         assert resp.status_code == 400
@@ -362,91 +361,36 @@ class TestAdoptingGithubVersionIsAlsoGuarded:
         assert resp.status_code == 200, resp.text
 
 
-class TestStaleWriteProtection:
-    """The data-loss case: drift computed at SHA A, someone pushes a fix (SHA B),
-    the user then clicks Restore Directly from the stale page."""
+class TestOnlyPullRequestsFixDrift:
+    """Restoring drift by committing straight to a branch was removed: every fix is a pull request."""
 
-    def _run_push(self, expected_sha, live_sha, content_matches=False):
-        """Drive the real _direct_push_workflow_to_branch against a faked GitHub."""
-        from workflows import _direct_push_workflow_to_branch
+    def test_a_direct_restore_is_refused_and_nothing_is_written(self, db_state):
+        with patch("workflows.create_pull_requests") as push, patch("workflows.github_put") as put:
+            resp = _resolve(db_state, OWNER, mode="direct")
 
-        with patch("workflows._check_existing_workflow_content",
-                   return_value=(live_sha, content_matches)), \
-             patch("workflows.github_put") as put:
-            put.return_value.status_code = 200
-            put.return_value.json.return_value = {"content": {"sha": "sha-written"}}
-            result = _direct_push_workflow_to_branch(
-                "alice", "repo1", "main", ".github/workflows/ci.yml", "name: ci\n",
-                "msg", {}, OWNER, None, expected_sha=expected_sha,
-            )
-        return result, put
-
-    def test_stale_sha_refuses_the_push(self, db_state):
-        result, _put = self._run_push(expected_sha="sha-A", live_sha="sha-B")
-
-        assert result["status_code"] == 409
-        assert "changed since drift was checked" in result["error"]
-
-    def test_stale_sha_writes_nothing(self, db_state):
-        # The point of the guard: no commit is made when the file moved on.
-        _result, put = self._run_push(expected_sha="sha-A", live_sha="sha-B")
-
+        assert resp.status_code == 400
+        assert "pull request" in resp.json()["detail"]
+        push.assert_not_called()
         put.assert_not_called()
 
-    def test_stale_resolve_surfaces_409_at_the_endpoint(self, db_state):
-        # The helper reports the conflict; the endpoint turns it into a 409.
-        with patch("workflows._direct_push_workflow_to_branch",
-                   return_value={"status_code": 409,
-                                 "error": "ci.yml changed since drift was checked."}):
-            resp = _resolve(db_state, OWNER, expected_sha="sha-A")
+    def test_a_direct_bulk_restore_is_refused_and_nothing_is_written(self, db_state):
+        with patch("workflows.create_pull_requests") as push, patch("workflows.github_put") as put:
+            resp = _bulk(db_state, OWNER, mode="direct")
 
-        assert resp.status_code == 409
-        assert "changed since drift was checked" in resp.json()["detail"]
-
-    def test_matching_sha_allows_the_push(self, db_state):
-        result, put = self._run_push(expected_sha="sha-A", live_sha="sha-A")
-
-        assert result["status_code"] == 200
-        put.assert_called_once()
-
-    def test_omitted_expectation_preserves_previous_behaviour(self, db_state):
-        # Optional by design, so existing callers keep working.
-        result, put = self._run_push(expected_sha=None, live_sha="sha-B")
-
-        assert result["status_code"] == 200
-        put.assert_called_once()
-
-    def test_identical_content_is_not_pushed_twice(self, db_state):
-        # Double-submit used to create a second empty-diff commit.
-        result, put = self._run_push(expected_sha="sha-A", live_sha="sha-A", content_matches=True)
-
-        assert result["status_code"] == 200
-        assert result.get("unchanged") is True
+        assert resp.status_code == 400
+        push.assert_not_called()
         put.assert_not_called()
 
-    def test_stale_item_fails_only_its_own_row_in_bulk(self, db_state):
-        with patch("workflows._direct_push_workflow_to_branch",
-                   return_value={"status_code": 409,
-                                 "error": "ci.yml changed since drift was checked."}):
-            resp = client.post(
-                f"/api/projects/{db_state['project_id']}/drift/bulk-resolve",
-                json={
-                    "resolution": "restore_actionsmanager",
-                    "delivery_mode": "direct",
-                    "items": [{
-                        "workflow_id": db_state["workflow_id"],
-                        "repo": "alice/repo1",
-                        "branch": "main",
-                        "expected_github_sha": "sha-A",
-                    }],
-                },
-                headers=_as(OWNER),
-            )
+    def test_a_restore_pull_request_carries_only_the_drifted_workflow(self, db_state):
+        with patch("workflows.create_pull_requests", return_value={"prs_created": 1}) as push:
+            resp = _resolve(db_state, OWNER)
 
         assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["success"] is False
-        assert "changed since drift was checked" in body["results"][0]["message"]
+        campaign = push.call_args.args[0]
+        # Not None, which would also carry every locally changed custom file.
+        assert (campaign.selected_repos, campaign.selected_custom_file_ids, campaign.include_codeowners) == (
+            ["alice/repo1"], [], False,
+        )
 
 
 class TestSaveWorkflowsRequiresEditor:

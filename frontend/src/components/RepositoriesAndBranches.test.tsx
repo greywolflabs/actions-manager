@@ -3,11 +3,16 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import RepositoriesAndBranches from "./RepositoriesAndBranches";
 import { fetchRepos } from "../api/repos";
+import { fetchTakenRepos } from "../api/managedFiles";
 
 import type { Mock } from 'vitest';
 // Mock the API
 vi.mock("../api/repos", () => ({
   fetchRepos: vi.fn(),
+}));
+
+vi.mock("../api/managedFiles", () => ({
+  fetchTakenRepos: vi.fn(),
 }));
 
 // Mock child components to isolate tests
@@ -21,9 +26,13 @@ vi.mock("./RepositoryBranchSelector", () => ({
   default: function MockRepositoryBranchSelector({
     availableRepositories,
     visibilityScope,
+    unavailableRepos,
   }: any) {
     return (
       <div data-testid="repository-branch-selector">
+        <div data-testid="unavailable-repos">
+          {[...(unavailableRepos ?? new Map()).entries()].map(([name, reason]: [string, string]) => `${name}: ${reason}`).join("; ")}
+        </div>
         <div data-testid="visibility-scope">{visibilityScope || "none"}</div>
         <div data-testid="available-repos-count">
           {availableRepositories.length}
@@ -63,6 +72,61 @@ describe("RepositoriesAndBranches", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     (fetchRepos as Mock).mockResolvedValue([]);
+  });
+
+  describe("a Managed Files project (#2367)", () => {
+    const repos = [
+      { id: 1, name: "api", full_name: "org/api", private: false },
+      { id: 2, name: "web", full_name: "org/web", private: false },
+    ];
+
+    it("locks the repositories another project of its kind uses, excluding itself", async () => {
+      (fetchTakenRepos as Mock).mockResolvedValue({ "org/api": { project_id: 9, project_name: "Payments" } });
+
+      render(<RepositoriesAndBranches {...defaultProps} repos={repos} fileKind="codeowners" />);
+
+      await waitFor(() => expect(screen.getByTestId("unavailable-repos")).toHaveTextContent("org/api: Used by Payments"));
+      expect(fetchTakenRepos).toHaveBeenCalledWith("codeowners", ["org/api", "org/web"], 1);
+      expect(screen.queryByText("Validation Repository")).not.toBeInTheDocument();
+      expect(screen.getByText("These repositories receive the project's file during PR Campaigns.")).toBeInTheDocument();
+    });
+
+    it("says so when it cannot tell which repositories are used", async () => {
+      (fetchTakenRepos as Mock).mockRejectedValue(new Error("boom"));
+
+      render(<RepositoriesAndBranches {...defaultProps} repos={repos} fileKind="codeowners" />);
+
+      expect(await screen.findByTestId("repos-taken-error"))
+        .toHaveTextContent("Couldn't check which repositories other projects use.");
+    });
+
+    it("asks again after a save, not as repositories are ticked", async () => {
+      (fetchTakenRepos as Mock).mockResolvedValue({});
+      const { rerender } = render(
+        <RepositoriesAndBranches {...defaultProps} repos={repos} fileKind="codeowners" repoConfigRefreshSignal={0} />,
+      );
+      await waitFor(() => expect(fetchTakenRepos).toHaveBeenCalledTimes(1));
+
+      rerender(
+        <RepositoriesAndBranches
+          {...defaultProps} repos={repos} fileKind="codeowners" repoConfigRefreshSignal={0} selectedRepos={["org/web"]}
+        />,
+      );
+      rerender(
+        <RepositoriesAndBranches
+          {...defaultProps} repos={repos} fileKind="codeowners" repoConfigRefreshSignal={1} selectedRepos={["org/web"]}
+        />,
+      );
+
+      await waitFor(() => expect(fetchTakenRepos).toHaveBeenCalledTimes(2));
+    });
+
+    it("a workflow project asks nothing and keeps its validation repository", () => {
+      render(<RepositoriesAndBranches {...defaultProps} repos={repos} />);
+
+      expect(fetchTakenRepos).not.toHaveBeenCalled();
+      expect(screen.getByText("Validation Repository")).toBeInTheDocument();
+    });
   });
 
   describe("Visibility Scope Filtering", () => {

@@ -11,11 +11,11 @@ Roles (highest → lowest):
 """
 
 from fastapi import Depends, HTTPException, Request, status
-from sqlalchemy import func, or_, text
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from database import get_db as _get_db
+from database import get_db as _get_db, serialize_writers
 from models import Account, Project, WorkspaceMember, ProjectMembership, SEED_ACCOUNT_GITHUB_USER
 
 # Ordered from lowest to highest privilege
@@ -35,13 +35,9 @@ FIRST_MEMBER_LOCK_ID = 1465
 
 
 def lock_first_member_decision(db: Session) -> None:
-    """Serialize the count-then-write on PostgreSQL, so two concurrent callers
-    can't both observe an empty workspace and both act on it. SQLite serializes
-    writes natively, so the call is a no-op there (raised and ignored)."""
-    try:
-        db.execute(text(f"SELECT pg_advisory_xact_lock({FIRST_MEMBER_LOCK_ID})"))
-    except Exception:
-        pass
+    """Serialize the count-then-write, so two concurrent callers can't both
+    observe an empty workspace and both act on it."""
+    serialize_writers(db, FIRST_MEMBER_LOCK_ID)
 
 
 def workspace_is_uninitialized(db: Session) -> bool:

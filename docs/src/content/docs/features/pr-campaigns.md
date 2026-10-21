@@ -35,7 +35,7 @@ PR campaigns are the recommended delivery method for rolling out workflow change
 ActionsManager creates a pull request in each repository using the configured GitHub token. All PRs share the same title, description, and branch name for consistency.
 
 A campaign does not have to cover the whole project. Adding a repository to a project offers a
-campaign [scoped to just that repository](projects.html#adding-a-repository-to-a-project-that-already-has-workflows),
+campaign [scoped to just that repository](projects.html#adding-a-repository-to-a-project-that-already-has-files),
 so the repositories already in sync are left alone.
 
 Starting a campaign requires **editor** access to the project. A campaign commits
@@ -120,6 +120,8 @@ A repository is flagged **not invertible**, and no pull request is opened for it
 - the campaign renamed a file, or touched something that is not a UTF-8 text file.
 
 Flagged repositories stay visible in the preview with the reason, rather than being silently skipped. The inverse is recomputed when you confirm, so a repository that changed between preview and confirmation is reported as skipped rather than overwritten.
+
+A rollback of a Caller or Reusable Workflow Project's campaign never changes a CODEOWNERS file, which [Managed Files](managed-files.html) manages now. The preview names each one it leaves as it is, and a pull request that changed nothing else has nothing to roll back.
 
 ## Preflight Validation
 

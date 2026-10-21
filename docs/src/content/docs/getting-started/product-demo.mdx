@@ -18,13 +18,13 @@ This cut has no sound; a caption names each chapter as it starts. For a narrated
 
 ## What's in the video
 
-The demo rolls one workflow out to three Node.js repositories, `payments-service`, `payments-worker` and `checkout-web`:
+The demo rolls one workflow out to three Node.js repositories, `node-api`, `node-worker` and `node-web`:
 
 1. **Sign in with a personal access token** (0:00): paste a fine-grained or classic PAT on the sign-in screen.
-2. **Create a Caller Workflow Project** (0:10): name it **Payments Platform**, pick the three repositories, choose prefix mode and set the project key **PAY**.
-3. **Detect the build type** (0:32): add a workflow called `build-and-test`. ActionsManager detects Node.js (npm) in all three repositories, so one workflow fits the whole project. Picking Node.js (npm) starts the workflow from that template, and it is committed locally as a draft.
-4. **Open pull requests across repositories** (0:48): one PR campaign opens PRs #41, #42 and #43, one per repository, each adding `AM_PAY_build-and-test.yml` on the `actions-manager/payments-platform` branch.
-5. **Review and merge** (1:07): **Merge Open PRs** merges all three from the campaign, which moves to **Completed Campaigns**.
+2. **Create a Caller Workflow Project** (0:10): name it **NodeBuilds**, pick the three repositories, choose prefix mode and set the project key **NODE**.
+3. **Detect the build type** (0:31): add a workflow called `build-and-test`. ActionsManager detects Node.js (npm) in all three repositories, so one workflow fits the whole project. Picking Node.js (npm) starts the workflow from that template, and it is committed locally as a draft.
+4. **Open pull requests across repositories** (0:47): one PR campaign opens PRs #41, #42 and #43, one per repository, each adding `AM_NODE_build-and-test.yml` on the `actions-manager/nodebuilds` branch.
+5. **Review and merge** (1:06): **Merge Open PRs** merges all three from the campaign, which moves to **Completed Campaigns**.
 
 :::note
 Never expose a Personal Access Token in recordings, screenshots, shell history, documentation, or committed files. The token typed in this demo is a placeholder. PAT authentication happens only between your browser and your own ActionsManager instance.

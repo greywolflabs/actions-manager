@@ -26,8 +26,6 @@ from workflows import (  # noqa: E402
     _update_project_workflow,
     _handle_adopt_local_only,
     _get_target_repos_for_sync,
-    _handle_sync_direct_push,
-    _direct_push_workflow_to_branch,
     _handle_sync_pr_mode,
     _handle_adopt_project_and_sync,
     AdoptGithubVersionRequest,
@@ -140,6 +138,23 @@ class TestValidateAdoptGithubRequest:
         with pytest.raises(HTTPException) as exc_info:
             _validate_adopt_github_request(db_session, payload, "unknownuser")
         assert exc_info.value.status_code == 401
+
+    @pytest.mark.parametrize("delivery_mode", ["direct", "invalid"])
+    def test_anything_but_a_pull_request_is_refused_before_anything_is_adopted(
+        self, db_session, test_data, delivery_mode,
+    ):
+        """Drift is fixed only through pull requests; refused up front, so nothing is half-adopted."""
+        payload = AdoptGithubVersionRequest(
+            project_id=test_data["project"].project_id,
+            workflow_id=test_data["workflow"].workflow_id,
+            repo_id=test_data["repo1"].repo_id,
+            branch="main",
+            resolution_mode=ADOPT_PROJECT_AND_SYNC,
+            delivery_mode=delivery_mode,
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_adopt_github_request(db_session, payload, "testuser")
+        assert exc_info.value.status_code == 400
 
     def test_invalid_resolution_mode_raises_400(self, db_session, test_data):
         """Test that invalid resolution mode raises 400."""
@@ -424,201 +439,11 @@ class TestHandleAdoptProjectAndSync:
             target_repo_ids=[],
         )
         result = _handle_adopt_project_and_sync(
-            db_session, payload, test_data["project"], test_data["workflow"],
-            test_data["repo1"], [], "AM_TEST_ci.yml", "content", "token", "testuser",
+            db_session, payload, test_data["project"], test_data["workflow"], test_data["repo1"], [], "testuser",
         )
         assert result["success"] is True
         assert result["new_drift_status"] == "synced"
         assert result["affected_repos"] == []
-
-    def test_invalid_delivery_mode_raises_400(self, db_session, test_data):
-        """Test that invalid delivery mode raises 400."""
-        payload = AdoptGithubVersionRequest(
-            project_id=test_data["project"].project_id,
-            workflow_id=test_data["workflow"].workflow_id,
-            repo_id=test_data["repo1"].repo_id,
-            resolution_mode=ADOPT_PROJECT_AND_SYNC,
-            delivery_mode="invalid",
-        )
-        with pytest.raises(HTTPException) as exc_info:
-            _handle_adopt_project_and_sync(
-                db_session, payload, test_data["project"], test_data["workflow"],
-                test_data["repo1"], [test_data["repo2"]], "AM_TEST_ci.yml",
-                "content", "token", "testuser",
-            )
-        assert exc_info.value.status_code == 400
-
-
-class TestHandleSyncDirectPush:
-    """Direct-mode adopt-and-sync delivers where the project delivers (#2301, #2302)."""
-
-    def _add_repo(self, db, project, name):
-        repo = Repo(repo_name=name)
-        db.add(repo)
-        db.commit()
-        db.add(ProjectRepo(project_id=project.project_id, repo_id=repo.repo_id))
-        db.commit()
-        return repo
-
-    def _sync(self, db, data, targets, push, clear=None):
-        pushed, cleared = [], []
-
-        def fake_push(owner, repo, branch, *_args, **_kwargs):
-            pushed.append((f"{owner}/{repo}", branch))
-            return push(f"{owner}/{repo}", branch)
-
-        def fake_clear(_db, _project, _kind, _workflow_id, repo, branch):
-            cleared.append((repo, branch))
-            if clear:
-                clear(repo, branch)
-
-        with patch("workflows._direct_push_workflow_to_branch", side_effect=fake_push), \
-             patch("workflows.clear_drift", side_effect=fake_clear):
-            result = _handle_sync_direct_push(
-                db, data["project"], data["workflow"], data["repo1"], targets,
-                "AM_TEST_ci.yml", "name: ci", "token", "testuser",
-            )
-        return result, pushed, cleared
-
-    def test_pushes_to_every_branch_the_project_delivers_to(self, db_session, test_data):
-        project = test_data["project"]
-        project.branch_option = "pattern"
-        project.branch_regex = "release/.*"
-        project.pr_state = "open"
-        db_session.commit()
-
-        def branches(_owner, _repo, option, regex, *_args, **_kwargs):
-            assert (option, regex) == ("pattern", "release/.*")
-            return ["release/1.x", "release/2.x"]
-
-        with patch("workflows._resolve_branches_for_repo", side_effect=branches), \
-             patch("workflows.get_default_branch", side_effect=AssertionError("read the default branch")):
-            result, pushed, cleared = self._sync(
-                db_session, test_data, [test_data["repo2"]],
-                lambda _repo, _branch: {"status_code": 201, "sha": "sha-new"},
-            )
-
-        expected = [("owner/repo2", "release/1.x"), ("owner/repo2", "release/2.x")]
-        assert pushed == expected
-        assert cleared == expected
-        assert result["success"] is True
-        assert [(e["repo"], e["branch"], e["status"]) for e in result["sync_results"]["repos"]] == [
-            ("owner/repo2", "release/1.x", "synced"), ("owner/repo2", "release/2.x", "synced"),
-        ]
-        assert project.pr_state == "synced"
-
-    def test_a_default_branch_project_still_pushes_to_its_default_branch(self, db_session, test_data):
-        with patch("workflows.get_default_branch", return_value="trunk"):
-            result, pushed, cleared = self._sync(
-                db_session, test_data, [test_data["repo2"]],
-                lambda _repo, _branch: {"status_code": 200, "sha": "sha-new"},
-            )
-
-        assert pushed == cleared == [("owner/repo2", "trunk")]
-        assert result["success"] is True
-
-    def test_a_later_failure_keeps_what_earlier_targets_did(self, db_session, test_data):
-        """#2302: repo2 is written and its drift cleared, then repo3 hits the rate limit."""
-        project, workflow, repo2 = test_data["project"], test_data["workflow"], test_data["repo2"]
-        repo3 = self._add_repo(db_session, project, "owner/repo3")
-        record_drift(db_session, workflow, repo2.repo_name, "main")
-
-        def push(repo, _branch):
-            if repo == "owner/repo3":
-                raise RateLimitExceeded("API rate limit exceeded. Limit resets at 2026-10-08T07:00:00")
-            return {"status_code": 201, "sha": "sha-new"}
-
-        with patch("workflows.get_default_branch", return_value="main"), \
-             patch("workflows._direct_push_workflow_to_branch",
-                   side_effect=lambda owner, repo, *_a, **_k: push(f"{owner}/{repo}", None)):
-            result = _handle_sync_direct_push(
-                db_session, project, workflow, test_data["repo1"], [repo2, repo3],
-                "AM_TEST_ci.yml", "name: ci", "token", "testuser",
-            )
-
-        assert result["success"] is False
-        by_repo = {e["repo"]: e for e in result["sync_results"]["repos"]}
-        assert by_repo["owner/repo2"]["status"] == "synced"
-        assert by_repo["owner/repo3"]["status"] == "failed"
-        assert by_repo["owner/repo3"]["error"] == "API rate limit exceeded. Limit resets at 2026-10-08T07:00:00"
-        # The UI shows only the message, so it has to say which target failed and why.
-        assert "owner/repo3@main: API rate limit exceeded. Limit resets at 2026-10-08T07:00:00" in result["message"]
-        assert project.pr_state == "draft"
-        db_session.expire_all()
-        state = db_session.query(FileDelivery).filter_by(repo_id=repo2.repo_id).one()
-        assert state.has_drift is False  # repo3's rollback did not undo repo2's clear
-
-    def test_a_drift_clear_failing_does_not_stop_the_sync(self, db_session, test_data):
-        repo3 = self._add_repo(db_session, test_data["project"], "owner/repo3")
-
-        def clear(repo, _branch):
-            if repo == "owner/repo2":
-                raise RuntimeError("database is locked")
-
-        with patch("workflows.get_default_branch", return_value="main"):
-            result, pushed, _cleared = self._sync(
-                db_session, test_data, [test_data["repo2"], repo3],
-                lambda _repo, _branch: {"status_code": 201, "sha": "sha-new"}, clear=clear,
-            )
-
-        assert pushed == [("owner/repo2", "main"), ("owner/repo3", "main")]
-        assert result["success"] is True
-        assert [e["status"] for e in result["sync_results"]["repos"]] == ["synced", "synced"]
-
-    def test_a_repository_override_decides_its_branches(self, db_session, test_data):
-        """The point of resolving through the delivery path: a repo's own branch config wins."""
-        assoc = db_session.query(ProjectRepo).filter_by(repo_id=test_data["repo2"].repo_id).one()
-        assoc.branch_config_mode = "override"
-        assoc.branch_option = "pattern"
-        assoc.branch_regex = "hotfix/.*"
-        db_session.commit()
-
-        def branches(_owner, _repo, option, regex, *_args, **_kwargs):
-            assert (option, regex) == ("pattern", "hotfix/.*")
-            return ["hotfix/42"]
-
-        with patch("workflows._resolve_branches_for_repo", side_effect=branches):
-            _result, pushed, _cleared = self._sync(
-                db_session, test_data, [test_data["repo2"]],
-                lambda _repo, _branch: {"status_code": 201, "sha": "sha-new"},
-            )
-
-        assert pushed == [("owner/repo2", "hotfix/42")]
-
-    def test_the_branch_is_encoded_when_reading_the_existing_file(self):
-        """A pattern can match a branch like release/1.0+hotfix; unencoded, '+' reads as a space."""
-        with patch("workflows._check_existing_workflow_content", return_value=(None, False)) as check, \
-             patch("workflows.github_put") as put:
-            put.return_value.status_code = 201
-            put.return_value.json.return_value = {"content": {"sha": "sha-new"}}
-            _direct_push_workflow_to_branch(
-                "owner", "repo2", "release/1.0+hotfix", ".github/workflows/ci.yml", "name: ci",
-                "msg", {}, "testuser", None,
-            )
-
-        assert check.call_args[0][0].endswith("?ref=release%2F1.0%2Bhotfix")
-        assert put.call_args.kwargs["json"]["branch"] == "release/1.0+hotfix"
-
-    def test_a_repo_whose_branches_cannot_be_resolved_is_reported(self, db_session, test_data):
-        repo3 = self._add_repo(db_session, test_data["project"], "owner/repo3")
-
-        def default_branch(owner, repo, *_args, **_kwargs):
-            if repo == "repo2":
-                raise DriftCheckUnavailable("GitHub returned 403 resolving the default branch of owner/repo2", 403)
-            return "main"
-
-        with patch("workflows.get_default_branch", side_effect=default_branch):
-            result, pushed, _cleared = self._sync(
-                db_session, test_data, [test_data["repo2"], repo3],
-                lambda _repo, _branch: {"status_code": 201, "sha": "sha-new"},
-            )
-
-        assert pushed == [("owner/repo3", "main")]
-        assert result["sync_results"]["repos"][0] == {
-            "repo": "owner/repo2", "branch": None, "status": "failed", "github_sha": None,
-            "error": "Failed to resolve branches: GitHub returned 403 resolving the default branch of owner/repo2",
-        }
-        assert result["success"] is False
 
 
 class TestFetchGithubContentAndAffectedRepos:

@@ -257,6 +257,7 @@ def test_a_change_on_github_after_delivery_is_drift_there(db, project, github):
     assert _drifted(summary) == [(REPO_A, "main")]
     detail = summary["drifted_custom_files"][0]
     assert detail["custom_file_id"] == cf.id
+    assert detail["file_id"] == cf.id  # named as every drift row names its file
     assert detail["file_path"] == PATH
     assert detail["deleted_in_github"] is False
     assert detail["github_sha"] == blob_sha(CHANGED)

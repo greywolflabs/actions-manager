@@ -74,7 +74,8 @@ vi.mock("./components/RulesetManager", () => ({ default: function C() { return <
 vi.mock("./components/CodeownersManager", () => ({ default: function C() { return <div data-testid="codeowners" />; } }));
 vi.mock("./components/UserAvatar", () => ({ default: function C() { return <div data-testid="user-avatar" />; } }));
 vi.mock("./components/PlanUsagePill", () => ({ default: function C() { return null; } }));
-vi.mock("./components/BrandLogo", () => ({ default: function C() { return null; } }));
+// The app header's tabs need a real router, and this file mocks react-router.
+vi.mock("./components/AppHeader", () => import("./test/appHeaderStub"));
 vi.mock("./components/SaveResultsModal", () => ({ default: function C() { return null; } }));
 vi.mock("./components/DeleteProjectModal", () => ({ default: function C() { return null; } }));
 vi.mock("./components/DangerZone", () => ({ default: function C() { return null; } }));

@@ -268,7 +268,7 @@ describe('OnboardingTour', () => {
   });
 
   test('points at the project card when the user backs out to the dashboard', () => {
-    // Real recovery case: pressing "Back to Projects" mid-tour previously left
+    // Real recovery case: leaving the project mid-tour previously left
     // the user with a callout naming a control that was nowhere on screen.
     tour.demoProjectName = 'Demo-Project-2';
     const card = document.createElement('div');

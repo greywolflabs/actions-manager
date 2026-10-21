@@ -30,6 +30,7 @@ vi.mock(
 
 vi.mock("./api/projects", () => ({
   __esModule: true,
+  fetchPendingDelivery: vi.fn().mockResolvedValue({ pending_delivery_repos: [], pending_delivery_known: true }),
   fetchProjects: vi.fn(),
   loadProject: vi.fn(),
   updateProjectName: vi.fn(),
@@ -137,11 +138,8 @@ vi.mock("./components/PlanUsagePill", () => ({
   },
 }));
 
-vi.mock("./components/BrandLogo", () => ({
-  default: function BrandLogo() {
-    return null;
-  },
-}));
+// The app header's tabs need a real router, and this file mocks react-router.
+vi.mock("./components/AppHeader", () => import("./test/appHeaderStub"));
 
 vi.mock("./components/SaveResultsModal", () => ({
   default: function SaveResultsModal() {
@@ -210,7 +208,13 @@ vi.mock("./api/customFiles", async (importOriginal) => ({
 
 vi.mock("./components/PRStatusPanel", () => ({ default: () => null }));
 vi.mock("./components/PRHistoryPanel", () => ({ default: () => null }));
-vi.mock("./components/CreatePRModal", () => ({ default: () => null }));
+let capturedPRModalProps: any = null;
+vi.mock("./components/CreatePRModal", () => ({
+  default: (props: any) => {
+    capturedPRModalProps = props;
+    return null;
+  },
+}));
 vi.mock("./components/LinkedWorkflowsModal", () => ({ default: () => null }));
 vi.mock("./components/ProjectColorSelector", () => ({ default: () => null }));
 
@@ -298,6 +302,7 @@ const scriptRow = () => screen.getByTestId("custom-file-row");
 describe("ProjectMgmt – adopting a custom file's GitHub copy clears its drift without a refresh", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    capturedPRModalProps = null;
     mockUseParams.mockReturnValue({ user: "alice", projectName: "proj-a" });
     (fetchProjects as Mock).mockResolvedValue([]);
     (loadProject as Mock).mockResolvedValue(project);
@@ -347,5 +352,62 @@ describe("ProjectMgmt – adopting a custom file's GitHub copy clears its drift 
     // The same editor, still showing what was saved.
     expect(screen.getByTestId("file-content-input")).toBe(editor);
     expect(editor).toHaveValue(GITHUB_COPY);
+  });
+
+  test("Use GitHub Version in Review Drift saves the file, and the review, the banner and the row clear without a refresh", async () => {
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId("review-drift-button")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("review-drift-button"));
+    fireEvent.click(await screen.findByRole("button", { name: /View Diff/i }));
+    expect(await screen.findByText("echo hotfix")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Use GitHub Version/i }));
+    // The save resolves the drift on the server.
+    (getProjectDrift as Mock).mockResolvedValue(summary([]));
+    fireEvent.click(await screen.findByRole("button", { name: "Use GitHub version" }));
+
+    await waitFor(() => expect(updateCustomFile).toHaveBeenCalledWith(42, 9, { file_content: GITHUB_COPY }));
+    expect(await screen.findByText(/All drift resolved/)).toBeInTheDocument();
+    await waitFor(() => expect(within(scriptRow()).queryByTestId("drift-badge")).not.toBeInTheDocument());
+    expect(loadProject).toHaveBeenCalledTimes(1);
+  });
+
+  test("Keep ActionsManager version in the file's banner opens a campaign carrying only that file", async () => {
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId("drift-banner")).toBeInTheDocument());
+    fireEvent.click(scriptRow());
+    const banner = await screen.findByTestId("custom-file-drift-banner");
+
+    fireEvent.click(within(banner).getByRole("button", { name: "Keep ActionsManager version" }));
+
+    await waitFor(() => expect(capturedPRModalProps).not.toBeNull());
+    expect(capturedPRModalProps.repositories).toEqual([{ name: "acme/proj-a" }]);
+    expect(capturedPRModalProps.initialSelection).toEqual({
+      workflows: [], reusableWorkflows: [], customFileIds: [9], codeowners: false,
+    });
+    expect(updateCustomFile).not.toHaveBeenCalled();
+  });
+
+  test("using the GitHub version of several files saves none when one changed on GitHub since the check", async () => {
+    const lintScript = { ...buildScript, id: 10, file_path: "scripts/lint.sh" };
+    (loadProject as Mock).mockResolvedValue({ ...project, custom_files: [buildScript, lintScript], drifted_custom_file_ids: [9, 10] });
+    (getProjectDrift as Mock).mockResolvedValue(summary([
+      driftedScript, { ...driftedScript, custom_file_id: 10, file_path: "scripts/lint.sh" },
+    ]));
+    (getCustomFileOnGitHub as Mock).mockImplementation(async (_projectId: number, id: number) => ({
+      repo_id: 1, repo_name: "acme/proj-a", branch: "main",
+      // The lint script moved on after the check recorded "b…b".
+      github: { exists: true, content: GITHUB_COPY, sha: id === 10 ? "c".repeat(40) : "b".repeat(40), path: "x" },
+    }));
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId("review-drift-button")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("review-drift-button"));
+
+    fireEvent.click(await screen.findByTestId("select-all-drifts"));
+    fireEvent.click(screen.getByTestId("bulk-use-github-button"));
+    fireEvent.click(await screen.findByRole("button", { name: "Use GitHub version" }));
+
+    expect(await screen.findByText(/scripts\/lint\.sh in acme\/proj-a @ main changed since drift was checked/)).toBeInTheDocument();
+    expect(updateCustomFile).not.toHaveBeenCalled();
   });
 });

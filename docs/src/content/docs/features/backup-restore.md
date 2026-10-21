@@ -113,6 +113,10 @@ Every restore validates integrity and version compatibility *before* changing an
 the data in a single transaction, and then runs any migrations the archive predates. A rejected
 archive leaves the installation exactly as it was.
 
+Restoring a backup taken before [Managed Files](managed-files.html) removes the CODEOWNERS files its
+Caller and Reusable Workflow Projects kept, and any custom file at a CODEOWNERS path, as upgrading
+does. The files in your repositories are not touched.
+
 :::caution
 A backup taken on 1.13.0-beta.1 or earlier can fail to restore on a later version if a project
 had CODEOWNERS in more than one repository, and the failed restore is rolled back. Keep the

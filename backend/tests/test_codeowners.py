@@ -148,9 +148,11 @@ class TestCodeowners:
         viewer = Account(github_user=VIEWER, github_email="v@example.com", account_type="free")
         self.db.add_all([owner, viewer])
         self.db.flush()
+        # Only a CODEOWNERS project in Managed Files holds the file (#2367).
         self.project = Project(
             project_name=TEST_PROJECT, project_code="COX", user_id=owner.user_id,
             branch_option="default", pr_state="synced",
+            project_type="managed_files", file_kind="codeowners",
         )
         self.db.add(self.project)
         self.db.flush()
@@ -280,7 +282,12 @@ class TestCodeowners:
         assert self._record().status == "committed_locally"
 
     def test_an_unsupported_path_is_refused(self):
-        assert self._save("* @a\n", file_path="docs/CODEOWNERS").status_code == 400
+        assert self._save("* @a\n", file_path="src/CODEOWNERS").status_code == 400
+
+    def test_every_path_github_reads_is_accepted(self):
+        """The kind definition's paths, docs/CODEOWNERS included (#2367)."""
+        for path in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+            assert self._save("* @a\n", file_path=path).status_code == 200
 
     def test_a_viewer_reads_but_cannot_save(self, authenticate_client):
         self._add_record()
@@ -354,6 +361,16 @@ class TestCodeowners:
         assert summary["drift_count"] == 1
         assert summary["drift_status"] == "drifted"
         assert summary["drifted_codeowners"][0]["message"] == f"CODEOWNERS content differs between local and {REPO_A}"
+
+    def test_a_drift_row_names_the_file_it_is_about(self):
+        """The page acts on a CODEOWNERS row by its record, as it does on a workflow's by the workflow."""
+        self._delivered()
+        self.github.put(REPO_A, CHANGED)
+
+        live = self._check()["drifted_codeowners"]
+        stored = self._stored()["drifted_codeowners"]
+
+        assert [row["file_id"] for row in live + stored] == [self._record().id] * 2
 
     def test_moving_the_file_locally_is_not_drift(self):
         """A check reads the file where it was delivered: reading the new path

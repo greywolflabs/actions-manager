@@ -46,6 +46,7 @@ from workflows import (
     GITHUB_TIMEOUT_SECONDS,
 )
 from authorization import has_project_role
+from file_kinds import refuse_unless_accepted
 from error_detail import failure_kind
 
 router = APIRouter()
@@ -711,6 +712,7 @@ def import_workflows(
         raise HTTPException(status_code=400, detail="At least one workflow must be specified for import")
 
     destination = _resolve_import_destination(db, account, payload, project)
+    refuse_unless_accepted(destination, "workflows")
     redirected = destination.project_id != project.project_id
 
     headers = {

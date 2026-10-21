@@ -1490,8 +1490,16 @@ class TestUserNamedCampaigns:
         explicit_none = _campaign_pr_body(db_session, "CMP", TEST_USER, [], "main", None, None, None)
 
         assert without == explicit_none
-        assert without.startswith("This PR updates ActionsManager workflows for project **CMP**.")
+        # No workflow rides along, so the PR updates files (#2367).
+        assert without.startswith("This PR updates ActionsManager files for project **CMP**.")
         assert "##" not in without
+
+    def test_pr_body_names_workflows_only_when_it_carries_one(self, db_session):
+        _create_account_and_project(db_session)
+
+        with_workflow = _campaign_pr_body(db_session, "CMP", TEST_USER, ["ci.yml"], "main", None, None)
+
+        assert with_workflow.startswith("This PR updates ActionsManager workflows for project **CMP**.")
 
 
 class TestSnapshotTruthfulness:

@@ -7,11 +7,22 @@ import { toast } from '../utils/toast';
 import { guiToYaml } from '../utils/workflowGuiConversion';
 import * as yaml from 'js-yaml';
 
-// The list only needs to let a test select a workflow.
+// The list only needs to let a test select a workflow, and to show the
+// Managed Files link it was handed.
 vi.mock('./UnifiedWorkflowList', () => ({
-  default: function UnifiedWorkflowList({ unifiedWorkflows, handleSelectWorkflow, selectedWorkflowId }: any) {
+  default: function UnifiedWorkflowList({
+    unifiedWorkflows,
+    handleSelectWorkflow,
+    selectedWorkflowId,
+    onOpenManagedFiles,
+  }: any) {
     return (
       <div>
+        {onOpenManagedFiles && (
+          <button type="button" data-testid="open-managed-files" onClick={onOpenManagedFiles}>
+            Managed Files
+          </button>
+        )}
         {unifiedWorkflows.map((w: any) => (
           <button
             type="button"
@@ -94,7 +105,6 @@ vi.mock('./UnifiedWorkflowEditor', () => ({
 
 vi.mock('./WorkflowCreationDialog', () => ({ default: () => null }));
 vi.mock('./TemplateSelectionModal', () => ({ default: () => null }));
-vi.mock('./CodeownersManager', () => ({ default: () => null }));
 vi.mock('./CustomFiles', () => ({ CustomFilePanel: () => null }));
 
 vi.mock('../utils/toast', () => ({
@@ -531,5 +541,16 @@ describe('a save that changes a workflow\'s kind (#2318)', () => {
     unmount();
 
     expect(onRegister).toHaveBeenLastCalledWith(null);
+  });
+});
+
+describe('UnifiedWorkflows – where CODEOWNERS went (#2367)', () => {
+  test('hands the Managed Files link to the Project Files list', async () => {
+    const onOpenManagedFiles = vi.fn();
+    renderSubject({ onOpenManagedFiles });
+
+    await userEvent.setup().click(screen.getByTestId('open-managed-files'));
+
+    expect(onOpenManagedFiles).toHaveBeenCalledTimes(1);
   });
 });

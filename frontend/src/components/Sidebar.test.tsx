@@ -8,6 +8,51 @@ import Sidebar from './Sidebar';
 const topLevelSections = ['Project Files', 'PR Campaigns', 'Build Metrics'];
 
 describe('Sidebar', () => {
+  describe('a Managed Files project (#2367)', () => {
+    const renderManaged = () => render(
+      <Sidebar
+        isWorkspaceAdmin
+        projectType="managed_files"
+        fileKind="codeowners"
+        fileKindLabel="CODEOWNERS"
+        projectName="Owners"
+        projectCode="OWN"
+        usePrefix
+        isCollapsed={false}
+      />,
+    );
+
+    test('names its one file, and has no build metrics or workflow configuration', () => {
+      renderManaged();
+
+      expect(screen.getByRole('button', { name: 'CODEOWNERS' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Project Files' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Build Metrics' })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Repositories & Branches/ })).toBeInTheDocument();
+      for (const label of ['Deploy Environments', 'Environment Variables', 'Environment Secrets', 'Environment Rulesets']) {
+        expect(screen.queryByRole('button', { name: label })).not.toBeInTheDocument();
+      }
+    });
+
+    test('keeps PR Campaigns and the Project Configs a project has', async () => {
+      renderManaged();
+      await userEvent.setup().click(screen.getByRole('button', { name: /Project Configs/i }));
+
+      expect(screen.getByRole('button', { name: 'PR Campaigns' })).toBeInTheDocument();
+      for (const label of ['Project Info', 'Project Members', 'Drift Detection', 'Export Config', 'Danger Zone']) {
+        expect(screen.getByRole('button', { name: label })).toBeInTheDocument();
+      }
+    });
+
+    test('shows its type in neutral slate, and no naming mode', () => {
+      renderManaged();
+
+      const badge = screen.getByLabelText('Project type: Managed Files Project');
+      expect(badge).toHaveStyle({ color: '#94a3b8' });
+      expect(screen.queryByText(/Prefix/)).not.toBeInTheDocument();
+    });
+  });
+
   describe('Project Configs is workspace-admin only', () => {
     // This group manages the project itself — members, drift configuration,
     // export, deletion — rather than the work inside it. Editors and viewers
@@ -46,7 +91,7 @@ describe('Sidebar', () => {
 
   const user = userEvent.setup();
 
-  test('expanded vs collapsed header & project code display', () => {
+  test('expanded vs collapsed header & project code display, with no logo of its own', () => {
     const { rerender } = render(
       <Sidebar
         isWorkspaceAdmin
@@ -55,17 +100,15 @@ describe('Sidebar', () => {
       />
     );
 
-    // Expanded: full variant renders wordmark span with aria-label (img is decorative/aria-hidden)
-    expect(screen.getAllByLabelText('ActionsManager').length).toBeGreaterThan(0);
+    // The app header above the workspace carries the logo; the sidebar has none of its own.
+    expect(screen.queryByLabelText('ActionsManager')).not.toBeInTheDocument();
     expect(screen.getByText(/Project Key: PRJ/)).toBeInTheDocument();
 
     // Collapse
     rerender(<Sidebar isWorkspaceAdmin isCollapsed projectCode="PRJ" />);
 
-    // Collapsed: shield icon-only logo still rendered, project code shown but
-    // not the long "Project Key:" line
-    expect(screen.getAllByAltText('ActionsManager').length).toBeGreaterThan(0);
-    // Project code shown, but not the long "Project Key:" line
+    // Collapsed: no shield either; the project code shown, but not the long "Project Key:" line
+    expect(screen.queryByAltText('ActionsManager')).not.toBeInTheDocument();
     expect(screen.getByText('PRJ')).toBeInTheDocument();
     expect(screen.queryByText(/Project Key:/)).not.toBeInTheDocument();
   });
@@ -105,10 +148,11 @@ describe('Sidebar', () => {
     const collapseBtnExpanded = screen.getByTitle('Collapse sidebar');
     expect(collapseBtnExpanded).toBeInTheDocument();
 
-    // Lives in the sidebar header, next to the logo — not the old floating
-    // middle-edge control.
+    // Lives at the top of the sidebar — not the old floating middle-edge control.
     expect(container.querySelector('.sidebar-header .sidebar-collapse-button')).toBe(collapseBtnExpanded);
     expect(container.querySelector('.sidebar-toggle')).not.toBeInTheDocument();
+    // It is the sidebar's top strip itself, not a button on a row of its own.
+    expect(container.querySelector('.sidebar-header')?.firstElementChild).toBe(collapseBtnExpanded);
 
     await user.click(collapseBtnExpanded);
     expect(onToggleCollapse).toHaveBeenCalledTimes(1);

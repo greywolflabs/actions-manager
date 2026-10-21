@@ -9,7 +9,7 @@ import os
 import sqlite3
 from pathlib import Path
 from urllib.parse import quote_plus
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
@@ -177,6 +177,22 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 # Create tables if they don't exist
 Base.metadata.create_all(engine)
+
+
+def serialize_writers(db, lock_id: int) -> None:
+    """Let writers that pass the same *lock_id* through one at a time, until this transaction ends.
+
+    For a check-then-write that two requests must never both pass: whoever
+    holds the lock reads what the previous holder committed. PostgreSQL takes a
+    transaction-scoped advisory lock on *lock_id*. SQLite has no advisory locks
+    but runs one writer at a time, so a write that changes nothing takes that
+    lock now rather than at the transaction's first real write; it holds back
+    every writer, whatever its lock_id.
+    """
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id})
+    else:
+        db.execute(text("UPDATE repos SET repo_id = repo_id WHERE 1 = 0"))
 
 
 def get_db():

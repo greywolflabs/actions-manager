@@ -31,6 +31,7 @@ const invertibleTarget = {
   pr_url: 'https://github.com/acme/api/pull/42',
   workflow_names: 'ci',
   invertible: true,
+  left_alone: [],
   reason: null,
   files: [{ path: '.github/workflows/AM_RBK_ci.yml', action: 'restore', before: NEW_YAML, after: OLD_YAML }],
 };
@@ -42,6 +43,7 @@ const blockedTarget = {
   pr_url: 'https://github.com/acme/web/pull/43',
   workflow_names: 'ci',
   invertible: false,
+  left_alone: [],
   reason: '.github/workflows/AM_RBK_ci.yml changed on main after this campaign merged — rolling back would discard that change.',
   files: [],
 };
@@ -99,6 +101,19 @@ describe('RollbackCampaignModal', () => {
     expect(screen.getAllByTestId('rollback-target')).toHaveLength(2);
     expect(await screen.findByTestId('rollback-summary'))
       .toHaveTextContent('1 of 2 merged repositories');
+  });
+
+  test('says which changed file Managed Files keeps out of the rollback', async () => {
+    mockPreview.mockResolvedValue({
+      campaign_id: 7, campaign_name: 'Bump runners',
+      targets: [{ ...invertibleTarget, left_alone: ['.github/CODEOWNERS'] }], invertible_count: 1,
+    });
+
+    renderModal();
+
+    expect(await screen.findByTestId('rollback-left-alone'))
+      .toHaveTextContent('.github/CODEOWNERS is left as it is, because Managed Files manages it now.');
+    expect(screen.queryByTestId('rollback-reason')).not.toBeInTheDocument();
   });
 
   test('confirming is disabled when nothing can be inverted', async () => {

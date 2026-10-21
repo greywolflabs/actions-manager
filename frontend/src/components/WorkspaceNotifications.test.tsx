@@ -49,6 +49,12 @@ describe('WorkspaceNotifications Component', () => {
     expect(mockFetchSubscriptions).not.toHaveBeenCalled();
   });
 
+  test('lists every project to subscribe to, Managed Files ones included', async () => {
+    render(<WorkspaceNotifications currentUser="alice" currentUserRole="admin" />);
+
+    await waitFor(() => expect(mockFetchProjects).toHaveBeenCalledWith('alice', 'all'));
+  });
+
   test('admin sees the recipient input and send button', () => {
     render(<WorkspaceNotifications currentUserRole="admin" />);
     expect(screen.getAllByPlaceholderText(/recipient@example.com/i)[0]).toBeInTheDocument();

@@ -364,6 +364,7 @@ describe('ProjectList', () => {
     });
 
     test('shows the last drift check time on the card when it has been checked', () => {
+      const when = new Date('2024-03-05T12:30:00Z');
       renderProjectList({
         projects: [
           {
@@ -379,7 +380,7 @@ describe('ProjectList', () => {
       });
 
       expect(screen.getByTestId('project-drift-checked-1')).toHaveTextContent(
-        new Date('2024-03-05T12:30:00Z').toLocaleString(),
+        `Drift checked ${when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} at ${when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`,
       );
     });
 
@@ -705,23 +706,21 @@ describe('ProjectList', () => {
     expect(screen.queryByRole('button', { name: /Create RWX Repository/i })).not.toBeInTheDocument();
   });
 
-  test('renders New Project and Managed Actions alongside the status pills, not the title row or toolbar', async () => {
+  test('renders New Project and the plan usage beside the heading, with the status pills on their own row', async () => {
     const onCreateProject = vi.fn();
-    renderProjectList({ onCreateProject });
+    renderProjectList({ onCreateProject, planUsage: <div data-testid="plan-usage-pill" /> });
 
+    const headingRow = screen.getByTestId('projects-heading-row');
     const newProjectButton = screen.getByTestId('new-project-button');
-    const managedActionsButton = screen.getByTestId('actions-projects-nav-button');
-    expect(newProjectButton).toBeInTheDocument();
-    expect(managedActionsButton).toBeInTheDocument();
-
-    expect(screen.getByRole('heading', { name: 'Projects' }).closest('div')).not.toContainElement(newProjectButton);
-    expect(screen.getByRole('heading', { name: 'Projects' }).closest('div')).not.toContainElement(managedActionsButton);
-    expect(within(screen.getByTestId('projects-toolbar')).queryByTestId('new-project-button')).not.toBeInTheDocument();
-    expect(within(screen.getByTestId('projects-toolbar')).queryByTestId('actions-projects-nav-button')).not.toBeInTheDocument();
+    expect(headingRow).toContainElement(screen.getByRole('heading', { name: 'Projects' }));
+    expect(headingRow).toContainElement(newProjectButton);
+    expect(headingRow).toContainElement(screen.getByTestId('plan-usage-pill'));
+    expect(newProjectButton.parentElement).toContainElement(screen.getByTestId('plan-usage-pill'));
 
     const statusPills = screen.getByRole('region', { name: /Project status summary/i });
-    expect(statusPills.parentElement).toContainElement(newProjectButton);
-    expect(statusPills.parentElement).toContainElement(managedActionsButton);
+    expect(headingRow).not.toContainElement(statusPills);
+    expect(statusPills).not.toContainElement(newProjectButton);
+    expect(within(screen.getByTestId('projects-toolbar')).queryByTestId('new-project-button')).not.toBeInTheDocument();
 
     await user.click(newProjectButton);
     expect(onCreateProject).toHaveBeenCalledTimes(1);
@@ -733,11 +732,85 @@ describe('ProjectList', () => {
     expect(screen.getByTestId('new-project-button')).toBeDisabled();
   });
 
-  test('Managed Actions navigates from its new location', async () => {
+  test('ends the grid with a dashed New project box that shows what the plan has left', async () => {
+    const onCreateProject = vi.fn();
+    renderProjectList({ onCreateProject, newProjectRemaining: '2 of 3 remaining' });
+
+    const card = screen.getByTestId('projects-new-card');
+    expect(card).toHaveTextContent('New project');
+    expect(card).toHaveTextContent('2 of 3 remaining');
+    expect(card).toHaveClass('border-dashed');
+    expect(card.parentElement).toBe(screen.getByTestId('project-row-Alpha').parentElement);
+    expect(card.parentElement?.lastElementChild).toBe(card);
+
+    await user.click(card);
+    expect(onCreateProject).toHaveBeenCalledTimes(1);
+  });
+
+  test('a card shows status beside the menu in the header, with the type as plain text under the name', () => {
     renderProjectList();
 
-    await user.click(screen.getByTestId('actions-projects-nav-button'));
-    expect(mockNavigate).toHaveBeenCalledWith('/project/alice/actions-projects');
+    const row = screen.getByTestId('project-row-Alpha');
+    const status = within(row).getByTestId('project-status-1');
+    const type = within(row).getByLabelText(/^Project type:/);
+    const name = within(row).getByText('Alpha');
+    expect(type).toHaveTextContent(/Caller Workflow Project/);
+    expect(type.previousElementSibling).toBe(name);
+    // Same header row as the actions menu, and not in the body below the divider.
+    expect(status.parentElement).toContainElement(within(row).getByRole('button', { name: /actions|menu|more/i }));
+  });
+
+  test('a card shows repository visibility and naming mode as plain icon text', () => {
+    renderProjectList({
+      projects: [
+        { id: 1, project_name: 'Priv', project_code: 'PR', updated_at: '2024-01-01T00:00:00Z', repository_visibility_scope: 'private', use_prefix: false },
+      ],
+    });
+
+    const scope = screen.getByTestId('project-scope-1');
+    expect(scope).toHaveTextContent('Private repos');
+    expect(scope).toHaveTextContent('No prefix');
+  });
+
+  test('the drag handle is in the card but hidden until hover or focus', () => {
+    renderProjectList();
+
+    const handle = screen.getByTestId('project-drag-handle-Alpha');
+    expect(handle).toHaveClass('opacity-0');
+    expect(handle).toHaveClass('group-hover:opacity-100');
+    expect(handle).toHaveClass('focus-visible:opacity-100');
+  });
+
+  test('the New project box has no remaining line when the plan has no limit', () => {
+    renderProjectList({ onCreateProject: vi.fn() });
+
+    expect(screen.getByTestId('projects-new-card')).not.toHaveTextContent('remaining');
+  });
+
+  test('the New project box is hidden at the plan limit, and without a way to create', () => {
+    renderProjectList({ onCreateProject: vi.fn(), isCreateProjectDisabled: true });
+    expect(screen.queryByTestId('projects-new-card')).not.toBeInTheDocument();
+  });
+
+  test('the New project box is hidden when the page cannot create projects', () => {
+    renderProjectList();
+    expect(screen.queryByTestId('projects-new-card')).not.toBeInTheDocument();
+  });
+
+  test('the New project box is the way in when there are no projects yet', () => {
+    renderProjectList({ projects: [], onCreateProject: vi.fn(), newProjectRemaining: '3 of 3 remaining' });
+
+    expect(screen.getByText('No saved projects yet.')).toBeInTheDocument();
+    expect(screen.getByTestId('projects-new-card')).toHaveTextContent('3 of 3 remaining');
+  });
+
+  // Managed Actions and Managed Files are tabs in the app header now (AppHeader.test.tsx).
+  test('the page has no Managed Actions or Managed Files buttons of its own', () => {
+    renderProjectList({ onCreateProject: vi.fn() });
+
+    expect(screen.queryByTestId('actions-projects-nav-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('managed-files-nav-button')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Managed (Actions|Files)/ })).not.toBeInTheDocument();
   });
 
   // --- Persistent manual ordering (issue #1804) ---
@@ -849,6 +922,7 @@ describe('ProjectList', () => {
       const grid = screen.getByTestId('project-row-Project01').parentElement;
       expect(grid).toHaveClass('grid');
       expect(grid).toHaveClass('sm:grid-cols-2');
+      expect(grid).toHaveClass('lg:grid-cols-3');
     });
   });
 });

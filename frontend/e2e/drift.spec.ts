@@ -22,7 +22,7 @@ import {
  *   2. Clean repos do not show the drift banner.
  *   3. Drift modal lists the affected repo and workflow.
  *   4. "Adopt GitHub Version" resolves drift and clears the banner.
- *   5. "Keep Local / Restore via PR" creates a PR and shows pr_pending state.
+ *   5. "Keep ActionsManager Version" opens a PR campaign carrying only that file.
  *   6. A failed resolution keeps the drift banner visible and shows an error.
  *   7. New workflows are not treated as drifted.
  */
@@ -385,9 +385,7 @@ test.describe("Drift resolution – Adopt GitHub version", () => {
     await page.getByTestId("review-drift-button").click();
     await expect(page.getByTestId("drift-modal")).toBeVisible();
 
-    // Click View Diff to expand a row, then try to resolve via direct restore.
-    // The "Restore ActionsManager Version (Direct)" button appears in the diff view
-    // when the adopt-github modal is not open. Click it and expect an error.
+    // Expand a row and use its GitHub version; the backend refuses it.
     await page.getByRole("button", { name: /View Diff/i }).first().click();
     await page.getByTestId("adopt-github-version-button").first().click();
 
@@ -405,19 +403,16 @@ test.describe("Drift resolution – Adopt GitHub version", () => {
 });
 
 test.describe("Drift resolution – workflow status badge stays in sync without reload", () => {
-  // Regression for: after "Create Fix Pull Request", the workflow status
-  // badge kept showing "Synced" until the page was reloaded, even though
-  // the backend had already moved workflow_status to "under_review". Root
-  // cause: DriftDetection only refreshed its own drift list afterward -
-  // ProjectMgmt.tsx's workflows/rxworkflows state (which the badge reads
-  // from) was never patched. Fixed via the onWorkflowStatusesChanged
-  // callback. These tests must NOT call page.goto/reload between the
+  // Regression for: after putting drift right with a pull request, the
+  // workflow status badge kept showing "Synced" until the page was reloaded,
+  // even though the backend had already moved workflow_status to
+  // "under_review". These tests must NOT call page.goto/reload between the
   // resolve action and the assertion - that's the whole point.
   test.beforeEach(async ({ page }) => {
     await seedAuthenticatedSession(page);
   });
 
-  test("status badge updates to Under Review immediately after creating a fix PR", async ({ page }) => {
+  test("keeping the ActionsManager version opens a campaign for only the workflow, and its badge moves to Under Review", async ({ page }) => {
     const project = makeProject({
       project_id: 1,
       project_name: "drift-pr-badge",
@@ -439,7 +434,6 @@ test.describe("Drift resolution – workflow status badge stays in sync without 
         },
       ],
     });
-    await mockResolveDrift(page, { responseState: "pr_pending" });
     await installApiMocks(page, createMockState({ projects: [project] }));
 
     await page.goto(`/project/${TEST_USER}/drift-pr-badge`);
@@ -457,68 +451,19 @@ test.describe("Drift resolution – workflow status badge stays in sync without 
     await page.getByTestId("review-drift-button").click();
     await expect(page.getByTestId("drift-modal")).toBeVisible();
     await page.getByRole("button", { name: /View Diff/i }).first().click();
-    await page.getByTestId("restore-pr-button").click();
+    // Drift is put right only through a pull request.
+    await expect(page.getByTestId("restore-direct-button")).toHaveCount(0);
+    await page.getByTestId("keep-actionsmanager-button").click();
 
-    await expect(page.getByTestId("drift-modal")).toContainText(/pull request/i, { timeout: 10_000 });
-    await page.getByRole("button", { name: "Cancel" }).click();
+    // The campaign modal replaces the review, carrying exactly this workflow to its repository.
     await expect(page.getByTestId("drift-modal")).toHaveCount(0);
+    const create = page.getByTestId("confirm-create-prs");
+    await expect(create).toHaveText(/Create 1 PR \(1 workflow\)/, { timeout: 10_000 });
+    await create.click();
+    await page.getByRole("button", { name: "Close" }).click();
 
     // No page.goto/reload between the action above and this assertion.
     await expect(page.getByTestId("workflow-status-badge").first()).toContainText(/Under Review/i, {
-      timeout: 10_000,
-    });
-  });
-
-  test("status badge updates to Synced immediately after Restore Directly", async ({ page }) => {
-    const project = makeProject({
-      project_id: 1,
-      project_name: "drift-direct-badge",
-      project_code: "DDRB",
-      selected_repos: [PHASE2_REPOS.SERVICE_A],
-      workflows: [
-        makeWorkflow({ name: PHASE2_WORKFLOWS.CI, workflowStatus: "under_review" }),
-      ],
-    });
-
-    await mockDriftResponse(page, {
-      driftedWorkflows: [
-        {
-          workflow_id: 1,
-          workflow_name: PHASE2_WORKFLOWS.CI,
-          workflow_filename: PHASE2_WORKFLOWS.CI,
-          repo: PHASE2_REPOS.SERVICE_A,
-          has_drift: true,
-        },
-      ],
-    });
-    await mockResolveDrift(page, { responseState: "synced" });
-    await installApiMocks(page, createMockState({ projects: [project] }));
-
-    await page.goto(`/project/${TEST_USER}/drift-direct-badge`);
-
-    // The status badge lives in the editor header; the Project Files row carries
-    // only a status dot. Select the workflow so the header is rendered.
-    await page.getByText(PHASE2_WORKFLOWS.CI, { exact: false }).first().click();
-
-    await expect(page.getByTestId("workflow-status-badge").first()).toContainText(/Under Review/i, {
-      timeout: 15_000,
-    });
-
-    await expect(page.getByTestId("drift-banner")).toBeVisible({ timeout: 15_000 });
-    await page.getByTestId("review-drift-button").click();
-    await expect(page.getByTestId("drift-modal")).toBeVisible();
-    await page.getByRole("button", { name: /View Diff/i }).first().click();
-    await page.getByTestId("restore-direct-button").click();
-    await page.getByRole("button", { name: "Overwrite directly" }).click();
-
-    await expect(page.getByTestId("drift-modal")).toContainText(/resolved|restored|success/i, {
-      timeout: 10_000,
-    });
-    await page.getByRole("button", { name: "Cancel" }).click();
-    await expect(page.getByTestId("drift-modal")).toHaveCount(0);
-
-    // No page.goto/reload between the action above and this assertion.
-    await expect(page.getByTestId("workflow-status-badge").first()).toContainText(/Synced/i, {
       timeout: 10_000,
     });
   });

@@ -10,7 +10,6 @@ import { useWorkflowSelectionLogic, GuiRefusal } from '../hooks/useWorkflowSelec
 import { useParentCallbacks } from '../hooks/useParentCallbacks';
 import { UnifiedWorkflowsProps, UnifiedWorkflowItem, RXWorkflow, Workflow } from '../types/workflow';
 import { CustomFilePanel } from './CustomFiles';
-import CodeownersManager from './CodeownersManager';
 import { CustomFile } from '../api/customFiles';
 import { toast } from '../utils/toast';
 import { planWorkflowKindMoves, type WorkflowKindChange } from '../utils/workflowKindChanges';
@@ -71,19 +70,15 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   onCustomFilesChange,
   customFileDrift = [],
   driftedCustomFileIds,
-  codeowners,
-  codeownersDrift = [],
-  onCodeownersSaved,
-  codeownersOpenRequested = false,
-  onCodeownersOpened,
+  onKeepCustomFile,
+  onOpenManagedFiles,
   importedActions = [],
   actionGroups = [],
   secrets = [],
   envVars = [],
 }) => {
-  // Project Files: custom file and codeowners selection
+  // Project Files: custom file selection
   const [selectedCustomFileId, setSelectedCustomFileId] = useState<number | null>(null);
-  const [codeownersSelected, setCodeownersSelected] = useState<boolean>(false);
   // -1 sentinel = "add new custom file" mode
   const ADD_CUSTOM_FILE_SENTINEL = -1;
 
@@ -129,22 +124,7 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   const handleSelectCustomFile = (id: number) => {
     setSelectedCustomFileId(id);
     state.setSelectedWorkflowId(null);
-    setCodeownersSelected(false);
   };
-
-  const handleSelectCodeowners = useCallback(() => {
-    setCodeownersSelected(true);
-    state.setSelectedWorkflowId(null);
-    setSelectedCustomFileId(null);
-  }, [state.setSelectedWorkflowId]);
-
-  // Asked for while this view may not have been mounted, so it is a flag the
-  // page clears once handled rather than a counter that only a change reveals.
-  useEffect(() => {
-    if (!codeownersOpenRequested) return;
-    handleSelectCodeowners();
-    onCodeownersOpened?.();
-  }, [codeownersOpenRequested, handleSelectCodeowners, onCodeownersOpened]);
   
   // Create unified workflow list
   const unifiedWorkflows: UnifiedWorkflowItem[] = [
@@ -248,7 +228,6 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   // YAML. Linked workflows are exempt: they only ever render as read-only YAML.
   const handleSelectWorkflow = (workflowId: string) => {
     setSelectedCustomFileId(null);
-    setCodeownersSelected(false);
     const refusal = _handleSelectWorkflow(workflowId);
     const isLinked = unifiedWorkflows.find(w => w.id === workflowId)?.type === 'linked';
     if (refusal && state.editMode === 'gui' && !isLinked) {
@@ -341,22 +320,7 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
           selectedRepos={selectedRepos}
           onReposDelivered={onReposDelivered}
           drift={customFileDrift.filter(d => d.custom_file_id === selectedCustomFileId)}
-        />
-      </div>
-    );
-  } else if (codeownersSelected) {
-    editorPanel = (
-      <div className="unified-workflows-editor overflow-auto">
-        <CodeownersManager
-          user={user}
-          projectName={projectName}
-          projectId={projectId ?? 0}
-          selectedRepos={selectedRepos}
-          isReadOnly={isReadOnly}
-          codeowners={codeowners ?? null}
-          drift={codeownersDrift}
-          onSaved={onCodeownersSaved}
-          onReposDelivered={onReposDelivered}
+          onKeepActionsManagerVersion={onKeepCustomFile}
         />
       </div>
     );
@@ -397,7 +361,7 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
 
   return (
     <div className="unified-workflows-container">
-      {/* Unified file list on the left — workflows + custom files + CODEOWNERS */}
+      {/* Unified file list on the left — workflows + custom files */}
       <UnifiedWorkflowList
         unifiedWorkflows={unifiedWorkflows}
         selectedWorkflowId={state.selectedWorkflowId}
@@ -414,10 +378,7 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
         selectedCustomFileId={selectedCustomFileId}
         onSelectCustomFile={handleSelectCustomFile}
         driftedCustomFileIds={driftedCustomFileIds}
-        codeowners={codeowners}
-        codeownersSelected={codeownersSelected}
-        codeownersDrifted={codeownersDrift.length > 0}
-        onSelectCodeowners={handleSelectCodeowners}
+        onOpenManagedFiles={onOpenManagedFiles}
       />
 
       {editorPanel}
@@ -435,7 +396,6 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
         existingWorkflowNames={[...workflows.map(workflow => workflow.name), ...rxworkflows.map(workflow => workflow.name)]}
         selectedRepos={selectedRepos}
         onAddCustomFile={() => handleSelectCustomFile(ADD_CUSTOM_FILE_SENTINEL)}
-        onSelectCodeowners={handleSelectCodeowners}
         setShowWorkflowCreationDialog={state.setShowWorkflowCreationDialog}
         selectWorkflowType={operations.selectWorkflowType}
         onLinkReusableWorkflow={onLinkReusableWorkflow}

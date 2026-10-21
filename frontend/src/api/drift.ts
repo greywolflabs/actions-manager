@@ -49,6 +49,8 @@ export interface WorkflowDriftDetail {
 
 /** The project's CODEOWNERS on one (repo, branch) where it drifted. */
 export interface CodeownersDriftDetail {
+  /** The drifted file's record: the CODEOWNERS record, or the custom file. */
+  file_id?: number | null;
   file_path: string;
   repo: string;
   repo_id?: number | null;
@@ -101,7 +103,8 @@ export interface ProjectDriftSummary {
 }
 
 export type DriftResolution = "use_github" | "restore_actionsmanager";
-export type DriftDeliveryMode = "pr" | "direct";
+/** Drift is put right only through a pull request: the server refuses anything else. */
+export type DriftDeliveryMode = "pr";
 
 export interface ResolveDriftRequest {
   github_user: string;
@@ -110,9 +113,9 @@ export interface ResolveDriftRequest {
   resolution: DriftResolution;
   delivery_mode?: DriftDeliveryMode;
   /**
-   * The GitHub blob SHA this decision was based on. The backend refuses a
-   * direct push with 409 if GitHub has moved on since, so a stale drift view
-   * can't silently revert someone else's fix.
+   * The GitHub blob SHA this decision was based on. The backend refuses to
+   * use GitHub's version with 409 if GitHub has moved on since, so a stale
+   * drift view can't adopt content the user never saw.
    */
   expected_github_sha?: string | null;
 }

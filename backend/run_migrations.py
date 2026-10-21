@@ -81,6 +81,9 @@ MIGRATION_SCRIPTS = [
     # After the record and its backfill, whose missing paths it fills.
     "migrate_pin_delivered_paths.py",              # Records where each backfilled delivery is, so a rename removes the old copy there; then drops workflows.renamed_from
     "migrate_add_projects_user_id_index.py",       # Indexes projects by owner and next drift check, for every per-owner lookup (issue #2346); after next_drift_check_at exists
+    "migrate_add_project_file_kind.py",            # Adds projects.file_kind, the file a Managed Files project manages (#2367)
+    # After file_kind, which tells a Managed Files project's CODEOWNERS from the rest.
+    "migrate_remove_workflow_project_codeowners.py",  # Deletes CODEOWNERS from Caller and Reusable Workflow Projects (#2367)
     # Must stay last: purges rows orphaned while SQLite foreign keys were
     # disabled, so every table it cleans has to exist by the time it runs.
     "migrate_add_project_workflow_unique.py",      # Enforces one project per workflow (drift hardening PR 4)

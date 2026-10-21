@@ -74,11 +74,11 @@ export default function ActionsProjectDetail({
   };
 
   if (!project) {
-    return <div className="w-full max-w-3xl mx-auto px-6 lg:px-8" data-testid="actions-project-detail-loading" />;
+    return <div className="w-full max-w-3xl" data-testid="actions-project-detail-loading" />;
   }
 
   return (
-    <div className="w-full max-w-3xl mx-auto px-6 lg:px-8" data-testid="actions-project-detail">
+    <div className="w-full max-w-3xl" data-testid="actions-project-detail">
       <div className="mb-6">
         <p className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-slate-400">
           {project.owner}/{project.repo} · {project.yaml_path}

@@ -238,8 +238,8 @@ const DeleteProjectModal: React.FC<DeleteProjectModalProps> = ({
 
           <FileChoice label={KEEP_FILES_LABEL} selected={!removing} onSelect={() => setRemoveFiles(false)}>
             <p>
-              ActionsManager deletes the project now and stops managing it. Its workflows, reusable workflows, custom
-              files and CODEOWNERS stay in your repositories as they are.
+              ActionsManager deletes the project now and stops managing it. The files it delivered stay in your
+              repositories as they are.
             </p>
           </FileChoice>
 

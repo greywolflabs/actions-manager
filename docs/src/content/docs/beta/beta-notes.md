@@ -27,6 +27,7 @@ The following limits apply during the self-hosted beta:
 |---|---|
 | Caller Workflow Projects | 4 |
 | Reusable Workflow Projects | 2 |
+| Managed Files projects | 3 |
 | Secrets per project | 6 |
 | Environment variables per project | 6 |
 | GitHub environments per project | 6 |

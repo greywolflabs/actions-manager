@@ -240,23 +240,6 @@ def test_a_target_never_delivered_to_removes_nothing(db, project):
                                       _path("ci-v2")) is None
 
 
-def test_a_direct_write_removes_the_delivered_copy_from_the_target_branch(db, github, project):
-    """No campaign branch: a direct sync writes the new path to main, removes the old one there, then records it."""
-    _workflow(db, project, "ci")
-    _deliver(db, github, project, APP)
-    _rename(db, project, "ci", "ci2")
-    workflow = db.query(Workflow).filter_by(workflow_name="ci2").one()
-
-    with patch("workflows._direct_push_workflow_to_branch", return_value={"status_code": 201, "sha": "pushed"}), \
-            patch("workflows.github_get", side_effect=github.get), \
-            patch("workflows.requests.delete", side_effect=github.delete):
-        entry = wf._direct_sync_to_branch(db, project, workflow, APP, "main", _path("ci2"), CONTENT, "sync", {}, USER)
-
-    assert (entry["status"], entry["error"]) == ("synced", None)
-    assert github.deletes == [(APP, "main", _path("ci"))]
-    assert deliveries.delivered_path(db, deliveries.WORKFLOW, workflow.workflow_id, APP, "main") == _path("ci2")
-
-
 def test_adopting_github_s_copy_after_a_local_rename_reads_it_where_it_was_delivered(db, github, project):
     """Drift after a local rename is reported at the delivered path, so Keep GitHub
     version reads it there, and the rename still waits for a campaign: marking it

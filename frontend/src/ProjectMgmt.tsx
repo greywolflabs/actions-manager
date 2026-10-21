@@ -1,10 +1,9 @@
 /* eslint-disable no-restricted-syntax, no-restricted-imports -- Legacy: TODO migrate inline styles and CSS imports to Tailwind CSS classes */
-import UserAvatar from "./components/UserAvatar";
 import PlanUsagePill from "./components/PlanUsagePill";
-import BrandLogo from "./components/BrandLogo";
+import { AppHeader, AppPage, type PrimarySection } from "./components/AppHeader";
 import { useParams, useNavigate, useLocation, Link } from "react-router";
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { fetchProjects, loadProject, Project, linkReusableWorkflow, RwxWorkflow, LinkedStandardProject, updateProjectColor, updateProjectDriftConfig, updateProjectName, updateProjectOrder, exportProjectBackup } from "./api/projects";
+import { fetchPendingDelivery, fetchProjects, loadProject, Project, linkReusableWorkflow, RwxWorkflow, LinkedStandardProject, updateProjectColor, updateProjectDriftConfig, updateProjectName, updateProjectOrder, exportProjectBackup, type ProjectTypeValue } from "./api/projects";
 import { fetchDriftSettings, formatDriftInterval, DriftSettings, DEFAULT_DRIFT_SETTINGS, DRIFT_INTERVAL_OPTIONS } from "./api/driftSettings";
 import { deleteProjectEnhanced, deletionErrorMessage, type DeleteProjectOptions, type EnhancedDeletionResult } from "./api/projectDeletion";
 import { campaignReusableWorkflows } from "./utils/campaignReusableWorkflows";
@@ -18,7 +17,7 @@ import EnvVars from "./components/EnvVars";
 import Secrets from "./components/Secrets";
 import UnifiedWorkflows from "./components/UnifiedWorkflows";
 import RulesetManager from "./components/RulesetManager";
-import type { CustomFile } from "./api/customFiles";
+import { hasLocalChange, updateCustomFile, type CustomFile } from "./api/customFiles";
 import { listActionsProjects, ActionsProject } from "./api/actionsProjects";
 import { listActionGroups, ActionGroup } from "./api/actionGroups";
 import ProjectList from "./components/ProjectList";
@@ -34,15 +33,18 @@ import Sidebar from "./components/Sidebar";
 import PRStatusPanel from "./components/PRStatusPanel";
 import PRHistoryPanel from "./components/PRHistoryPanel";
 import BuildMetricsPanel from "./components/BuildMetricsPanel";
-import CreatePRModal from "./components/CreatePRModal";
+import CreatePRModal, { type CampaignSelection } from "./components/CreatePRModal";
 import LinkedWorkflowsModal from "./components/LinkedWorkflowsModal";
 import ProjectColorSelector from "./components/ProjectColorSelector";
 import { WorkflowImportPanel } from "./components/WorkflowImportPanel";
 import { getProjectTypeConfig, ProjectType } from "./utils/projectTypeConfig";
+import { FILE_KIND_UI } from "./utils/fileKinds";
+import { useFileKind } from "./hooks/useFileKind";
 import { getPrefixModeConfig, projectKeyFixedNote } from "./utils/prefixModeConfig";
 import { normalizeProjectColorKey, type ProjectColorKey } from "./utils/projectColors";
 import { getProjectPRStatus } from "./api/pullRequests";
-import { getProjectCodeowners, type CodeownersRecord } from "./api/codeowners";
+import { getProjectCodeowners, saveProjectCodeowners, type CodeownersRecord } from "./api/codeowners";
+import { campaignSelectionOf, fileGithubCopy, oneRowPerFile, type DriftRow } from "./utils/driftRows";
 import type { GitHubTokenStatus, Plan } from "./api/user";
 import { ProjectPRState } from "./types/workflow";
 import "./styles/projectMgmt.css";
@@ -86,6 +88,7 @@ const VALID_PROJECT_PR_STATES = new Set<ProjectPRState>(["new", "draft", "open",
 
 // The PR status's project_state once a refresh found the last removal PR merged.
 const PROJECT_DELETED_STATE = "deleted";
+const managedFilesPath = (user: string | undefined): string => `/project/${user}/managed-files`;
 const PROJECT_DELETED_NOTICE = "Project deleted: its removal pull requests merged.";
 
 /** The server's reason when the project the page asked for is gone (a 404), else null. */
@@ -276,9 +279,41 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   const [seededDriftNames, setSeededDriftNames] = useState<string[]>([]);
   const [driftRefreshSignal, setDriftRefreshSignal] = useState<number>(0);
   const refreshDrift = useCallback(() => setDriftRefreshSignal(prev => prev + 1), []);
-  // Project repos that have never received any of the project's workflows,
-  // from the server so the reminder survives a reload.
+  // Project repos that have never received any of the project's files, from
+  // the server so the reminder survives a reload.
   const [pendingDeliveryRepos, setPendingDeliveryRepos] = useState<string[]>([]);
+  // Bumped by every write to the list, so a re-read that resolves after a
+  // later save, load or campaign does not overwrite what that one set.
+  const pendingDeliveryVersionRef = useRef<number>(0);
+  const takePendingDeliveryRepos = useCallback((next: string[]): void => {
+    pendingDeliveryVersionRef.current += 1;
+    setPendingDeliveryRepos(next);
+  }, []);
+  // Called once a campaign, a push onto its PR, a CODEOWNERS save, or a pull
+  // request settling has resolved. Each can change which repos are waiting for
+  // delivery without its response saying so: a PR carrying only the CODEOWNERS
+  // leaves a repo waiting for the project's workflows, a closed one puts its
+  // repo back, and a project's first CODEOWNERS starts the wait.
+  // Read through a ref so the callback stays stable (loadPRStatus depends on it,
+  // and the page load re-runs whenever loadPRStatus changes), set with the id
+  // so a call later in the same load already sees it.
+  const pendingDeliveryProjectRef = useRef<string | number>("");
+  const takeProjectId = useCallback((id: string | number): void => {
+    pendingDeliveryProjectRef.current = id;
+    setProjectId(id);
+  }, []);
+  const refreshPendingDelivery = useCallback((): void => {
+    const id = pendingDeliveryProjectRef.current;
+    if (!id) return;
+    const version = ++pendingDeliveryVersionRef.current;
+    fetchPendingDelivery(id)
+      .then((result) => {
+        if (version === pendingDeliveryVersionRef.current) {
+          setPendingDeliveryRepos(result.pending_delivery_repos ?? []);
+        }
+      })
+      .catch((error) => console.error("❌ Could not refresh the repositories waiting for delivery:", error));
+  }, []);
 
   const driftedWorkflowNames = useMemo(
     () => new Set(driftDetails.map(d => d.workflow_name)),
@@ -306,12 +341,15 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     () => new Set(customFileDrift ? customFileDrift.map(d => d.custom_file_id) : seededCustomFileDriftIds),
     [customFileDrift, seededCustomFileDriftIds],
   );
-  // Set by the drift panel; the Project Files view opens the editor and clears it.
-  const [codeownersOpenRequested, setCodeownersOpenRequested] = useState<boolean>(false);
+  // CODEOWNERS or a custom file changed on GitHub: the live check's answer once
+  // it has loaded (it sets both lists together), the project fetch's until then.
+  const hasFileDrift = useMemo(() => (
+    (customFileDrift === null ? seededCodeownersDrift : codeownersDrift.length > 0) || driftedCustomFileIds.size > 0
+  ), [customFileDrift, codeownersDrift, seededCodeownersDrift, driftedCustomFileIds]);
 
   // New state for enhanced deletion modal
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState<boolean>(false);
-  const [driftDialogInfo, setDriftDialogInfo] = useState<{ label: string; onConfirm: () => void } | null>(null);
+  const [driftDialogInfo, setDriftDialogInfo] = useState<{ label: string; onConfirm: () => void; includesFiles: boolean } | null>(null);
   const [pendingRename, setPendingRename] = useState<string | null>(null);
   
   // Progress bar state for save operations
@@ -341,6 +379,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   const [newRepoDeliveryPrompt, setNewRepoDeliveryPrompt] = useState<string[] | null>(null);
   // Narrows the PR campaign modal to specific repos. Null = every project repo.
   const [prModalRepoScope, setPrModalRepoScope] = useState<string[] | null>(null);
+  // The exact files the campaign modal starts with, when it is opened to put drift right. Null = its defaults.
+  const [prModalSelection, setPrModalSelection] = useState<CampaignSelection | null>(null);
   // Bumped after a save so the branch-override panel refetches. It cannot key
   // off selectedRepos alone: that changes when a repo is ticked, before the save.
   const [repoConfigRefreshSignal, setRepoConfigRefreshSignal] = useState<number>(0);
@@ -351,8 +391,36 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   // State for prefix usage setting
   const [usePrefix, setUsePrefix] = useState<boolean>(true);
 
-  // State for project type (standard or rwx)
-  const [projectType, setProjectType] = useState<ProjectType>("standard");
+  // State for project type (standard, rwx or managed_files)
+  const [projectType, setProjectType] = useState<ProjectTypeValue>("standard");
+  // The same, for handleProjectGone, which keeps one identity across loads (the
+  // load depends on it) and can run before a render shows the loaded type.
+  const projectTypeRef = useRef<ProjectTypeValue>("standard");
+  const navigateRef = useRef(navigate);
+  useEffect(() => { navigateRef.current = navigate; }, [navigate]);
+  const takeProjectType = useCallback((next: ProjectTypeValue): void => {
+    projectTypeRef.current = next;
+    setProjectType(next);
+  }, []);
+  // The file a Managed Files project manages; null for every other type.
+  const [fileKind, setFileKind] = useState<string | null>(null);
+  const { definition: fileKindDefinition, failed: fileKindFailed, retry: retryFileKind } = useFileKind(fileKind);
+  const typeConfig = getProjectTypeConfig(projectType);
+  // What a waiting repo waits for, as the server counts it: the workflows, or
+  // for a Managed Files project, its file, named by its kind once that loads.
+  const deliverableNoun = workflows.length > 0 || rxworkflows.length > 0
+    ? "workflows"
+    : fileKindDefinition?.label ?? "file";
+  // Where the project's files are edited, as the sidebar names it.
+  const filesSectionLabel = typeConfig.holdsWorkflows ? "Project Files" : deliverableNoun;
+  // What the workflow components see. A Managed Files project holds no
+  // workflows, so it never renders them (typeConfig.holdsWorkflows).
+  const workflowProjectType: ProjectType = projectType === "rwx" ? "rwx" : "standard";
+  // The list a project belongs to: the Managed Files section lists its own (#2367).
+  // The header marks the same section current while the project is open.
+  const isManagedFilesProject = projectType === "managed_files";
+  const projectsListPath = isManagedFilesProject ? managedFilesPath(user) : `/project/${user}`;
+  const projectSection: PrimarySection = isManagedFilesProject ? "managed-files" : "projects";
 
   // Saved backend repository visibility scope for the loaded project
   // ("public" | "private"). Defaults to "public" to match the backend default
@@ -428,6 +496,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   // Bumped when the server may have changed the CODEOWNERS file's status (a
   // campaign carrying it, or its PRs merging or closing).
   const [codeownersRefreshCounter, setCodeownersRefreshCounter] = useState<number>(0);
+  // Set when the file could not be read: a Managed Files project's editor says so.
+  const [codeownersLoadFailed, setCodeownersLoadFailed] = useState<boolean>(false);
 
   // State for the caller's effective project role (from backend)
   const [callerProjectRole, setCallerProjectRole] = useState<string>("project_admin");
@@ -713,7 +783,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     setRegexPattern("");
     setBranchOption("default");
     setProjectCode("");
-    setProjectId("");
+    takeProjectId("");
     setSecrets([]);
     setEnvVars([]);
     setManualEnvVars([]);
@@ -721,8 +791,9 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     setDeploymentEnvironments([]);
     setReusableWorkflowsEnabled(false);
     setLinkedWorkflows([]);
+    setFileKind(null);
     setActiveSection('workflows');
-  }, []);
+  }, [takeProjectId]);
 
   // The project this page shows no longer exists: deleted here, or its last
   // removal pull request merged. Leave it for the list, which no longer has it.
@@ -730,6 +801,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     if (notice) toast.info(notice);
     resetProjectState();
     if (user) fetchProjects(user).then(setProjects);
+    // A Managed Files project goes back to its own section, which lists them.
+    if (projectTypeRef.current === "managed_files") navigateRef.current(managedFilesPath(user));
   }, [user, resetProjectState]);
 
   // Function to load PR status for the current project
@@ -795,6 +868,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           setCustomFiles((prev: any[]) => prev.map((f: any) =>
             f.file_status === 'under_review' ? { ...f, file_status: 'committed_locally' } : f
           ));
+          // The load's list predates this settle: a closed PR's repos wait again.
+          refreshPendingDelivery();
           console.log('✅ PRs closed without merge: Under Review badges reverted to committed_locally');
         }
       } else {
@@ -849,7 +924,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
       // Set to default state on error
       setProjectPRState("new");
     }
-  }, [user, handleProjectGone]);
+  }, [user, handleProjectGone, refreshPendingDelivery]);
 
   // Function to refresh projects list
   const refreshProjectsList = useCallback(async (): Promise<void> => {
@@ -903,7 +978,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         setSeededCodeownersDrift(Boolean(response.codeowners_drifted));
         setSeededCustomFileDriftIds(response.drifted_custom_file_ids ?? []);
         setCustomFileDrift(null);
-        setPendingDeliveryRepos(response.pending_delivery_repos ?? []);
+        takePendingDeliveryRepos(response.pending_delivery_repos ?? []);
         setDriftDetails(
           (response.drifted_workflow_names ?? []).map((name): WorkflowDriftDetail => ({
             workflow_id: 0,
@@ -943,12 +1018,12 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         });
         
         setProjectCode(response.project_code ?? "");
-        setProjectId(response.project_id ?? "");
+        takeProjectId(response.project_id ?? "");
         setAccountType(response.account_type ?? null);
         setReusableWorkflowsEnabled(response.reusable_workflows_enabled ?? false);
         setUsePrefix(response.use_prefix ?? true);  // Default to true for backward compatibility
-        const loadedProjectType: ProjectType = (response.project_type ?? "standard") as ProjectType;
-        setProjectType(loadedProjectType);
+        takeProjectType(response.project_type ?? "standard");
+        setFileKind(response.file_kind ?? null);
         setRepositoryVisibilityScope(
           response.repository_visibility_scope === "private" ? "private" : "public",
         );
@@ -984,8 +1059,10 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           // Drift detection could be enabled here if needed
         }
 
-        const secretsPromises = (response.selected_repos ?? []).map((repo: string) => getSecrets(user, repo, response.project_name ?? ""));
-        const envVarsPromises = (response.selected_repos ?? []).map((repo: string) => getEnvVars(user, repo, response.project_name ?? ""));
+        // Both read GitHub per repository, for sections a Managed Files project has none of.
+        const settingsRepos = getProjectTypeConfig(response.project_type).holdsWorkflows ? (response.selected_repos ?? []) : [];
+        const secretsPromises = settingsRepos.map((repo: string) => getSecrets(user, repo, response.project_name ?? ""));
+        const envVarsPromises = settingsRepos.map((repo: string) => getEnvVars(user, repo, response.project_name ?? ""));
 
         const secretsResults = await Promise.all(secretsPromises);
         const envVarsResults = await Promise.all(envVarsPromises);
@@ -1040,13 +1117,16 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         throw error;
       }
     }
-  }, [user, navigate, loadPRStatus, handleProjectGone]);
+  }, [user, navigate, loadPRStatus, handleProjectGone, takeProjectId, takeProjectType]);
 
   const refreshProjectCampaignState = useCallback(async (refreshFromGitHub: boolean = false): Promise<void> => {
     if (!projectName) return;
     await loadProjectFromAPI(projectName, { throwOnError: true, refreshPRFromGitHub: refreshFromGitHub });
     await refreshProjectsList();
     setDriftRefreshSignal((current) => current + 1);
+    // A merge or close settles the CODEOWNERS file's status too: under review
+    // becomes synced, or committed locally again.
+    setCodeownersRefreshCounter((current) => current + 1);
   }, [loadProjectFromAPI, projectName, refreshProjectsList]);
 
   // Requests from this page name its project by id as well as by name, so a name
@@ -1065,13 +1145,15 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
       setProjectName(urlProjectName);
       loadProjectFromAPI(urlProjectName);
     } else {
-      // No project in the URL (e.g. user navigated back to the project list).
+      // No project in the URL: the header's tabs or logo, the browser's Back,
+      // or Restart tour left it. Every way out clears the project, so the next
+      // one opens fresh (on its files, with nothing left over from this one).
       // Incrementing the counter invalidates any in-flight loadProjectFromAPI call
-      // so it won't overwrite state after we clear projectName here.
+      // so it won't overwrite state after we clear it here.
       ++loadRequestCounterRef.current;
-      setProjectName("");
+      resetProjectState();
     }
-  }, [urlProjectName, loadProjectFromAPI]);
+  }, [urlProjectName, loadProjectFromAPI, resetProjectState]);
 
   // A response for a project the page has since left must not land on this one.
   const codeownersProjectRef = useRef<number>(0);
@@ -1080,12 +1162,24 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     if (codeownersProjectRef.current !== id) {
       codeownersProjectRef.current = id;
       setCodeowners(undefined);
+      setCodeownersLoadFailed(false);
     }
     if (!user || !id) return;
+    // Only a Managed Files project of the kind holds CODEOWNERS now (#2367).
+    if (typeConfig.holdsWorkflows) {
+      setCodeowners(null);
+      return;
+    }
     getProjectCodeowners(id)
-      .then((record) => { if (codeownersProjectRef.current === id) setCodeowners(record); })
-      .catch(() => {}); // best-effort; the row just shows no status
-  }, [user, projectId, codeownersRefreshCounter]);
+      .then((record) => {
+        if (codeownersProjectRef.current !== id) return;
+        setCodeowners(record);
+        setCodeownersLoadFailed(false);
+      })
+      // In a workflow project the file's row just shows no status; a Managed
+      // Files project's editor says the read failed instead of loading forever.
+      .catch(() => { if (codeownersProjectRef.current === id) setCodeownersLoadFailed(true); });
+  }, [user, projectId, codeownersRefreshCounter, typeConfig.holdsWorkflows]);
 
   useEffect(() => {
     if (user) {
@@ -1257,13 +1351,15 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
 
   // Shows a ConfirmDialog when there is drift; otherwise runs fn immediately.
   // Per the issue's safety rules, never silently overwrite GitHub changes.
-  const ifNotDrifted = useCallback((actionLabel: string, fn: () => void): void => {
-    if (driftDetails.length === 0) {
+  // A campaign also carries custom files and CODEOWNERS, so it passes
+  // includesFiles to be warned about their drift too.
+  const ifNotDrifted = useCallback((actionLabel: string, fn: () => void, includesFiles = false): void => {
+    if (driftDetails.length === 0 && !(includesFiles && hasFileDrift)) {
       fn();
       return;
     }
-    setDriftDialogInfo({ label: actionLabel, onConfirm: fn });
-  }, [driftDetails]);
+    setDriftDialogInfo({ label: actionLabel, onConfirm: fn, includesFiles });
+  }, [driftDetails, hasFileDrift]);
 
   // Helper function to validate project state before saving
   const validateProjectState = (): string | null => {
@@ -1345,8 +1441,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     // waiting (adding a project's first workflow makes every repo wait), so it
     // has to land without a refresh. The save computes that list *before* any
     // GitHub push, so on a push the repos just delivered to are cleared instead
-    // of replayed as still waiting; the next load corrects a partial push,
-    // exactly as it does after a campaign.
+    // of replayed as still waiting; the next load corrects a partial push.
     //
     // `pushedToGitHub` is unreachable today: this handler only runs from the
     // header save button, which renders only in a workflow section, where the
@@ -1354,7 +1449,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     // elsewhere, revisit the clear — handleWorkflowsUpdate only pushes
     // workflows whose isModified is set, so a secrets- or env-vars-only save
     // would deliver nothing while still clearing every reminder.
-    setPendingDeliveryRepos(pushedToGitHub ? [] : (result.pendingDeliveryRepos ?? []));
+    takePendingDeliveryRepos(pushedToGitHub ? [] : (result.pendingDeliveryRepos ?? []));
     setRepoConfigRefreshSignal((prev) => prev + 1);
     // Saving an edited workflow resolved its stored drift.
     refreshDrift();
@@ -1483,7 +1578,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   const handleGoToMain = (): void => {
     setIsSaveResultsModalOpen(false);
     resetProjectState();
-    navigate(`/project/${user}`);
+    navigate(projectsListPath);
   };
 
   // Callbacks for workflow functions
@@ -1576,14 +1671,21 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
       toast.error("Please select at least one repository");
       return;
     }
+    // Synced with nothing drifted: the button is on only for the repos waiting
+    // for delivery, so it opens the campaign for them, as the reminder does.
+    // That campaign overwrites no copy of a drifted file, so only workflow
+    // drift warns there.
+    const waitingOnly = projectPRState === 'synced' && !hasFileDrift && visiblePendingDeliveryRepos.length > 0;
+    const scope = waitingOnly ? visiblePendingDeliveryRepos : null;
     // Safety: opening a PR pushes local content to GitHub, which would silently
     // overwrite drifted workflows.  Confirm before proceeding.
     ifNotDrifted('Create Pull Requests', () => {
+      setPrModalRepoScope(scope);
       setShowCreatePRModal(true);
       // Fired here, not on the button, so it only counts once the modal is
       // really open — the drift guard can cancel this.
       tour.completed("create-campaign");
-    });
+    }, scope === null);
   };
 
   // Open the campaign modal narrowed to `repos` — the repositories a save just
@@ -1596,27 +1698,29 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     });
   };
 
+  // "Keep the ActionsManager version": the campaign modal with exactly the
+  // drifted files, to the repositories they drifted in. No drift warning:
+  // overwriting GitHub's change is what the user just chose.
+  const openCampaignToRestore = useCallback((repos: string[], selection: CampaignSelection): void => {
+    setPrModalRepoScope(repos);
+    setPrModalSelection(selection);
+    setShowCreatePRModal(true);
+  }, []);
+
   // Widens the campaign modal back to every project repo. Without this a scoped
   // campaign leaves the next header-launched one silently narrowed.
   const closeCreatePRModal = (): void => {
     setShowCreatePRModal(false);
     setPrModalRepoScope(null);
+    setPrModalSelection(null);
   };
 
-  // A repo an open PR now carries the project's workflows to stops "waiting for
-  // delivery" (the server applies the same rule).
-  const clearDeliveredRepos = useCallback((repos: string[]): void => {
-    const delivered = new Set(repos);
-    setPendingDeliveryRepos((prev) => prev.filter((repo) => !delivered.has(repo)));
-  }, []);
-
   // Function to handle successful PR creation
-  const handlePRCreationSuccess = (selectedWorkflowNames: string[], selectedReusableWorkflowNames: string[], selectedCustomFileIds: number[], includedCodeowners: boolean = false, targetedRepos: string[] = []): void => {
+  const handlePRCreationSuccess = (selectedWorkflowNames: string[], selectedReusableWorkflowNames: string[], selectedCustomFileIds: number[], includedCodeowners: boolean = false): void => {
     console.log("✅ PRs created successfully");
-    // Keyed on what the user left ticked, not on what the modal was offered: a
-    // repo they unticked gets no PR, and clearing it would drop its badge and
-    // count while it is genuinely still waiting.
-    clearDeliveredRepos(targetedRepos);
+    // The server's answer, not the repos the campaign targeted: one the user
+    // unticked, or one a PR reached with only a custom file, is still waiting.
+    refreshPendingDelivery();
     // Belt-and-braces alongside closeCreatePRModal: the campaign is delivered,
     // so nothing downstream should still be narrowed to one repo. Safe while the
     // modal is open — it shows results, not the repo picker, from here on.
@@ -1648,11 +1752,12 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         selectedRXSet.has(w.workflow_name) ? { ...w, workflowStatus: 'under_review' } : w
       ));
     }
-    // Mark selected custom files as under_review
+    // Mark selected custom files under_review, as the server does: only those
+    // with a local change. A synced one carried to put it back stays synced.
     if (selectedCustomFileIds.length > 0) {
       const selectedCFSet = new Set(selectedCustomFileIds);
       setCustomFiles((prev: CustomFile[]) => prev.map(f =>
-        selectedCFSet.has(f.id) ? { ...f, file_status: 'under_review' } : f
+        selectedCFSet.has(f.id) && hasLocalChange(f) ? { ...f, file_status: 'under_review' } : f
       ));
     }
     // The server locks the file under review once a PR carries it; reload it to show that.
@@ -1711,7 +1816,12 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
       ));
       setCodeownersRefreshCounter(prev => prev + 1);
     }
-  }, []);
+    // A merged pull request delivered its files; a closed one leaves its repos
+    // waiting again. Either changes the list the reminder shows.
+    if (normalizedState === 'synced' || normalizedState === 'draft') {
+      refreshPendingDelivery();
+    }
+  }, [refreshPendingDelivery]);
 
   // Function to open the PR Campaigns workspace
   // Every section change goes through here, so the tour sees the PR Campaigns
@@ -1731,6 +1841,25 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   // Function to render the content based on active section
   // Helper function to render the project list when no project is selected
   const renderProjectList = (): React.ReactElement => {
+    const limits = userDetails?.plan?.limits;
+    const callerCount = projects.filter(p => (p.project_type ?? "standard") === "standard").length;
+    const rwxCount = projects.filter(p => p.project_type === "rwx").length;
+    const perType = limits?.caller_projects != null && limits?.reusable_projects != null;
+    // Unknown until the plan loads (or if the user fetch failed): leave it
+    // to the backend, which refuses a project over the limit, rather than
+    // disabling the button until a reload.
+    let createProjectDisabled = false;
+    if (projects.length > 0 && limits) {
+      createProjectDisabled = perType
+        // Disable only when BOTH per-type limits are reached
+        ? callerCount >= limits.caller_projects! && rwxCount >= limits.reusable_projects!
+        : limits.projects !== null && projects.length >= limits.projects;
+    }
+    // One total across both project types, e.g. "2 of 3 remaining".
+    const totalLimit = perType ? limits!.caller_projects! + limits!.reusable_projects! : limits?.projects ?? null;
+    const newProjectRemaining = totalLimit === null
+      ? null
+      : `${Math.max(totalLimit - projects.length, 0)} of ${totalLimit} remaining`;
     return (
       <ProjectList
         user={user}
@@ -1738,21 +1867,16 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         onReorder={handleProjectsReorder}
         reorderError={projectOrderError}
         onCreateProject={() => navigate(`/project/${user}/new`)}
-        isCreateProjectDisabled={(() => {
-          if (projects.length === 0) return false;
-          const limits = userDetails?.plan?.limits;
-          // Unknown until the plan loads (or if the user fetch failed): leave it
-          // to the backend, which refuses a project over the limit, rather than
-          // disabling the button until a reload.
-          if (!limits) return false;
-          if (limits.caller_projects !== null && limits.reusable_projects !== null) {
-            // Disable only when BOTH per-type limits are reached
-            const callerCount = projects.filter(p => (p.project_type ?? "standard") === "standard").length;
-            const rwxCount = projects.filter(p => p.project_type === "rwx").length;
-            return callerCount >= limits.caller_projects && rwxCount >= limits.reusable_projects;
-          }
-          return limits.projects !== null && projects.length >= limits.projects;
-        })()}
+        planUsage={userDetails && (
+          <PlanUsagePill
+            plan={userDetails.plan}
+            projectsUsed={projects.length}
+            callerProjectsUsed={projects.filter(p => (p.project_type ?? "standard") === "standard").length}
+            rwxProjectsUsed={projects.filter(p => p.project_type === "rwx").length}
+          />
+        )}
+        isCreateProjectDisabled={createProjectDisabled}
+        newProjectRemaining={newProjectRemaining}
       />
     );
   };
@@ -1793,8 +1917,80 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     );
   };
 
+  // Called once a custom file's save, removal or restore has resolved, which
+  // can resolve or drop its stored drift: re-read it so the list, the editor
+  // and the banner stop reporting it now.
+  const applyCustomFilesChange = (updated: CustomFile[]): void => {
+    setCustomFiles(updated);
+    refreshDrift();
+    const hasLocalChanges = updated.some(hasLocalChange);
+    if (hasLocalChanges && (projectPRState === 'new' || projectPRState === 'synced')) {
+      setProjectPRState('draft');
+    }
+  };
+
+  // "Keep the ActionsManager version" of drifted files: the campaign modal
+  // with exactly those files, to the repositories they drifted in.
+  const keepActionsManagerVersion = (rows: DriftRow[]): void => {
+    const reusable = new Set([
+      ...rxworkflows.map((w) => w.name),
+      ...workflows.filter((w) => w.isReusable).map((w) => w.name),
+    ]);
+    openCampaignToRestore([...new Set(rows.map((row) => row.repo))], campaignSelectionOf(rows, reusable));
+  };
+
+  // The left side of a custom file's or the CODEOWNERS file's drift diff.
+  const driftContentOf = (row: DriftRow): string | null => (row.kind === "codeowners"
+    ? codeowners?.content ?? null
+    : customFiles.find((f) => f.id === row.fileId)?.file_content ?? null);
+
+  // "Use the GitHub version" of drifted custom files and CODEOWNERS: each one's
+  // GitHub copy becomes the project's file, saved as Commit Locally saves it,
+  // and applied to the page the same way, so drift clears wherever GitHub
+  // holds that copy without a refresh.
+  const adoptGithubVersionOfFiles = async (rows: DriftRow[]): Promise<string> => {
+    const id = typeof projectId === 'number' ? projectId : Number(projectId);
+    const files = oneRowPerFile(rows);
+    // Every copy is read, and checked against the one the drift check saw,
+    // before any is saved: one that moved on refuses the lot, not the rest.
+    const copies = await Promise.all(files.map((row) => fileGithubCopy(row, user!, id, projectName!, true)));
+    let updatedFiles = customFiles;
+    for (const [index, row] of files.entries()) {
+      const content = copies[index];
+      if (row.kind === "codeowners") {
+        const saved = await saveProjectCodeowners(id, content, codeowners?.file_path ?? row.name);
+        handleCodeownersSaved(saved.codeowners, saved.pr_state);
+      } else {
+        const { custom_file: saved } = await updateCustomFile(id, row.fileId, { file_content: content });
+        updatedFiles = updatedFiles.map((f) => (f.id === saved.id ? saved : f));
+      }
+    }
+    if (updatedFiles !== customFiles) applyCustomFilesChange(updatedFiles);
+    return files.length === 1
+      ? `${files[0].name} now holds the GitHub version from ${files[0].repo}. Deliver it to the other repositories with a PR campaign.`
+      : `${files.length} files now hold their GitHub versions. Deliver them to the other repositories with a PR campaign.`;
+  };
+
+  const handleCodeownersSaved = (record: CodeownersRecord, prState?: string): void => {
+    setCodeowners(record);
+    // Saving resolved the file's stored drift: re-read it so the banner,
+    // the row and the Projects list stop reporting it now.
+    setDriftRefreshSignal(prev => prev + 1);
+    refreshPendingDelivery();
+    // A save promotes the project to draft so a CODEOWNERS-only change
+    // can open a campaign; take the server's answer, not a guess.
+    if (prState) {
+      const next = normalizeProjectPRState(prState);
+      setProjectPRState(next);
+      // The projects list shows each project's state too.
+      if (next !== projectPRState) refreshProjectsList();
+    }
+  };
+
   // Helper function to render workflows section
   const renderWorkflows = (): React.ReactElement => {
+    // A Managed Files project's files are its one file, in its kind's editor.
+    if (!typeConfig.holdsWorkflows) return renderKindEditor();
     // Reusable workflow authoring is always on for RWX projects
     const effectiveReusableEnabled = projectType === 'rwx' ? true : reusableWorkflowsEnabled;
     return (
@@ -1822,7 +2018,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             onAddRXWorkflow={handleAddRXWorkflowCallback}
             detectedBuildTypes={EMPTY_BUILD_TYPES}
             reusableWorkflowsEnabled={effectiveReusableEnabled}
-            projectType={projectType}
+            projectType={workflowProjectType}
             linkedWorkflows={projectType === 'standard' ? linkedWorkflows : []}
             setLinkedWorkflows={projectType === 'standard' ? setLinkedWorkflows : undefined}
             canLinkReusableWorkflows={projectType === 'standard' && !isProjectReadOnly}
@@ -1832,44 +2028,18 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             refreshProjectData={refreshProjectCampaignState}
             refreshDrift={refreshDrift}
             onProjectStateChange={handleProjectStateChange}
-            onReposDelivered={clearDeliveredRepos}
+            onReposDelivered={refreshPendingDelivery}
             driftedWorkflowNames={driftedWorkflowNames}
             customFiles={customFiles as any}
             setCustomFiles={setCustomFiles as any}
             projectId={typeof projectId === 'number' ? projectId : (projectId ? Number(projectId) : 0)}
-            onCustomFilesChange={(updated) => {
-              setCustomFiles(updated as any);
-              // Called once the save, removal or restore has resolved, which can
-              // resolve or drop a file's stored drift: re-read it so the list,
-              // the editor and the banner stop reporting it now.
-              refreshDrift();
-              const hasLocalChanges = (updated as any[]).some(
-                (f: any) => f.file_status !== "synced_with_github" || f.pending_delete
-              );
-              if (hasLocalChanges && (projectPRState === 'new' || projectPRState === 'synced')) {
-                setProjectPRState('draft');
-              }
-            }}
+            onCustomFilesChange={applyCustomFilesChange}
+            onKeepCustomFile={(fileId, repos) => openCampaignToRestore(repos, {
+              workflows: [], reusableWorkflows: [], customFileIds: [fileId], codeowners: false,
+            })}
             customFileDrift={customFileDrift ?? []}
             driftedCustomFileIds={driftedCustomFileIds}
-            codeowners={codeowners}
-            codeownersDrift={codeownersDrift}
-            codeownersOpenRequested={codeownersOpenRequested}
-            onCodeownersOpened={() => setCodeownersOpenRequested(false)}
-            onCodeownersSaved={(record, prState) => {
-              setCodeowners(record);
-              // Saving resolved the file's stored drift: re-read it so the banner,
-              // the row and the Projects list stop reporting it now.
-              setDriftRefreshSignal(prev => prev + 1);
-              // A save promotes the project to draft so a CODEOWNERS-only change
-              // can open a campaign; take the server's answer, not a guess.
-              if (prState) {
-                const next = normalizeProjectPRState(prState);
-                setProjectPRState(next);
-                // The projects list shows each project's state too.
-                if (next !== projectPRState) refreshProjectsList();
-              }
-            }}
+            onOpenManagedFiles={() => navigate(managedFilesPath(user))}
             importedActions={importedActions}
             actionGroups={actionGroups}
             secrets={secrets}
@@ -1882,6 +2052,59 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
 
   const numericProjectId =
     typeof projectId === 'number' ? projectId : (projectId ? Number(projectId) : 0);
+
+  function retryKindEditor(): void {
+    if (fileKindFailed) retryFileKind();
+    if (codeownersLoadFailed) {
+      setCodeownersLoadFailed(false);
+      setCodeownersRefreshCounter(prev => prev + 1);
+    }
+  }
+
+  // A Managed Files project's one file, in the editor its kind's definition
+  // names (#2367). The page loads and delivers the file as it does for any
+  // project; the editor is all that differs between kinds.
+  function renderKindEditor(): React.ReactElement {
+    const KindEditor = fileKind ? FILE_KIND_UI[fileKind]?.Editor : undefined;
+    let body: React.ReactNode;
+    if (fileKind && !KindEditor) {
+      body = <p className="text-sm text-text-muted dark:text-text-muted-dark">This file can&apos;t be edited in this version of ActionsManager.</p>;
+    } else if ((codeowners === undefined && codeownersLoadFailed) || fileKindFailed) {
+      body = (
+        <div role="alert" className="flex items-center gap-3 text-sm text-red-600 dark:text-red-400">
+          Couldn&apos;t load this project&apos;s file.
+          <Button type="button" variant="outline" size="sm" onClick={retryKindEditor}>
+            Try again
+          </Button>
+        </div>
+      );
+    } else if (!KindEditor || !fileKindDefinition || codeowners === undefined) {
+      body = <p className="text-sm text-text-muted dark:text-text-muted-dark">Loading…</p>;
+    } else {
+      body = (
+        <KindEditor
+          user={user!}
+          projectName={projectName}
+          projectId={numericProjectId}
+          selectedRepos={selectedRepos}
+          isReadOnly={isProjectReadOnly}
+          codeowners={codeowners}
+          drift={codeownersDrift}
+          onSaved={handleCodeownersSaved}
+          onReposDelivered={refreshPendingDelivery}
+          onKeepActionsManagerVersion={(repos) => openCampaignToRestore(repos, {
+            workflows: [], reusableWorkflows: [], customFileIds: [], codeowners: true,
+          })}
+          paths={fileKindDefinition.paths}
+        />
+      );
+    }
+    return (
+      <div className="section-content" data-testid="file-kind-editor">
+        <div className="section-card-content">{body}</div>
+      </div>
+    );
+  }
 
   // Render all Repository Config sections as a single scrolling page with anchor IDs
   const renderRepoConfigsPage = (): React.ReactElement => {
@@ -1917,11 +2140,14 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
                 setValidationRepo={setValidationRepo}
                 preflightRequired={preflightRequired}
                 setPreflightRequired={setPreflightRequired}
+                fileKind={fileKind}
               />
             )}
           </div>
         </section>
 
+        {/* Environments, variables, secrets and rulesets serve workflows. */}
+        {typeConfig.holdsWorkflows && <>
         {/* Deploy Environments */}
         <section
           id="repo-config-environments"
@@ -2010,6 +2236,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             />
           </div>
         </section>
+        </>}
 
       </div>
     );
@@ -2078,6 +2305,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             setValidationRepo={setValidationRepo}
             preflightRequired={preflightRequired}
             setPreflightRequired={setPreflightRequired}
+            fileKind={fileKind}
           />
         </div>
       </div>
@@ -2086,7 +2314,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
 
   // Helper function to render project info / settings detail section
   const renderProjectInfo = (): React.ReactElement => {
-    const typeLabel = getProjectTypeConfig(projectType).label;
+    const typeLabel = typeConfig.label;
     const modeCfg = getPrefixModeConfig(usePrefix);
     const modeColor = usePrefix ? "var(--color-success-text)" : "var(--color-warning-text)";
     const modeBg = usePrefix ? "rgba(16,185,129,0.08)" : "rgba(245,158,11,0.08)";
@@ -2111,12 +2339,23 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             <span style={{ color: "var(--text-secondary)", fontWeight: 500 }}>Type</span>
             <span style={{ fontWeight: 600 }}>{typeLabel}</span>
 
-            <span style={{ color: "var(--text-secondary)", fontWeight: 500 }}>Mode</span>
-            <span style={{ fontWeight: 600, color: modeColor }}>{modeCfg.label}</span>
+            {typeConfig.holdsWorkflows ? (
+              <>
+                <span style={{ color: "var(--text-secondary)", fontWeight: 500 }}>Mode</span>
+                <span style={{ fontWeight: 600, color: modeColor }}>{modeCfg.label}</span>
+              </>
+            ) : (
+              <>
+                <span className="font-medium text-text-secondary dark:text-secondary-dark">File</span>
+                <span className="font-semibold" data-testid="project-info-file-kind">
+                  {fileKindDefinition?.label ?? fileKind}
+                </span>
+              </>
+            )}
           </div>
 
-          {/* Resource Naming Mode detail card */}
-          <div style={{
+          {/* Resource Naming Mode detail card: names workflows, secrets and variables */}
+          {typeConfig.holdsWorkflows && <div style={{
             padding: "1rem 1.25rem",
             borderRadius: "8px",
             border: `1px solid ${modeBorder}`,
@@ -2131,16 +2370,16 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             <ul style={{ margin: "0.6rem 0 0", paddingLeft: "1.1rem", fontSize: "0.82rem", color: "var(--text-secondary)", lineHeight: 1.7 }}>
               {modeCfg.bullets.map((bullet, i) => <li key={i}>{bullet}</li>)}
             </ul>
-          </div>
+          </div>}
 
-          <ProjectColorSelector
+          {typeConfig.hasColour && <ProjectColorSelector
             className="mt-6"
             value={projectColor}
             onChange={handleProjectColorChange}
-            projectType={projectType}
+            projectType={workflowProjectType}
             disabled={isProjectReadOnly}
-          />
-          {!isProjectReadOnly && projectColorSaveState !== "idle" && (
+          />}
+          {typeConfig.hasColour && !isProjectReadOnly && projectColorSaveState !== "idle" && (
             <output className="mt-2 text-xs text-text-muted dark:text-text-muted-dark" aria-live="polite">
               {projectColorSaveState === "saving"
                 ? "Saving…"
@@ -2217,7 +2456,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           </p>
           <p style={{ margin: "0 0 1rem", color: "var(--text-secondary)", fontSize: "0.85rem", lineHeight: 1.6 }}>
             Includes project metadata, linked repositories, branch configuration, workflows, workflow YAML, status/hash metadata,
-            workflow version history (when available), project relationships, rulesets, CODEOWNERS records, repo workflow overrides,
+            workflow version history (when available), project relationships, rulesets, a Managed Files project&apos;s file, repo workflow overrides,
             and linked reusable workflow relationships.
           </p>
           <p style={{ margin: "0 0 1.25rem", color: "var(--text-secondary)", fontSize: "0.85rem", lineHeight: 1.6 }}>
@@ -2302,6 +2541,17 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     />
   );
 
+  const renderProjectMembers = (name: string): React.ReactElement => {
+    const numericProjectId = typeof projectId === 'number' ? projectId : (projectId ? Number(projectId) : undefined);
+    return (
+      <ProjectMembers
+        projectId={numericProjectId}
+        projectName={name}
+        workspaceRole={userDetails?.workspace_role}
+      />
+    );
+  };
+
   // Main section content renderer with reduced complexity
   const renderSectionContent = (): React.ReactElement => {
     if (!projectName) {
@@ -2336,7 +2586,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           />
         ) : renderWorkflows();
       case 'build-metrics':
-        return renderBuildMetrics();
+        return typeConfig.holdsWorkflows ? renderBuildMetrics() : renderWorkflows();
       case 'project-info':
         return renderProjectInfo();
       case 'linked-workflows':
@@ -2353,30 +2603,13 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         return renderBackupExport();
       case 'danger-zone':
         return renderDangerZone(projectName);
-      case 'project-members': {
-        const numericProjectId = typeof projectId === 'number' ? projectId : (projectId ? Number(projectId) : undefined);
-        return (
-          <ProjectMembers
-            projectId={numericProjectId}
-            projectName={projectName}
-            workspaceRole={userDetails?.workspace_role}
-          />
-        );
-      }
+      case 'project-members':
+        return renderProjectMembers(projectName);
       case 'drift-config':
         return renderDriftConfig();
       default:
         return renderDefaultRepositoriesAndBranches();
     }
-  };
-
-  // Extract nested ternary operation for main content CSS classes
-  const getMainContentClasses = () => {
-    if (!projectName) {
-      return 'main-content without-sidebar';
-    }
-    const sidebarClass = isSidebarCollapsed ? 'collapsed' : '';
-    return `main-content with-sidebar ${sidebarClass}`;
   };
 
   // Memoized values for button display logic
@@ -2425,7 +2658,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
       preflightRequired,
     });
     if (result.projectId && !projectId) {
-      setProjectId(result.projectId);
+      takeProjectId(result.projectId);
     }
     if (result.projectCode && !projectCode) {
       setProjectCode(result.projectCode);
@@ -2437,7 +2670,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     // the next project load would mean the reminder only showed up after a
     // manual refresh. The server recomputes it, so this cannot drift from what
     // the next load will say.
-    setPendingDeliveryRepos(result.pendingDeliveryRepos ?? []);
+    takePendingDeliveryRepos(result.pendingDeliveryRepos ?? []);
     // This save posts every workflow too, so it can change one's kind.
     moveReKindedWorkflows(result.kindChanges ?? []);
     // The repos are persisted now, so the branch-override panel can finally see
@@ -2466,7 +2699,10 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
     newlyAddedRepos: string[],
     result: UpdateResult,
   ): void => {
-    if (projectType === "rwx" || !workflows.some((w) => !w.isReusable)) return;
+    const hasFilesToDeliver = workflows.some((w) => !w.isReusable)
+      || rxworkflows.length > 0
+      || Boolean(codeowners?.content);
+    if (projectType === "rwx" || !hasFilesToDeliver) return;
     const waiting = result.pendingDeliveryKnown
       ? newlyAddedRepos.filter((repo) => (result.pendingDeliveryRepos ?? []).includes(repo))
       : newlyAddedRepos;
@@ -2560,9 +2796,26 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
            selectedRepos.length > 0;
   }, [isWorkflowSection, projectId, projectPRState, selectedRepos.length]);
 
+  // Draft has local changes to deliver. A synced project can still open a
+  // campaign to put back a file changed on GitHub, or to reach a repository
+  // that has none of the project's files yet; both come from the delivery record.
   const isPRButtonDisabled = useMemo(() => {
-    return isSaving || projectPRState !== 'draft';
-  }, [isSaving, projectPRState]);
+    const canStartCampaign = projectPRState === 'draft'
+      || (projectPRState === 'synced' && (hasFileDrift || visiblePendingDeliveryRepos.length > 0));
+    return isSaving || !canStartCampaign;
+  }, [isSaving, projectPRState, hasFileDrift, visiblePendingDeliveryRepos]);
+
+  const prButtonTitle = (): string | undefined => {
+    if (isProjectReadOnly) return 'You have read-only access to this project';
+    if (!isPRButtonDisabled) return undefined;
+    if (projectPRState === 'open') return 'Pull requests are already open and under review';
+    if (projectPRState === 'synced') {
+      return typeConfig.holdsWorkflows
+        ? 'Workflows are synced with GitHub – commit changes locally first'
+        : `${deliverableNoun} is synced with GitHub – commit a change locally first`;
+    }
+    return undefined;
+  };
 
   const isLocalSaveDisabled = useMemo(() => {
     return isLocalSaving || !isRepoBranchDirty || selectedRepos.length === 0;
@@ -2570,414 +2823,371 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
 
   return (
     <div className="app-layout">
-      {projectName && (
-        <Sidebar 
-          activeSection={REPO_CONFIG_SECTION_KEYS.includes(activeSection) ? scrollActiveSection : activeSection}
-          pendingDeliveryCount={projectType === "rwx" ? 0 : visiblePendingDeliveryRepos.length}
-          onSectionChange={handleSectionChange}
-          projectName={projectName}
-          onProjectNameSave={handleProjectNameSave}
-          projectCode={projectCode}
-          projectType={projectType}
-          repositoryVisibilityScope={repositoryVisibilityScope}
-          usePrefix={usePrefix}
-          isReadOnly={isProjectReadOnly}
-          isWorkspaceAdmin={isWorkspaceAdmin}
-          onLinkReusableWorkflow={() => setShowLinkedWorkflowsModal(true)}
-          isCollapsed={isSidebarCollapsed}
-          onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
-          isMobileOpen={isMobileSidebarOpen}
-          onMobileClose={() => setIsMobileSidebarOpen(false)}
-        />
-      )}
-      {projectName && isMobileSidebarOpen && (
-        <div
-          className="sidebar-mobile-backdrop"
-          aria-hidden="true"
-          onClick={() => setIsMobileSidebarOpen(false)}
-        />
-      )}
+      <AppHeader
+        user={user || ""}
+        userDetails={userDetails}
+        onLogout={onLogout}
+        // Until the project loads, its type (and so its section) isn't known.
+        currentSection={projectName && projectId ? projectSection : undefined}
+      />
+      <div className="app-body">
+        {projectName && (
+          <Sidebar 
+            activeSection={REPO_CONFIG_SECTION_KEYS.includes(activeSection) ? scrollActiveSection : activeSection}
+            pendingDeliveryCount={projectType === "rwx" ? 0 : visiblePendingDeliveryRepos.length}
+            onSectionChange={handleSectionChange}
+            projectName={projectName}
+            onProjectNameSave={handleProjectNameSave}
+            projectCode={projectCode}
+            projectType={projectType}
+            fileKind={fileKind}
+            fileKindLabel={fileKindDefinition?.label}
+            repositoryVisibilityScope={repositoryVisibilityScope}
+            usePrefix={usePrefix}
+            isReadOnly={isProjectReadOnly}
+            isWorkspaceAdmin={isWorkspaceAdmin}
+            onLinkReusableWorkflow={() => setShowLinkedWorkflowsModal(true)}
+            isCollapsed={isSidebarCollapsed}
+            onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+            isMobileOpen={isMobileSidebarOpen}
+            onMobileClose={() => setIsMobileSidebarOpen(false)}
+          />
+        )}
+        {projectName && isMobileSidebarOpen && (
+          <div
+            className="sidebar-mobile-backdrop"
+            aria-hidden="true"
+            onClick={() => setIsMobileSidebarOpen(false)}
+          />
+        )}
       
-      <div className={getMainContentClasses()}>
-        {!projectName ? (
-          <div className="project-list-container">
-            <div className="project-list-header">
-              <BrandLogo variant="full" size="lg" className="main-title" />
-              <div className="header-controls">
-                {userDetails && (
-                  <PlanUsagePill
-                    plan={userDetails.plan}
-                    projectsUsed={projects.length}
-                    callerProjectsUsed={projects.filter(p => (p.project_type ?? "standard") === "standard").length}
-                    rwxProjectsUsed={projects.filter(p => p.project_type === "rwx").length}
-                  />
-                )}
-                {userDetails && (
-                  <UserAvatar 
-                    avatarUrl={userDetails.avatar_url} 
-                    username={userDetails.github_user} 
-                    accountType={userDetails.account_type}
-                    plan={userDetails.plan}
-                    githubAccountType={userDetails.github_account_type}
-                    connectedGithubAccount={userDetails.connected_github_account}
-                    connectedGithubAccountType={userDetails.connected_github_account_type}
-                    workspaceRole={userDetails.workspace_role}
-                    rateLimit={userDetails.rate_limit}
-                    githubToken={userDetails.github_token}
-                    onLogout={onLogout}
-                  />
-                )}
-              </div>
+        <div className="main-content">
+          {!projectName ? (
+            <div className="h-full overflow-y-auto">
+              <AppPage>{renderSectionContent()}</AppPage>
             </div>
-            {renderSectionContent()}
-          </div>
-        ) : (
-          <>
-            {/* Read-only banner for project_viewer users. A project being deleted
-                is read-only to everyone, and its own banner below says why. */}
-            {isProjectReadOnly && !isProjectDeleting && (
-              <div className="mb-2 px-4 py-2 rounded-lg text-sm font-medium bg-yellow-50 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300 border border-yellow-200 dark:border-yellow-800">
-                👁️ You have <strong>viewer</strong> access to this project. Editing is disabled.
-              </div>
-            )}
-            <div className="content-header">
-              <div className="content-header-nav">
-                <button
-                  className="sidebar-mobile-toggle"
-                  aria-label={isMobileSidebarOpen ? 'Close navigation' : 'Open navigation'}
-                  onClick={() => setIsMobileSidebarOpen(prev => !prev)}
-                >
-                  <span aria-hidden="true">☰</span>
-                </button>
-                <button
-                  className="back-to-projects-button"
-                  onClick={handleGoToMain}
-                >
-                  <span aria-hidden="true">←</span>{' '}
-                  Back to Projects
-                </button>
-              </div>
+          ) : (
+            <>
+              {/* Read-only banner for project_viewer users. A project being deleted
+                  is read-only to everyone, and its own banner below says why. */}
+              {isProjectReadOnly && !isProjectDeleting && (
+                <div className="mb-2 px-4 py-2 rounded-lg text-sm font-medium bg-yellow-50 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300 border border-yellow-200 dark:border-yellow-800">
+                  👁️ You have <strong>viewer</strong> access to this project. Editing is disabled.
+                </div>
+              )}
+              <div className="content-header">
+                <div className="content-header-nav">
+                  <button
+                    className="sidebar-mobile-toggle"
+                    aria-label={isMobileSidebarOpen ? 'Close navigation' : 'Open navigation'}
+                    onClick={() => setIsMobileSidebarOpen(prev => !prev)}
+                  >
+                    <span aria-hidden="true">☰</span>
+                  </button>
+                  {/* Drift status, beside the actions rather than a full-width row of its own */}
+                  <DriftDetection
+                    user={user!}
+                    projectId={typeof projectId === "number" ? projectId : (projectId ? Number(projectId) : null)}
+                    projectName={projectName}
+                    selectedRepos={selectedRepos}
+                    onDriftLoaded={handleDriftLoaded}
+                    refreshSignal={driftRefreshSignal}
+                    seededDriftNames={seededDriftNames}
+                    seededCodeownersDrift={seededCodeownersDrift}
+                    seededCustomFileDriftCount={seededCustomFileDriftIds.length}
+                    onWorkflowStatusesChanged={handleDriftWorkflowStatusesChanged}
+                    onKeepActionsManagerVersion={keepActionsManagerVersion}
+                    onUseGithubVersionOfFiles={adoptGithubVersionOfFiles}
+                    contentOf={driftContentOf}
+                    onProjectChanged={refreshProjectCampaignState}
+                  />
+                </div>
 
-              <div className="header-action-buttons">
-                {/* Workflow-specific buttons - only show when workflows section is active */}
-                {activeSection === 'workflows' && (
-                  <>
-                    {/* Import Existing Workflows Button */}
-                    {!isProjectReadOnly && selectedRepos && selectedRepos.length > 0 && (
-                      <Button
-                        variant="outline"
-                        onClick={() => setShowWorkflowImport(true)}
-                        data-testid="import-workflows-button"
-                      >
-                        📥 Import Existing
-                      </Button>
-                    )}
-                    {/* Refresh Status Button */}
-                    {selectedRepos && selectedRepos.length > 0 && workflows.some(w => w.name && w.name.trim()) && refreshStatusFn && (
-                      <Button
-                        variant="outline"
-                        onClick={refreshStatusFn}
-                        disabled={isRefreshingStatus}
-                      >
-                        {isRefreshingStatus ? "🔄 Refreshing..." : "🔄 Refresh Status"}
-                      </Button>
-                    )}
-                  </>
-                )}
+                <div className="header-action-buttons">
+                  {/* Workflow-specific buttons - only show when workflows section is active */}
+                  {activeSection === 'workflows' && typeConfig.holdsWorkflows && (
+                    <>
+                      {/* Import Existing Workflows Button */}
+                      {!isProjectReadOnly && selectedRepos && selectedRepos.length > 0 && (
+                        <Button
+                          variant="outline"
+                          onClick={() => setShowWorkflowImport(true)}
+                          data-testid="import-workflows-button"
+                        >
+                          📥 Import Existing
+                        </Button>
+                      )}
+                      {/* Refresh Status Button */}
+                      {selectedRepos && selectedRepos.length > 0 && workflows.some(w => w.name && w.name.trim()) && refreshStatusFn && (
+                        <Button
+                          variant="outline"
+                          onClick={refreshStatusFn}
+                          disabled={isRefreshingStatus}
+                        >
+                          {isRefreshingStatus ? "🔄 Refreshing..." : "🔄 Refresh Status"}
+                        </Button>
+                      )}
+                    </>
+                  )}
 
-                {/* Reusable Workflow-specific buttons - only show when rxworkflows section is active */}
-                {activeSection === 'rxworkflows' && (
-                  <>
-                    {/* Generate Templates Button */}
-                    {generateTemplatesFn && (
-                      <Button
-                        variant="outline"
-                        onClick={generateTemplatesFn}
-                        disabled={isGeneratingTemplates}
-                      >
-                        {isGeneratingTemplates ? "🔄 Generating..." : "📝 Generate Templates"}
-                      </Button>
-                    )}
-                  </>
-                )}
+                  {/* Reusable Workflow-specific buttons - only show when rxworkflows section is active */}
+                  {activeSection === 'rxworkflows' && (
+                    <>
+                      {/* Generate Templates Button */}
+                      {generateTemplatesFn && (
+                        <Button
+                          variant="outline"
+                          onClick={generateTemplatesFn}
+                          disabled={isGeneratingTemplates}
+                        >
+                          {isGeneratingTemplates ? "🔄 Generating..." : "📝 Generate Templates"}
+                        </Button>
+                      )}
+                    </>
+                  )}
 
-                {/* Deploy Environments-specific buttons - only show when environments section is active */}
-                {activeSection === 'environments' && (
-                  <>
-                    {/* Create Environment (focus add form) */}
-                    {focusAddEnvironmentFn && (
-                      <Button
-                        variant="outline"
-                        onClick={isProjectReadOnly ? undefined : focusAddEnvironmentFn}
-                        disabled={isProjectReadOnly}
-                        title={isProjectReadOnly ? "You have read-only access to this project" : undefined}
-                      >
-                        ➕ Create Environment
-                      </Button>
-                    )}
-                  </>
-                )}
+                  {/* Deploy Environments-specific buttons - only show when environments section is active */}
+                  {activeSection === 'environments' && (
+                    <>
+                      {/* Create Environment (focus add form) */}
+                      {focusAddEnvironmentFn && (
+                        <Button
+                          variant="outline"
+                          onClick={isProjectReadOnly ? undefined : focusAddEnvironmentFn}
+                          disabled={isProjectReadOnly}
+                          title={isProjectReadOnly ? "You have read-only access to this project" : undefined}
+                        >
+                          ➕ Create Environment
+                        </Button>
+                      )}
+                    </>
+                  )}
 
-                {/* Environment Variables-specific buttons - only show when envvars section is active */}
-                {activeSection === 'envvars' && (
-                  <>
-                    {/* Add Environment Variable Button */}
-                    {addEnvVarFn && (
-                      <Button 
-                        variant="outline"
-                        onClick={addEnvVarFn}
-                        disabled={isProjectReadOnly}
-                        title={isProjectReadOnly ? "You have read-only access to this project" : undefined}
-                      >
-                        ➕ Add Environment Variable
-                      </Button>
-                    )}
-                  </>
-                )}
+                  {/* Environment Variables-specific buttons - only show when envvars section is active */}
+                  {activeSection === 'envvars' && (
+                    <>
+                      {/* Add Environment Variable Button */}
+                      {addEnvVarFn && (
+                        <Button 
+                          variant="outline"
+                          onClick={addEnvVarFn}
+                          disabled={isProjectReadOnly}
+                          title={isProjectReadOnly ? "You have read-only access to this project" : undefined}
+                        >
+                          ➕ Add Environment Variable
+                        </Button>
+                      )}
+                    </>
+                  )}
 
-                {/* Environment Secrets-specific buttons - only show when secrets section is active */}
-                {activeSection === 'secrets' && (
-                  <>
-                    {/* Add Secret Button */}
-                    {addSecretFn && (
-                      <Button 
-                        variant="outline"
-                        onClick={addSecretFn}
-                        disabled={isProjectReadOnly}
-                        title={isProjectReadOnly ? "You have read-only access to this project" : undefined}
-                      >
-                        ➕ Add Secret
-                      </Button>
-                    )}
-                  </>
-                )}
+                  {/* Environment Secrets-specific buttons - only show when secrets section is active */}
+                  {activeSection === 'secrets' && (
+                    <>
+                      {/* Add Secret Button */}
+                      {addSecretFn && (
+                        <Button 
+                          variant="outline"
+                          onClick={addSecretFn}
+                          disabled={isProjectReadOnly}
+                          title={isProjectReadOnly ? "You have read-only access to this project" : undefined}
+                        >
+                          ➕ Add Secret
+                        </Button>
+                      )}
+                    </>
+                  )}
                 
-                {/* Spacer to separate section-specific buttons from standard buttons */}
-                {((activeSection === 'workflows' && refreshStatusFn) || 
-                  (activeSection === 'rxworkflows' && generateTemplatesFn) ||
-                  (activeSection === 'environments' && focusAddEnvironmentFn) ||
-                  (activeSection === 'envvars' && addEnvVarFn) ||
-                  (activeSection === 'secrets' && addSecretFn)) && (
-                  <div style={{ width: "1px", height: "40px", backgroundColor: "var(--border-color)", margin: "0 1rem" }}></div>
-                )}
+                  {/* Spacer to separate section-specific buttons from standard buttons */}
+                  {((activeSection === 'workflows' && refreshStatusFn) || 
+                    (activeSection === 'rxworkflows' && generateTemplatesFn) ||
+                    (activeSection === 'environments' && focusAddEnvironmentFn) ||
+                    (activeSection === 'envvars' && addEnvVarFn) ||
+                    (activeSection === 'secrets' && addSecretFn)) && (
+                    <div style={{ width: "1px", height: "40px", backgroundColor: "var(--border-color)", margin: "0 1rem" }}></div>
+                  )}
                 
-                {/* Standard action buttons - conditional display based on section */}
-                {/* Repos & Branches: local Save button (DB only) + "Save to GitHub" */}
-                {isRepoBranchSection && projectType !== "rwx" && (
-                  <>
-                    {/* Local Save button — saves draft without pushing to GitHub */}
-                    <button
-                      className="action-button secondary"
-                      onClick={isProjectReadOnly ? undefined : handleLocalSaveRepoConfig}
-                      disabled={isProjectReadOnly || isLocalSaveDisabled}
-                      title={
-                        isProjectReadOnly
-                          ? "You have read-only access to this project"
-                          : selectedRepos.length === 0
-                            ? "Select at least one repository to save"
-                            : isRepoBranchDirty
-                              ? "Save changes to the app (no GitHub push)"
-                              : "No unsaved changes"
-                      }
+                  {/* Standard action buttons - conditional display based on section */}
+                  {/* Repos & Branches: local Save button (DB only) + "Save to GitHub" */}
+                  {isRepoBranchSection && projectType !== "rwx" && (
+                    <>
+                      {/* Local Save button — saves draft without pushing to GitHub */}
+                      <button
+                        className="action-button secondary"
+                        onClick={isProjectReadOnly ? undefined : handleLocalSaveRepoConfig}
+                        disabled={isProjectReadOnly || isLocalSaveDisabled}
+                        title={
+                          isProjectReadOnly
+                            ? "You have read-only access to this project"
+                            : selectedRepos.length === 0
+                              ? "Select at least one repository to save"
+                              : isRepoBranchDirty
+                                ? "Save changes to the app (no GitHub push)"
+                                : "No unsaved changes"
+                        }
+                        style={{
+                          opacity: (isProjectReadOnly || isLocalSaveDisabled) ? 0.5 : 1,
+                          cursor: (isProjectReadOnly || isLocalSaveDisabled) ? "not-allowed" : "pointer"
+                        }}
+                      >
+                        {isLocalSaving ? "⏳ Saving..." : "💾 Save"}
+                      </button>
+                      {/* "Changes saved" toast shown inline next to the button */}
+                      {localSaveToastVisible && (
+                        <output
+                          className="repo-success-message"
+                          aria-live="polite"
+                          style={{ marginRight: "0.5rem" }}
+                        >
+                          <span className="success-icon">✅</span>
+                          <span className="success-text">Changes saved</span>
+                        </output>
+                      )}
+                    </>
+                  )}
+                  {/* Save button with section-appropriate text - only show for workflow sections when multiple workflows are modified */}
+                  {shouldShowTopCommitButton && (
+                    <button 
+                      className="action-button secondary" 
+                      onClick={isProjectReadOnly ? undefined : handleSaveProjectClick}
+                      disabled={isProjectReadOnly || isSaving}
+                      title={isProjectReadOnly ? "You have read-only access to this project" : undefined}
                       style={{
-                        opacity: (isProjectReadOnly || isLocalSaveDisabled) ? 0.5 : 1,
-                        cursor: (isProjectReadOnly || isLocalSaveDisabled) ? "not-allowed" : "pointer"
+                        opacity: (isProjectReadOnly || isSaving) ? 0.5 : 1,
+                        cursor: (isProjectReadOnly || isSaving) ? "not-allowed" : "pointer"
                       }}
                     >
-                      {isLocalSaving ? "⏳ Saving..." : "💾 Save"}
+                      {isSaving ? "⏳ Saving..." : saveButtonText}
                     </button>
-                    {/* "Changes saved" toast shown inline next to the button */}
-                    {localSaveToastVisible && (
-                      <output
-                        className="repo-success-message"
-                        aria-live="polite"
-                        style={{ marginRight: "0.5rem" }}
-                      >
-                        <span className="success-icon">✅</span>
-                        <span className="success-text">Changes saved</span>
-                      </output>
-                    )}
-                  </>
-                )}
-                {/* Save button with section-appropriate text - only show for workflow sections when multiple workflows are modified */}
-                {shouldShowTopCommitButton && (
-                  <button 
-                    className="action-button secondary" 
-                    onClick={isProjectReadOnly ? undefined : handleSaveProjectClick}
-                    disabled={isProjectReadOnly || isSaving}
-                    title={isProjectReadOnly ? "You have read-only access to this project" : undefined}
-                    style={{
-                      opacity: (isProjectReadOnly || isSaving) ? 0.5 : 1,
-                      cursor: (isProjectReadOnly || isSaving) ? "not-allowed" : "pointer"
-                    }}
-                  >
-                    {isSaving ? "⏳ Saving..." : saveButtonText}
-                  </button>
-                )}
+                  )}
                 
-                {/* Create Pull Requests button - show for workflows/rxworkflows; disabled when no local commits are ready */}
-                {shouldShowPRButton && (
-                  <button 
-                    data-testid="create-pull-requests-button"
-                    className="action-button primary" 
-                    onClick={isProjectReadOnly ? undefined : handleOpenCreatePRModal}
-                    disabled={isProjectReadOnly || isPRButtonDisabled}
-                    title={
-                      isProjectReadOnly ? 'You have read-only access to this project' :
-                      projectPRState === 'open' ? 'Pull requests are already open and under review' :
-                      projectPRState === 'synced' ? 'Workflows are synced with GitHub – commit changes locally first' :
-                      undefined
-                    }
-                    style={{
-                      opacity: (isProjectReadOnly || isPRButtonDisabled) ? 0.5 : 1,
-                      cursor: (isProjectReadOnly || isPRButtonDisabled) ? "not-allowed" : "pointer",
-                      backgroundColor: "#2563eb",
-                      color: "white"
-                    }}
-                  >
-                    🚀 Create Pull Requests
-                  </button>
-                )}
+                  {/* Create Pull Requests button - show for workflows/rxworkflows; disabled when no local commits are ready */}
+                  {shouldShowPRButton && (
+                    <button 
+                      data-testid="create-pull-requests-button"
+                      className="action-button primary" 
+                      onClick={isProjectReadOnly ? undefined : handleOpenCreatePRModal}
+                      disabled={isProjectReadOnly || isPRButtonDisabled}
+                      title={prButtonTitle()}
+                      style={{
+                        opacity: (isProjectReadOnly || isPRButtonDisabled) ? 0.5 : 1,
+                        cursor: (isProjectReadOnly || isPRButtonDisabled) ? "not-allowed" : "pointer",
+                        backgroundColor: "#2563eb",
+                        color: "white"
+                      }}
+                    >
+                      🚀 Create Pull Requests
+                    </button>
+                  )}
                 
-                {/* User Avatar - positioned at the end */}
-                {userDetails && (
-                  <UserAvatar 
-                    avatarUrl={userDetails.avatar_url} 
-                    username={userDetails.github_user} 
-                    accountType={userDetails.account_type}
-                    plan={userDetails.plan}
-                    githubAccountType={userDetails.github_account_type}
-                    connectedGithubAccount={userDetails.connected_github_account}
-                    connectedGithubAccountType={userDetails.connected_github_account_type}
-                    workspaceRole={userDetails.workspace_role}
-                    rateLimit={userDetails.rate_limit}
-                    githubToken={userDetails.github_token}
-                    onLogout={onLogout}
-                  />
-                )}
+                </div>
               </div>
-            </div>
             
-            {/* Project-Level PR Campaign Banner */}
-            {projectId && projectPRState === 'open' && (
-              <div className="project-pr-status-banner" role="alert" aria-live="polite">
-                <div className="pr-banner-content">
-                  <div className="pr-banner-icon" aria-hidden="true">🔵</div>
-                  <div className="pr-banner-text">
-                    <strong>Active PR Campaign</strong>
-                    <span className="pr-banner-subtitle">
-                      This workflow is part of an active PR campaign. Changes to workflows will add commits to existing PRs.
-                    </span>
+              {/* Project-Level PR Campaign Banner */}
+              {projectId && projectPRState === 'open' && (
+                <div className="project-pr-status-banner" role="alert" aria-live="polite">
+                  <div className="pr-banner-content">
+                    <div className="pr-banner-icon" aria-hidden="true">🔵</div>
+                    <div className="pr-banner-text">
+                      <strong>Active PR Campaign</strong>
+                      <span className="pr-banner-subtitle">
+                        {typeConfig.holdsWorkflows
+                          ? "This workflow is part of an active PR campaign. Changes to workflows will add commits to existing PRs."
+                          : `This project's ${deliverableNoun} is part of an active PR campaign. Changes to it will add commits to the open PRs.`}
+                      </span>
+                    </div>
+                    <button 
+                      className="pr-banner-button"
+                      onClick={handleTogglePRStatusPanel}
+                      aria-label="Manage PR Campaign"
+                    >
+                      <span aria-hidden="true">📊</span> Manage PR Campaign
+                    </button>
                   </div>
-                  <button 
-                    className="pr-banner-button"
-                    onClick={handleTogglePRStatusPanel}
-                    aria-label="Manage PR Campaign"
-                  >
-                    <span aria-hidden="true">📊</span> Manage PR Campaign
-                  </button>
                 </div>
-              </div>
-            )}
+              )}
             
-            {projectId && isProjectDeleting && (
-              <div className="project-pr-status-banner" role="alert" aria-live="polite" data-testid="project-deleting-banner">
-                <div className="pr-banner-content">
-                  <div className="pr-banner-icon" aria-hidden="true">🗑️</div>
-                  <div className="pr-banner-text">
-                    <strong>Deleting this project</strong>
-                    <span className="pr-banner-subtitle">
-                      This project is being deleted. It is read-only until its removal pull requests merge; closing one calls the deletion off.
-                    </span>
+              {projectId && isProjectDeleting && (
+                <div className="project-pr-status-banner" role="alert" aria-live="polite" data-testid="project-deleting-banner">
+                  <div className="pr-banner-content">
+                    <div className="pr-banner-icon" aria-hidden="true">🗑️</div>
+                    <div className="pr-banner-text">
+                      <strong>Deleting this project</strong>
+                      <span className="pr-banner-subtitle">
+                        This project is being deleted. It is read-only until its removal pull requests merge; closing one calls the deletion off.
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="pr-banner-button"
+                      onClick={() => handleSectionChange('pr-history')}
+                    >
+                      <span aria-hidden="true">📊</span> Open PR Campaigns
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    className="pr-banner-button"
-                    onClick={() => handleSectionChange('pr-history')}
-                  >
-                    <span aria-hidden="true">📊</span> Open PR Campaigns
-                  </button>
                 </div>
-              </div>
-            )}
+              )}
 
-            {/* Drift Detection Component */}
-            <DriftDetection
-              user={user!}
-              projectId={typeof projectId === "number" ? projectId : (projectId ? Number(projectId) : null)}
-              projectName={projectName}
-              selectedRepos={selectedRepos}
-              onDriftLoaded={handleDriftLoaded}
-              refreshSignal={driftRefreshSignal}
-              seededDriftNames={seededDriftNames}
-              seededCodeownersDrift={seededCodeownersDrift}
-              seededCustomFileDriftCount={seededCustomFileDriftIds.length}
-              onWorkflowStatusesChanged={handleDriftWorkflowStatusesChanged}
-              onOpenCodeowners={() => {
-                handleSectionChange('codeowners');
-                setCodeownersOpenRequested(true);
-              }}
-            />
+              {/* Repositories that joined the project but have no workflows yet */}
+              {projectType !== "rwx" && (
+                <PendingDeliveryNotice
+                  repos={visiblePendingDeliveryRepos}
+                  deliverable={deliverableNoun}
+                  onCreatePullRequests={
+                    isProjectReadOnly
+                      ? undefined
+                      : () => openCreatePRModalForRepos(visiblePendingDeliveryRepos)
+                  }
+                />
+              )}
 
-            {/* Repositories that joined the project but have no workflows yet */}
-            {projectType !== "rwx" && (
-              <PendingDeliveryNotice
-                repos={visiblePendingDeliveryRepos}
-                onCreatePullRequests={
-                  isProjectReadOnly
-                    ? undefined
-                    : () => openCreatePRModalForRepos(visiblePendingDeliveryRepos)
-                }
-              />
-            )}
-
-            {/* Progress bar for save operations */}
-            {isSaving && (
-              <div style={{
-                width: "calc(100% - 2 * var(--spacing-xl))",
-                margin: "0 var(--spacing-xl) 1rem",
-                padding: "0.5rem",
-                backgroundColor: "var(--background-color, #f5f5f5)",
-                border: "1px solid var(--border-color, #ddd)",
-                borderRadius: "4px"
-              }}>
+              {/* Progress bar for save operations */}
+              {isSaving && (
                 <div style={{
-                  fontSize: "0.9rem",
-                  marginBottom: "0.5rem",
-                  color: "var(--text-color, #333)"
-                }}>
-                  {saveProgressText}
-                </div>
-                <div style={{
-                  width: "100%",
-                  height: "8px",
-                  backgroundColor: "var(--progress-background, #e0e0e0)",
-                  borderRadius: "4px",
-                  overflow: "hidden"
+                  width: "calc(100% - 2 * var(--spacing-xl))",
+                  margin: "0 var(--spacing-xl) 1rem",
+                  padding: "0.5rem",
+                  backgroundColor: "var(--background-color, #f5f5f5)",
+                  border: "1px solid var(--border-color, #ddd)",
+                  borderRadius: "4px"
                 }}>
                   <div style={{
-                    width: `${saveProgress}%`,
-                    height: "100%",
-                    backgroundColor: "var(--progress-color, #4caf50)",
-                    transition: "width 0.3s ease-in-out"
-                  }}></div>
+                    fontSize: "0.9rem",
+                    marginBottom: "0.5rem",
+                    color: "var(--text-color, #333)"
+                  }}>
+                    {saveProgressText}
+                  </div>
+                  <div style={{
+                    width: "100%",
+                    height: "8px",
+                    backgroundColor: "var(--progress-background, #e0e0e0)",
+                    borderRadius: "4px",
+                    overflow: "hidden"
+                  }}>
+                    <div style={{
+                      width: `${saveProgress}%`,
+                      height: "100%",
+                      backgroundColor: "var(--progress-color, #4caf50)",
+                      transition: "width 0.3s ease-in-out"
+                    }}></div>
+                  </div>
+                  <div style={{
+                    fontSize: "0.8rem",
+                    marginTop: "0.25rem",
+                    color: "var(--text-color-muted, #666)",
+                    textAlign: "right"
+                  }}>
+                    {Math.round(saveProgress)}%
+                  </div>
                 </div>
-                <div style={{
-                  fontSize: "0.8rem",
-                  marginTop: "0.25rem",
-                  color: "var(--text-color-muted, #666)",
-                  textAlign: "right"
-                }}>
-                  {Math.round(saveProgress)}%
-                </div>
-              </div>
-            )}
+              )}
             
-            <div className="section-container" ref={sectionContainerRef}>
-              {renderSectionContent()}
-            </div>
-          </>
-        )}
+              <div className="section-container" ref={sectionContainerRef}>
+                {renderSectionContent()}
+              </div>
+            </>
+          )}
+        </div>
       </div>
       
       
@@ -3030,7 +3240,12 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           projectName={projectName}
           onClose={() => setShowPRStatusPanel(false)}
           refreshProjectsList={refreshProjectsList}
-          onProjectStateChange={handleProjectStateChange}
+          onProjectStateChange={(state) => {
+            handleProjectStateChange(state);
+            // Closing one pull request of several leaves the project open, but
+            // puts that pull request's repo back on the waiting list.
+            if (normalizeProjectPRState(state) === 'open') refreshPendingDelivery();
+          }}
           onProjectDeleted={() => handleProjectGone(PROJECT_DELETED_NOTICE)}
           key={prStatusRefreshKey}
         />
@@ -3045,12 +3260,15 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           workflows={workflows.filter((w) => !w.isReusable).map((w) => ({ name: w.name, status: w.workflowStatus }))}
           // A newly added repo holds none of the project's workflows, so the
           // "changed only" default would under-deliver on a mixed-status project.
-          preselectAllWorkflows={prModalRepoScope !== null}
+          preselectAllWorkflows={prModalRepoScope !== null && prModalSelection === null}
+          initialSelection={prModalSelection}
+          projectDraft={projectPRState === 'draft'}
           projectCode={projectCode}
           usePrefix={usePrefix}
           customFiles={customFiles}
+          driftedCustomFileIds={driftedCustomFileIds}
           reusableWorkflows={campaignReusableWorkflows({
-            projectType,
+            projectType: workflowProjectType,
             ownedReusable: rxworkflows,
             linkedWorkflows,
             selectedRepos,
@@ -3075,7 +3293,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
           projectName={projectName}
           githubUser={user}
           selectedRepos={selectedRepos}
-          projectType={projectType}
+          projectType={workflowProjectType}
           onCreateReusableProject={() => navigate(`/project/${user}/new?type=rwx`)}
           onImportComplete={(prState) => {
             if (prState) {
@@ -3107,9 +3325,9 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         <ConfirmDialog
           open={true}
           title={newRepoDeliveryPrompt.length === 1
-            ? "Deliver this project's workflows to the new repository?"
-            : "Deliver this project's workflows to the new repositories?"}
-          description={`${newRepoDeliveryPrompt.join(", ")} ${newRepoDeliveryPrompt.length === 1 ? "was" : "were"} added and saved, but this project's workflows have not been delivered there yet. Open a pull request campaign for ${newRepoDeliveryPrompt.length === 1 ? "it" : "them"} now, or keep the change local and deliver later from the Workflows section.`}
+            ? `Deliver this project's ${deliverableNoun} to the new repository?`
+            : `Deliver this project's ${deliverableNoun} to the new repositories?`}
+          description={`${newRepoDeliveryPrompt.join(", ")} ${newRepoDeliveryPrompt.length === 1 ? "was" : "were"} added and saved, but this project's ${deliverableNoun} have not been delivered there yet. Open a pull request campaign for ${newRepoDeliveryPrompt.length === 1 ? "it" : "them"} now, or keep the change local and deliver later from ${filesSectionLabel}.`}
           confirmLabel="Create pull requests"
           cancelLabel="Save locally only"
           onConfirm={() => {
@@ -3125,7 +3343,9 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         <ConfirmDialog
           open={true}
           title={`${driftDialogInfo.label} with unresolved drift?`}
-          description="One or more workflows have been changed directly in GitHub since your last sync. Proceeding will overwrite those changes."
+          description={driftDialogInfo.includesFiles
+            ? "One or more workflows or files have been changed directly in GitHub since your last sync. Proceeding will overwrite those changes."
+            : "One or more workflows have been changed directly in GitHub since your last sync. Proceeding will overwrite those changes."}
           confirmLabel={driftDialogInfo.label}
           destructive
           onConfirm={() => { const fn = driftDialogInfo.onConfirm; setDriftDialogInfo(null); fn(); }}
@@ -3137,7 +3357,7 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
         <ConfirmDialog
           open={true}
           title="Rename project?"
-          description={`This will change the project display name to "${pendingRename}". The project key (${projectCode}) is fixed. ${projectKeyFixedNote(usePrefix, projectCode)}`}
+          description={`This will change the project display name to "${pendingRename}". The project key (${projectCode}) is fixed. ${projectKeyFixedNote(usePrefix, projectCode, typeConfig.holdsWorkflows)}`}
           confirmLabel="Rename"
           onConfirm={confirmProjectRename}
           onCancel={() => setPendingRename(null)}

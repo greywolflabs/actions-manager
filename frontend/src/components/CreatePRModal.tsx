@@ -11,6 +11,18 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { getDocsUrl } from "../help/helpLinks";
 import { normalizeWorkflowFilename, workflowDisplayFilename } from "../utils/workflowFilename";
+import { hasLocalChange } from "../api/customFiles";
+
+/**
+ * Exactly the files a campaign starts with when it is opened for them: "Keep
+ * the ActionsManager version" of drifted files. Synced files are offered too.
+ */
+export interface CampaignSelection {
+  workflows: string[];
+  reusableWorkflows: string[];
+  customFileIds: number[];
+  codeowners: boolean;
+}
 
 interface CreatePRModalProps {
   user: string;
@@ -22,11 +34,20 @@ interface CreatePRModalProps {
    * repository that holds none of them, "changed only" would under-deliver.
    */
   preselectAllWorkflows?: boolean;
+  /**
+   * The project is a draft. With nothing changed locally, that is because its
+   * repositories or branches changed, and the campaign starts with every file.
+   */
+  projectDraft?: boolean;
+  /** Start with exactly these files ticked, whatever their status; see CampaignSelection. */
+  initialSelection?: CampaignSelection | null;
   reusableWorkflows?: Array<{ name: string; status?: string; sourceRepo?: string; isLinked?: boolean; deliversToProjectRepos?: boolean }>;
   /** Project code and naming mode, so rows name the file that lands on GitHub. */
   projectCode?: string;
   usePrefix?: boolean;
   customFiles?: Array<{ id: number; file_path: string; file_status: string; pending_delete: boolean }>;
+  /** Custom files the last drift check found changed on GitHub: offered even when synced, so a campaign can put them back. */
+  driftedCustomFileIds?: ReadonlySet<number>;
   /** The project's CODEOWNERS file, which a campaign can deliver to every repository it targets. */
   codeowners?: { filePath: string; status: string } | null;
   validationRepo?: string | null;
@@ -274,6 +295,47 @@ function suggestCampaignName(
   return "";
 }
 
+/** What a custom file's row says beside its path: why it is offered when nothing local changed. */
+function customFileNote(
+  file: { id: number; file_status: string; pending_delete: boolean }, drifted?: ReadonlySet<number>,
+): string {
+  if (file.pending_delete) return " (pending delete)";
+  if (!hasLocalChange(file) && drifted?.has(file.id)) return " (changed on GitHub)";
+  return "";
+}
+
+/**
+ * Whether the campaign starts with every file ticked: for a newly added
+ * repository, or for a draft project with nothing changed locally, whose new
+ * repositories or branches hold none of its files yet. Otherwise only what
+ * changed, so a synced project's campaign never re-pushes identical files.
+ */
+function startsWithEveryFile(
+  preselectAll: boolean,
+  projectDraft: boolean,
+  statuses: Array<string | undefined>,
+  customFiles: NonNullable<CreatePRModalProps["customFiles"]>,
+): boolean {
+  if (preselectAll) return true;
+  return projectDraft
+    && statuses.every((status) => status === "synced_with_github")
+    && !customFiles.some(hasLocalChange);
+}
+
+/** Whether the campaign is still being created: the request is out, or its task has not finished. */
+function creationInProgress(creating: boolean, taskStatus: { status?: string } | null | undefined): boolean {
+  if (creating) return true;
+  const status = taskStatus?.status;
+  return Boolean(taskStatus) && status !== "completed" && status !== "error";
+}
+
+/** Whether a campaign's selection carries anything: a workflow, a custom file or CODEOWNERS. */
+function selectionCarriesFiles(
+  workflows: Set<string>, reusableWorkflows: Set<string>, customFileIds: Set<number>, includeCodeowners: boolean,
+): boolean {
+  return workflows.size > 0 || reusableWorkflows.size > 0 || customFileIds.size > 0 || includeCodeowners;
+}
+
 /** Ticked when it has changes to deliver, or for a newly added repo, which needs every file. */
 function includesCodeownersByDefault(codeowners: CreatePRModalProps["codeowners"], preselectAll: boolean): boolean {
   if (!codeowners) return false;
@@ -295,6 +357,41 @@ interface CreatePRCampaignParams {
   campaignDescription: string;
 }
 
+/**
+ * The custom files a campaign offers, and which of them are ticked. Every file
+ * with local changes; a synced one too when it drifted, to put it back, or for
+ * a newly added repo (preselectAll), which needs every file.
+ */
+function useCustomFileSelection(
+  customFiles: NonNullable<CreatePRModalProps["customFiles"]>,
+  preselectAll: boolean,
+  drifted: ReadonlySet<number> | undefined,
+  pinned: readonly number[] | undefined,
+) {
+  const offeredCustomFiles = useMemo(
+    () => customFiles.filter((f) => hasLocalChange(f) || preselectAll || drifted?.has(f.id) || pinned?.includes(f.id)),
+    [customFiles, preselectAll, drifted, pinned],
+  );
+  // A drifted synced file is offered unticked, for a newly added repo too:
+  // overwriting a change made on GitHub is the user's call, as it is for a
+  // synced CODEOWNERS. Pinned files are that call already made.
+  const [selectedCustomFileIds, setSelectedCustomFileIds] = useState<Set<number>>(
+    () => new Set(pinned ?? offeredCustomFiles
+      .filter((f) => hasLocalChange(f) || (preselectAll && !drifted?.has(f.id)))
+      .map((f) => f.id))
+  );
+  // A file no longer offered (its drift resolved while the modal was open) must
+  // not stay ticked out of sight: the server delivers a named file whatever its status.
+  useEffect(() => {
+    const offered = new Set(offeredCustomFiles.map((f) => f.id));
+    setSelectedCustomFileIds((prev) => {
+      const kept = new Set([...prev].filter((id) => offered.has(id)));
+      return kept.size === prev.size ? prev : kept;
+    });
+  }, [offeredCustomFiles]);
+  return { offeredCustomFiles, selectedCustomFileIds, setSelectedCustomFileIds };
+}
+
 function useCreatePRCampaign({
   user, projectName, selectedRepos, selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, includeCodeowners, onSuccess,
   campaignName, campaignDescription,
@@ -310,10 +407,12 @@ function useCreatePRCampaign({
   }, []);
 
   const handleCreate = useCallback(async () => {
-    const hasWorkflowsOrFiles = selectedWorkflows.size > 0 || selectedReusableWorkflows.size > 0 || selectedCustomFileIds.size > 0;
+    const carriesFiles = selectionCarriesFiles(
+      selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, includeCodeowners,
+    );
     // CODEOWNERS goes to the caller repositories like a custom file, so it needs them too.
-    if (selectedRepos.size === 0 && (hasWorkflowsOrFiles || includeCodeowners)) { setError("Please select at least one repository"); return; }
-    if (!hasWorkflowsOrFiles && !includeCodeowners) {
+    if (selectedRepos.size === 0 && carriesFiles) { setError("Please select at least one repository"); return; }
+    if (!carriesFiles) {
       setError("Please select at least one workflow, custom file, or CODEOWNERS"); return;
     }
     setCreating(true);
@@ -327,7 +426,12 @@ function useCreatePRCampaign({
     try {
       const response = await createPullRequests(user, projectName, {
         selectedRepos: Array.from(selectedRepos),
-        selectedWorkflows: selectedWorkflows.size > 0 ? Array.from(selectedWorkflows) : undefined,
+        // The list whenever the caller repos get anything: sent as undefined,
+        // an empty selection means every workflow to the server. Undefined
+        // only for a run carrying nothing but reusable workflows.
+        selectedWorkflows: selectedWorkflows.size > 0 || selectedCustomFileIds.size > 0 || includeCodeowners
+          ? Array.from(selectedWorkflows)
+          : undefined,
         selectedReusableWorkflows: selectedReusableWorkflows.size > 0 ? Array.from(selectedReusableWorkflows) : undefined,
         // Always send array so empty selection explicitly excludes files (not undefined=all)
         selectedCustomFileIds: Array.from(selectedCustomFileIds),
@@ -430,10 +534,13 @@ interface PRCreationProgressProps {
   selectedReusableWorkflows: Set<string>;
   selectedCustomFileIds?: Set<number>;
   changedCustomFiles?: Array<{ id: number; file_path: string }>;
+  /** The CODEOWNERS file's path, when the campaign carries it. */
+  codeownersPath?: string | null;
 }
 
 const PRCreationProgress: React.FC<PRCreationProgressProps> = ({
   taskStatus, totalPRTargetRepos, selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, changedCustomFiles,
+  codeownersPath = null,
 }) => (
   <div className="task-status-section" data-testid="pr-creation-progress">
     <div className="creating-spinner">
@@ -459,13 +566,23 @@ const PRCreationProgress: React.FC<PRCreationProgressProps> = ({
         );
       })}
     </div>
-    <div className="task-workflow-files">
-      <span className="task-workflow-files-label">Workflow files:</span>
-      <ul>
-        {Array.from(selectedWorkflows).map((wf) => <li key={wf}>{normalizeWorkflowFilename(wf)}</li>)}
-        {Array.from(selectedReusableWorkflows).map((wf) => <li key={wf}>{normalizeWorkflowFilename(wf)}</li>)}
-      </ul>
-    </div>
+    {selectedWorkflows.size + selectedReusableWorkflows.size > 0 && (
+      <div className="task-workflow-files">
+        <span className="task-workflow-files-label">Workflow files:</span>
+        <ul>
+          {Array.from(selectedWorkflows).map((wf) => <li key={wf}>{normalizeWorkflowFilename(wf)}</li>)}
+          {Array.from(selectedReusableWorkflows).map((wf) => <li key={wf}>{normalizeWorkflowFilename(wf)}</li>)}
+        </ul>
+      </div>
+    )}
+    {codeownersPath && (
+      <div className="task-workflow-files">
+        <span className="task-workflow-files-label">CODEOWNERS:</span>
+        <ul>
+          <li>{codeownersPath}</li>
+        </ul>
+      </div>
+    )}
     {selectedCustomFileIds && selectedCustomFileIds.size > 0 && changedCustomFiles && (
       <div className="task-workflow-files">
         <span className="task-workflow-files-label">Custom files:</span>
@@ -499,7 +616,9 @@ const PRCreationResults: React.FC<{ results: any }> = ({ results }) => (
     </div>
     <div className="results-details">
       {Object.entries(results.results || {}).map(([key, value]: [string, any]) => {
-        const status = value.status || "unknown";
+        // A target that already holds everything carried, such as the repos a
+        // put-back campaign leaves alone, is not a failure.
+        const status = value.nothing_to_deliver ? "nothing_to_deliver" : value.status || "unknown";
         const prUrl = value.pr_url;
         const prNumber = value.pr_number;
         // Without these the user sees a red chip and has to read the server log to
@@ -511,6 +630,7 @@ const PRCreationResults: React.FC<{ results: any }> = ({ results }) => (
               <span className={`result-status ${status}`}>
                 {status === "pr_created" && "✅ Created"}
                 {status === "pr_updated" && "✅ Updated"}
+                {status === "nothing_to_deliver" && "➖ Already up to date"}
                 {status === "error" && "❌ Error"}
               </span>
               <span className="result-repo">{key}</span>
@@ -721,6 +841,7 @@ interface PRCreationFormProps {
   workflows: Array<{ name: string; status?: string; displayName?: string }>;
   reusableWorkflows: Array<{ name: string; status?: string; sourceRepo?: string; displayName?: string; deliversToProjectRepos?: boolean }>;
   changedCustomFiles: Array<{ id: number; file_path: string; file_status: string; pending_delete: boolean }>;
+  driftedCustomFileIds?: ReadonlySet<number>;
   selectedCustomFileIds: Set<number>;
   onToggleCustomFile: (id: number) => void;
   onSelectAllCustomFiles: () => void;
@@ -753,7 +874,7 @@ const PRCreationForm: React.FC<PRCreationFormProps> = ({
   requiresPreflight, preflightPassed, campaignBlockedByPreflight,
   validationActionInProgress, selectedWorkflows, selectedReusableWorkflows,
   changedWorkflows, unchangedWorkflows, changedReusableWorkflows, unchangedReusableWorkflows,
-  workflows, reusableWorkflows, changedCustomFiles, selectedCustomFileIds,
+  workflows, reusableWorkflows, changedCustomFiles, driftedCustomFileIds, selectedCustomFileIds,
   onToggleCustomFile, onSelectAllCustomFiles, onDeselectAllCustomFiles,
   showUnchangedWorkflows, setShowUnchangedWorkflows,
   repositories, selectedRepos, selectedReusableSourceRepos, creating,
@@ -817,12 +938,14 @@ const PRCreationForm: React.FC<PRCreationFormProps> = ({
             </p>
           </>
         )}
-        <div className="campaign-summary">
-          <span className="selection-count">
-            {totalSelectedWorkflows} of {totalWorkflows} workflow{totalWorkflows !== 1 ? "s" : ""} selected
-            {reusableWorkflows.length > 0 && ` (${selectedWorkflows.size} standard, ${selectedReusableWorkflows.size} reusable)`}
-          </span>
-        </div>
+        {totalWorkflows > 0 && (
+          <div className="campaign-summary">
+            <span className="selection-count">
+              {totalSelectedWorkflows} of {totalWorkflows} workflow{totalWorkflows !== 1 ? "s" : ""} selected
+              {reusableWorkflows.length > 0 && ` (${selectedWorkflows.size} standard, ${selectedReusableWorkflows.size} reusable)`}
+            </span>
+          </div>
+        )}
       </div>
       {workflows.length > 0 && (
         <WorkflowSection
@@ -868,7 +991,7 @@ const PRCreationForm: React.FC<PRCreationFormProps> = ({
               return (
                 <label key={cf.id} className={`repo-item ${isSelected ? "selected" : ""}`}>
                   <input type="checkbox" checked={isSelected} onChange={() => onToggleCustomFile(cf.id)} disabled={creating} />
-                  <span className="repo-name">{cf.file_path}{cf.pending_delete ? " (pending delete)" : ""}</span>
+                  <span className="repo-name">{cf.file_path}{customFileNote(cf, driftedCustomFileIds)}</span>
                 </label>
               );
             })}
@@ -887,13 +1010,14 @@ const PRCreationForm: React.FC<PRCreationFormProps> = ({
                 disabled={creating}
               />
               <span className="repo-name">{codeowners.filePath}</span>
-              <span className="workflow-status-badge">every caller repository</span>
+              <span className="workflow-status-badge">{totalWorkflows > 0 ? "every caller repository" : "every repository"}</span>
             </label>
           </div>
         </div>
       )}
       <div className="repo-selection">
-        <h3 className="selection-section-title">Caller Repositories</h3>
+        {/* A campaign without workflows (a Managed Files project's) has no callers, only repositories. */}
+        <h3 className="selection-section-title">{totalWorkflows > 0 ? "Caller Repositories" : "Repositories"}</h3>
         <div className="selection-actions">
           <Button onClick={onSelectAllRepos} variant="secondary" size="sm" disabled={creating}>Select All</Button>
           <Button onClick={onDeselectAllRepos} variant="secondary" size="sm" disabled={creating}>Deselect All</Button>
@@ -941,10 +1065,13 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
   repositories,
   workflows: workflowsProp,
   preselectAllWorkflows = false,
+  projectDraft = false,
+  initialSelection = null,
   reusableWorkflows: reusableWorkflowsProp = [],
   projectCode,
   usePrefix,
   customFiles = [],
+  driftedCustomFileIds,
   codeowners = null,
   validationRepo = null,
   preflightRequired = false,
@@ -977,31 +1104,36 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
   const [selectedRepos, setSelectedRepos] = useState<Set<string>>(
     new Set(repositories.map((r) => r.full_name || r.name))
   );
-  const [showUnchangedWorkflows, setShowUnchangedWorkflows] = useState(false);
+  // Open when a workflow the campaign was opened for sits among the unchanged ones.
+  const [showUnchangedWorkflows, setShowUnchangedWorkflows] = useState(() => Boolean(
+    initialSelection?.workflows.some((name) => workflows.some((w) => w.name === name && w.status === "synced_with_github"))
+  ));
   const changedWorkflows = useMemo(() => workflows.filter((w) => w.status !== "synced_with_github"), [workflows]);
   const unchangedWorkflows = useMemo(() => workflows.filter((w) => w.status === "synced_with_github"), [workflows]);
   const changedReusableWorkflows = useMemo(() => reusableWorkflows.filter((w) => w.status !== "synced_with_github"), [reusableWorkflows]);
   const unchangedReusableWorkflows = useMemo(() => reusableWorkflows.filter((w) => w.status === "synced_with_github"), [reusableWorkflows]);
+  const [everyFile] = useState(() => startsWithEveryFile(
+    preselectAllWorkflows,
+    projectDraft,
+    [...workflows, ...reusableWorkflows].map((w) => w.status).concat(codeowners ? [codeowners.status] : []),
+    customFiles,
+  ));
   const [selectedWorkflows, setSelectedWorkflows] = useState<Set<string>>(
-    new Set((!preselectAllWorkflows && changedWorkflows.length > 0 ? changedWorkflows : workflows).map((w) => w.name))
+    () => new Set(initialSelection?.workflows ?? (everyFile ? workflows : changedWorkflows).map((w) => w.name))
   );
-  // A campaign for a newly added repo (preselectAllWorkflows) needs every file
+  // A campaign that starts with every file (everyFile) needs every file
   // that repo should hold. A reusable workflow this project owns is one of them;
   // a linked one lives in its RWX project's repo, so it stays changed-only.
   const [selectedReusableWorkflows, setSelectedReusableWorkflows] = useState<Set<string>>(
-    new Set(
-      reusableWorkflows
-        .filter((w) => w.status !== "synced_with_github" || (preselectAllWorkflows && w.deliversToProjectRepos))
-        .map((w) => w.name)
-    )
+    () => new Set(initialSelection?.reusableWorkflows ?? reusableWorkflows
+      .filter((w) => w.status !== "synced_with_github" || (everyFile && w.deliversToProjectRepos))
+      .map((w) => w.name))
   );
 
-  const changedCustomFiles = useMemo(() => customFiles.filter((f) => f.file_status !== "synced_with_github" || f.pending_delete), [customFiles]);
-  const [selectedCustomFileIds, setSelectedCustomFileIds] = useState<Set<number>>(
-    new Set(changedCustomFiles.map((f) => f.id))
-  );
+  const { offeredCustomFiles, selectedCustomFileIds, setSelectedCustomFileIds } =
+    useCustomFileSelection(customFiles, everyFile, driftedCustomFileIds, initialSelection?.customFileIds);
   const [includeCodeowners, setIncludeCodeowners] = useState<boolean>(
-    () => includesCodeownersByDefault(codeowners, preselectAllWorkflows)
+    () => (initialSelection ? initialSelection.codeowners && codeowners !== null : includesCodeownersByDefault(codeowners, everyFile))
   );
 
   const [campaignName, setCampaignName] = useState("");
@@ -1049,9 +1181,8 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
   const preflightPassed = preflight.status === "passed";
   const campaignBlockedByPreflight = requiresPreflight && !preflightPassed;
   const validationActionInProgress = creating || preflight.running || preflight.refreshing || preflight.closing || preflight.merging;
-  const hasWorkflowsOrFiles = selectedWorkflows.size > 0 || selectedReusableWorkflows.size > 0 || selectedCustomFileIds.size > 0;
   // Every selection, CODEOWNERS included, is delivered to the caller repositories.
-  const canCreate = (includeCodeowners || hasWorkflowsOrFiles)
+  const canCreate = selectionCarriesFiles(selectedWorkflows, selectedReusableWorkflows, selectedCustomFileIds, includeCodeowners)
     && selectedRepos.size > 0
     && (!requiresPreflight || preflightPassed);
 
@@ -1091,7 +1222,8 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
   const totalSelectedWorkflows = selectedWorkflows.size + selectedReusableWorkflows.size;
   const totalWorkflows = workflows.length + reusableWorkflows.length;
   const modalTitle = campaignBlockedByPreflight ? "Campaign Readiness" : "Create PR Campaign";
-  const isCreatingInProgress = creating || (taskStatus && taskStatus.status !== "completed" && taskStatus.status !== "error");
+  const isCreatingInProgress = creationInProgress(creating, taskStatus);
+  const carriedCodeownersPath = includeCodeowners ? codeowners?.filePath : null;
 
   // Dismissing happens on a dedicated backdrop button rather than a click
   // handler on the overlay div: a div with onClick is a non-native interactive
@@ -1119,7 +1251,7 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
         </div>
         <div className="modal-body">
           {isCreatingInProgress ? (
-            <PRCreationProgress taskStatus={taskStatus} totalPRTargetRepos={totalPRTargetRepos} selectedWorkflows={selectedWorkflows} selectedReusableWorkflows={selectedReusableWorkflows} selectedCustomFileIds={selectedCustomFileIds} changedCustomFiles={changedCustomFiles} />
+            <PRCreationProgress taskStatus={taskStatus} totalPRTargetRepos={totalPRTargetRepos} selectedWorkflows={selectedWorkflows} selectedReusableWorkflows={selectedReusableWorkflows} selectedCustomFileIds={selectedCustomFileIds} changedCustomFiles={offeredCustomFiles} codeownersPath={carriedCodeownersPath} />
           ) : results ? (
             <PRCreationResults results={results} />
           ) : (
@@ -1144,10 +1276,11 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
               unchangedReusableWorkflows={unchangedReusableWorkflows}
               workflows={workflows}
               reusableWorkflows={reusableWorkflows}
-              changedCustomFiles={changedCustomFiles}
+              changedCustomFiles={offeredCustomFiles}
+              driftedCustomFileIds={driftedCustomFileIds}
               selectedCustomFileIds={selectedCustomFileIds}
               onToggleCustomFile={(id) => { const next = new Set(selectedCustomFileIds); if (next.has(id)) { next.delete(id); } else { next.add(id); } setSelectedCustomFileIds(next); }}
-              onSelectAllCustomFiles={() => setSelectedCustomFileIds(new Set(changedCustomFiles.map((f) => f.id)))}
+              onSelectAllCustomFiles={() => setSelectedCustomFileIds(new Set(offeredCustomFiles.map((f) => f.id)))}
               onDeselectAllCustomFiles={() => setSelectedCustomFileIds(new Set())}
               showUnchangedWorkflows={showUnchangedWorkflows}
               setShowUnchangedWorkflows={setShowUnchangedWorkflows}
@@ -1181,7 +1314,7 @@ const CreatePRModal: React.FC<CreatePRModalProps> = ({
             <>
               <Button onClick={onClose} variant="secondary" disabled={creating}>Cancel</Button>
               <Button data-testid="confirm-create-prs" onClick={handleCreate} disabled={creating || !canCreate}>
-                {createButtonText(creating, preflightConfigured, totalPRTargetRepos.size, totalSelectedWorkflows, selectedCustomFileIds.size + (includeCodeowners ? 1 : 0))}
+                {createButtonText(creating, preflightConfigured, totalPRTargetRepos.size, totalSelectedWorkflows, selectedCustomFileIds.size + Number(includeCodeowners))}
               </Button>
             </>
           )}

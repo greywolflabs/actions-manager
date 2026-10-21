@@ -17,8 +17,13 @@ vi.mock("../api/workflows", () => ({
   deleteWorkflowFromDatabase: vi.fn().mockResolvedValue({ success: true }),
 }));
 
+vi.mock("../api/codeowners", () => ({ getCodeowners: vi.fn() }));
+vi.mock("../api/customFiles", () => ({ getCustomFileOnGitHub: vi.fn() }));
+
 import { getProjectDrift, resolveWorkflowDrift } from "../api/drift";
 import { deleteWorkflowFromGitHub, deleteWorkflowFromDatabase } from "../api/workflows";
+import { getCodeowners } from "../api/codeowners";
+import { getCustomFileOnGitHub } from "../api/customFiles";
 
 const mockDrift = (overrides: Partial<WorkflowDriftDetail> = {}): WorkflowDriftDetail => ({
   workflow_id: 1,
@@ -64,8 +69,11 @@ const defaultProps = {
 };
 
 /** Render, open the drift modal, and expand the diff for the first drift. */
-async function openDiff(user: ReturnType<typeof userEvent.setup>) {
-  render(<DriftDetection {...defaultProps} />);
+async function openDiff(
+  user: ReturnType<typeof userEvent.setup>,
+  props: Partial<React.ComponentProps<typeof DriftDetection>> = {},
+) {
+  render(<DriftDetection {...defaultProps} {...props} />);
   await waitFor(() => expect(screen.getByTestId("drift-banner")).toBeInTheDocument());
   await user.click(screen.getByTestId("review-drift-button"));
   await user.click(screen.getByRole("button", { name: /View Diff/i }));
@@ -317,10 +325,10 @@ describe("DriftDetection", () => {
         affected_repos: ["org/repo2"],
       });
 
-    async function openDeletedDiff() {
+    async function openDeletedDiff(props: Partial<React.ComponentProps<typeof DriftDetection>> = {}) {
       const user = userEvent.setup();
       vi.mocked(getProjectDrift).mockResolvedValue(mockSummary([deletedDrift()]));
-      render(<DriftDetection {...defaultProps} />);
+      render(<DriftDetection {...defaultProps} {...props} />);
       await waitFor(() => expect(screen.getByTestId("drift-banner")).toBeInTheDocument());
       await user.click(screen.getByTestId("review-drift-button"));
       await user.click(screen.getByRole("button", { name: /View Diff/i }));
@@ -346,7 +354,7 @@ describe("DriftDetection", () => {
       await openDeletedDiff();
 
       expect(screen.queryByTestId("adopt-github-version-button")).not.toBeInTheDocument();
-      expect(screen.getByTestId("deleted-restore-pr-button")).toBeInTheDocument();
+      expect(screen.getByTestId("keep-actionsmanager-button")).toBeInTheDocument();
       expect(screen.getByTestId("delete-everywhere-button")).toBeInTheDocument();
     });
 
@@ -356,30 +364,28 @@ describe("DriftDetection", () => {
       await user.click(screen.getByTestId("delete-everywhere-button"));
 
       expect(await screen.findByText(/org\/repo, org\/repo2/)).toBeInTheDocument();
-      expect(screen.getByText(/cannot be undone/i)).toBeInTheDocument();
+      expect(screen.getByText(/version history included, when they merge/i)).toBeInTheDocument();
       // Nothing deleted until the user confirms.
       expect(vi.mocked(deleteWorkflowFromGitHub)).not.toHaveBeenCalled();
     });
 
-    test("confirming removes the file from every repo and from ActionsManager", async () => {
-      const user = await openDeletedDiff();
+    test("confirming opens pull requests removing it, and leaves the workflow until they merge", async () => {
+      const onProjectChanged = vi.fn();
+      const user = await openDeletedDiff({ onProjectChanged });
 
       await user.click(screen.getByTestId("delete-everywhere-button"));
       await user.click(await screen.findByRole("button", { name: /Delete everywhere/i }));
 
-      // "direct", explicitly: the row is deleted immediately below, so a
-      // campaign would be left carrying a removal for a workflow that no longer
-      // exists in ActionsManager.
+      // A removal campaign: drift is put right through pull requests only, and
+      // the workflow leaves ActionsManager when they merge, not now.
       await waitFor(() =>
         expect(vi.mocked(deleteWorkflowFromGitHub)).toHaveBeenCalledWith(
-          "testuser", ["org/repo", "org/repo2"], "Build", "", "proj", "direct",
+          "testuser", ["org/repo", "org/repo2"], "Build", "", "proj", "campaign",
         ),
       );
-      await waitFor(() =>
-        expect(vi.mocked(deleteWorkflowFromDatabase)).toHaveBeenCalledWith(
-          "testuser", "proj", "Build",
-        ),
-      );
+      expect(vi.mocked(deleteWorkflowFromDatabase)).not.toHaveBeenCalled();
+      // The page shows the workflow marked for removal without a refresh.
+      expect(onProjectChanged).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -441,17 +447,17 @@ describe("DriftDetection", () => {
     expect(screen.queryByTestId("drift-banner")).not.toBeInTheDocument();
   });
 
-  test("shows the clarified action labels, descriptions, and repo/branch", async () => {
+  test("offers the same two actions as every file, and nothing that skips a pull request", async () => {
     const user = userEvent.setup();
     vi.mocked(getProjectDrift).mockResolvedValue(mockSummary([mockDrift()]));
     await openDiff(user);
 
-    expect(screen.getByRole("button", { name: /Create Fix Pull Request/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Restore Directly/i })).toBeInTheDocument();
-    expect(screen.getByText(/No other repositories are changed/i)).toBeInTheDocument();
-    expect(screen.getByText(/Immediately overwrites the workflow/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Keep ActionsManager Version/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Use GitHub Version/i })).toBeInTheDocument();
+    expect(screen.getByText(/carrying only this file/i)).toBeInTheDocument();
     expect(screen.getByText(/Recommended/i)).toBeInTheDocument();
-    expect(screen.getByText(/Immediate GitHub change/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Restore Directly/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Create Fix Pull Request/i })).not.toBeInTheDocument();
     // Repo + target branch surfaced prominently above the diff.
     expect(screen.getByText(/Target branch:/i)).toBeInTheDocument();
     // Clarified diff column headers.
@@ -459,120 +465,32 @@ describe("DriftDetection", () => {
     expect(screen.getByText("Current GitHub version")).toBeInTheDocument();
   });
 
-  test("Create Fix Pull Request posts the pr payload and refreshes drift", async () => {
+  test("Keep ActionsManager Version hands exactly this workflow to the campaign and closes the review", async () => {
     const user = userEvent.setup();
+    const onKeep = vi.fn();
     vi.mocked(getProjectDrift).mockResolvedValue(mockSummary([mockDrift()]));
-    vi.mocked(resolveWorkflowDrift).mockResolvedValue({
-      message: "PR opened",
-      action: "restore_actionsmanager",
-      workflow_id: 1,
-      repo: "org/repo",
-      branch: "main",
-      state: "pr_pending",
-    });
-    await openDiff(user);
+    await openDiff(user, { onKeepActionsManagerVersion: onKeep });
 
-    await user.click(screen.getByRole("button", { name: /Create Fix Pull Request/i }));
+    await user.click(screen.getByRole("button", { name: /Keep ActionsManager Version/i }));
 
-    expect(vi.mocked(resolveWorkflowDrift)).toHaveBeenCalledWith(1, {
-      github_user: "testuser",
-      repo: "org/repo",
-      branch: "main",
-      resolution: "restore_actionsmanager",
-      delivery_mode: "pr",
-      // Sent so the backend can reject a stale resolve (issue: drift hardening).
-      expected_github_sha: "sha-b",
-    });
-    // Drift refetched after success (initial load + post-resolve refresh).
-    await waitFor(() => expect(vi.mocked(getProjectDrift).mock.calls.length).toBeGreaterThanOrEqual(2));
-  });
-
-  test("a stale resolve surfaces the conflict instead of silently overwriting", async () => {
-    // The backend 409s when the file changed since drift was checked; the user
-    // must see that rather than believing their resolve succeeded.
-    const user = userEvent.setup();
-    vi.mocked(getProjectDrift).mockResolvedValue(mockSummary([mockDrift()]));
-    vi.mocked(resolveWorkflowDrift).mockRejectedValue({
-      response: {
-        status: 409,
-        data: { detail: "ci.yml in org/repo@main changed since drift was checked." },
-      },
-    });
-    await openDiff(user);
-
-    await user.click(screen.getByRole("button", { name: /Create Fix Pull Request/i }));
-
-    expect(
-      await screen.findByText(/changed since drift was checked/i),
-    ).toBeInTheDocument();
-  });
-
-  test("disables the actions and prevents duplicate submits while a resolve is in flight", async () => {
-    const user = userEvent.setup();
-    vi.mocked(getProjectDrift).mockResolvedValue(mockSummary([mockDrift()]));
-    let finish!: () => void;
-    vi.mocked(resolveWorkflowDrift).mockReturnValue(
-      new Promise((resolve) => {
-        finish = () => resolve({
-          message: "PR opened", action: "restore_actionsmanager",
-          workflow_id: 1, repo: "org/repo", branch: "main", state: "pr_pending",
-        });
-      }),
-    );
-    await openDiff(user);
-
-    const prButton = screen.getByRole("button", { name: /Create Fix Pull Request/i });
-    await user.click(prButton);
-
-    // In-flight: shows action-specific loading text and disables all row actions.
-    expect(screen.getByRole("button", { name: /Creating pull request/i })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /Restore Directly/i })).toBeDisabled();
-
-    // A second click is a no-op (button disabled) — still exactly one call.
-    await user.click(screen.getByRole("button", { name: /Creating pull request/i }));
-    expect(vi.mocked(resolveWorkflowDrift)).toHaveBeenCalledTimes(1);
-
-    finish();
-    await waitFor(() =>
-      expect(screen.queryByRole("button", { name: /Creating pull request/i })).not.toBeInTheDocument());
-  });
-
-  test("Restore Directly requires confirmation before writing to GitHub", async () => {
-    const user = userEvent.setup();
-    vi.mocked(getProjectDrift).mockResolvedValue(mockSummary([mockDrift()]));
-    vi.mocked(resolveWorkflowDrift).mockResolvedValue({
-      message: "restored", action: "restore_actionsmanager",
-      workflow_id: 1, repo: "org/repo", branch: "main", state: "synced",
-    });
-    await openDiff(user);
-
-    await user.click(screen.getByRole("button", { name: /Restore Directly/i }));
-    // No API call yet — confirmation dialog naming repo + branch appears first.
+    expect(onKeep).toHaveBeenCalledTimes(1);
+    const [[rows]] = onKeep.mock.calls;
+    expect(rows.map((row: { kind: string; fileId: number; repo: string }) => [row.kind, row.fileId, row.repo]))
+      .toEqual([["workflow", 1, "org/repo"]]);
+    // Nothing is written from here: the campaign modal opens for review.
     expect(vi.mocked(resolveWorkflowDrift)).not.toHaveBeenCalled();
-    expect(screen.getByText(/Overwrite GitHub directly\?/i)).toBeInTheDocument();
-    expect(screen.getByText(/branch main in org\/repo/i)).toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: /Overwrite directly/i }));
-    expect(vi.mocked(resolveWorkflowDrift)).toHaveBeenCalledWith(
-      1,
-      expect.objectContaining({ resolution: "restore_actionsmanager", delivery_mode: "direct" }),
-    );
+    await waitFor(() => expect(screen.queryByTestId("drift-modal")).not.toBeInTheDocument());
   });
 
-  test("shows the backend error detail instead of the raw axios message", async () => {
+  test("Use GitHub Version on a workflow opens its scope choice, without a direct commit", async () => {
     const user = userEvent.setup();
     vi.mocked(getProjectDrift).mockResolvedValue(mockSummary([mockDrift()]));
-    vi.mocked(resolveWorkflowDrift).mockRejectedValue({
-      response: { data: { detail: "Branch protection blocked the push" } },
-      message: "Request failed with status code 500",
-    });
     await openDiff(user);
 
-    await user.click(screen.getByRole("button", { name: /Create Fix Pull Request/i }));
+    await user.click(screen.getByRole("button", { name: /Use GitHub Version/i }));
 
-    await waitFor(() =>
-      expect(screen.getByText("Branch protection blocked the push")).toBeInTheDocument());
-    expect(screen.queryByText(/Request failed with status code 500/i)).not.toBeInTheDocument();
+    expect(await screen.findByTestId("adopt-github-version-modal")).toBeInTheDocument();
+    expect(screen.queryByText(/Direct commit/i)).not.toBeInTheDocument();
   });
 });
 
@@ -634,28 +552,84 @@ describe("DriftDetection – CODEOWNERS", () => {
     await waitFor(() => expect(onDriftLoaded).toHaveBeenCalledWith([mockDrift()], [row], []));
   });
 
-  test("lists each drifted branch and opens the CODEOWNERS editor to resolve it", async () => {
+  test("lists each drifted branch in the one table, with its kind, its diff and its two actions", async () => {
     const user = userEvent.setup();
-    const onOpenCodeowners = vi.fn();
+    const onKeep = vi.fn();
+    vi.mocked(getCodeowners).mockResolvedValue({
+      success: true, repo_id: 3, repo_name: "org/repo", branch: "main", local: null,
+      github: { exists: true, content: "* @someone-else\n", sha: "sha-b", path: ".github/CODEOWNERS" },
+    });
     vi.mocked(getProjectDrift).mockResolvedValue(withCodeowners([], [
-      codeownersDrift(),
-      codeownersDrift({ repo: "org/other", branch: "release/1", deleted_in_github: true, github_sha: null }),
+      codeownersDrift({ file_id: 4 }),
+      codeownersDrift({ file_id: 4, repo: "org/other", branch: "release/1", deleted_in_github: true, github_sha: null }),
     ]));
-    render(<DriftDetection {...defaultProps} onOpenCodeowners={onOpenCodeowners} />);
+    render(<DriftDetection {...defaultProps} onKeepActionsManagerVersion={onKeep}
+      contentOf={() => "* @org/team\n"} />);
     await waitFor(() => expect(screen.getByTestId("review-drift-button")).toBeEnabled());
 
     await user.click(screen.getByTestId("review-drift-button"));
-    const section = screen.getByTestId("codeowners-drift-section");
+    const rows = screen.getAllByRole("row").slice(1);
 
     expect(screen.getByText("⚠️ Drift Detected")).toBeInTheDocument();
-    expect(section).toHaveTextContent("org/repomainChanged in GitHub");
-    expect(section).toHaveTextContent("org/otherrelease/1Deleted in GitHub");
-    // Only CODEOWNERS drifted, so there is no empty workflow table to read.
-    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    expect(rows[0]).toHaveTextContent(".github/CODEOWNERSCODEOWNERSorg/repomainDrift detected");
+    expect(rows[1]).toHaveTextContent(".github/CODEOWNERSCODEOWNERSorg/otherrelease/1Deleted in GitHub");
 
-    await user.click(screen.getByTestId("open-codeowners-button"));
-    expect(onOpenCodeowners).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(screen.queryByTestId("drift-modal")).not.toBeInTheDocument());
+    await user.click(screen.getAllByRole("button", { name: /View Diff/i })[0]);
+    // GitHub's side read where the check read it; ActionsManager's from the page.
+    expect(await screen.findByText("* @someone-else")).toBeInTheDocument();
+    expect(screen.getByText("* @org/team")).toBeInTheDocument();
+    expect(vi.mocked(getCodeowners)).toHaveBeenCalledWith(
+      "org/repo", "testuser", "proj", { branch: "main", path: ".github/CODEOWNERS" },
+    );
+
+    await user.click(screen.getByRole("button", { name: /Keep ActionsManager Version/i }));
+    expect(onKeep.mock.calls[0][0].map((row: { kind: string; fileId: number }) => [row.kind, row.fileId]))
+      .toEqual([["codeowners", 4]]);
+  });
+
+  test("Use GitHub Version of CODEOWNERS is confirmed, then saved by the page", async () => {
+    const user = userEvent.setup();
+    const onUseGithub = vi.fn().mockResolvedValue(".github/CODEOWNERS now holds the GitHub version from org/repo.");
+    vi.mocked(getCodeowners).mockResolvedValue({
+      success: true, repo_id: 3, repo_name: "org/repo", branch: "main", local: null,
+      github: { exists: true, content: "x", sha: "sha-b", path: ".github/CODEOWNERS" },
+    });
+    vi.mocked(getProjectDrift).mockResolvedValue(withCodeowners([], [codeownersDrift({ file_id: 4 })]));
+    render(<DriftDetection {...defaultProps} onUseGithubVersionOfFiles={onUseGithub} />);
+    await waitFor(() => expect(screen.getByTestId("review-drift-button")).toBeEnabled());
+    await user.click(screen.getByTestId("review-drift-button"));
+    await user.click(screen.getByRole("button", { name: /View Diff/i }));
+
+    await user.click(screen.getByRole("button", { name: /Use GitHub Version/i }));
+    expect(onUseGithub).not.toHaveBeenCalled();
+    expect(screen.getByText(/becomes the project's version/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Use GitHub version" }));
+
+    await waitFor(() => expect(onUseGithub).toHaveBeenCalledTimes(1));
+    expect(onUseGithub.mock.calls[0][0][0]).toMatchObject({ kind: "codeowners", fileId: 4, repo: "org/repo", branch: "main" });
+  });
+
+  test("shows the page's error detail when using the GitHub version fails", async () => {
+    const user = userEvent.setup();
+    const onUseGithub = vi.fn().mockRejectedValue({
+      response: { data: { detail: "CODEOWNERS syntax error on line 2" } },
+      message: "Request failed with status code 400",
+    });
+    vi.mocked(getCodeowners).mockResolvedValue({
+      success: true, repo_id: 3, repo_name: "org/repo", branch: "main", local: null,
+      github: { exists: true, content: "x", sha: "sha-b", path: ".github/CODEOWNERS" },
+    });
+    vi.mocked(getProjectDrift).mockResolvedValue(withCodeowners([], [codeownersDrift({ file_id: 4 })]));
+    render(<DriftDetection {...defaultProps} onUseGithubVersionOfFiles={onUseGithub} />);
+    await waitFor(() => expect(screen.getByTestId("review-drift-button")).toBeEnabled());
+    await user.click(screen.getByTestId("review-drift-button"));
+    await user.click(screen.getByRole("button", { name: /View Diff/i }));
+
+    await user.click(screen.getByRole("button", { name: /Use GitHub Version/i }));
+    await user.click(screen.getByRole("button", { name: "Use GitHub version" }));
+
+    expect(await screen.findByText("CODEOWNERS syntax error on line 2")).toBeInTheDocument();
+    expect(screen.queryByText(/Request failed with status code 400/i)).not.toBeInTheDocument();
   });
 });
 
@@ -720,21 +694,42 @@ describe("DriftDetection – custom files", () => {
     await waitFor(() => expect(onDriftLoaded).toHaveBeenCalledWith([mockDrift()], [], [row]));
   });
 
-  test("lists each drifted file and branch in Review Drift", async () => {
+  test("lists each drifted file and branch in the one table, its diff read from the file's own GitHub copy", async () => {
     const user = userEvent.setup();
+    vi.mocked(getCustomFileOnGitHub).mockResolvedValue({
+      repo_id: 3, repo_name: "org/repo", branch: "main",
+      github: { exists: true, content: "echo changed\n", sha: "sha-b", path: "scripts/build.sh" },
+    });
     vi.mocked(getProjectDrift).mockResolvedValue(withCustomFiles([], [
       customFileDrift(),
       customFileDrift({ repo: "org/other", branch: "release/1", deleted_in_github: true, github_sha: null }),
     ]));
-    render(<DriftDetection {...defaultProps} />);
+    render(<DriftDetection {...defaultProps} contentOf={() => "echo build\n"} />);
     await waitFor(() => expect(screen.getByTestId("review-drift-button")).toBeEnabled());
 
     await user.click(screen.getByTestId("review-drift-button"));
-    const section = screen.getByTestId("custom-file-drift-section");
+    const rows = screen.getAllByRole("row").slice(1);
 
-    expect(screen.getByText("⚠️ Drift Detected")).toBeInTheDocument();
-    expect(section).toHaveTextContent("scripts/build.shorg/repomainChanged in GitHub");
-    expect(section).toHaveTextContent("scripts/build.shorg/otherrelease/1Deleted in GitHub");
-    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    expect(rows[0]).toHaveTextContent("scripts/build.shCustom fileorg/repomainDrift detected");
+    expect(rows[1]).toHaveTextContent("scripts/build.shCustom fileorg/otherrelease/1Deleted in GitHub");
+
+    await user.click(screen.getAllByRole("button", { name: /View Diff/i })[0]);
+    expect(await screen.findByText("echo changed")).toBeInTheDocument();
+    expect(vi.mocked(getCustomFileOnGitHub)).toHaveBeenCalledWith(1, 7, "org/repo", "main");
+  });
+
+  test("a deleted custom file can be put back, and is not deleted everywhere from here", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getProjectDrift).mockResolvedValue(withCustomFiles([], [
+      customFileDrift({ deleted_in_github: true, github_sha: null }),
+    ]));
+    render(<DriftDetection {...defaultProps} />);
+    await waitFor(() => expect(screen.getByTestId("review-drift-button")).toBeEnabled());
+    await user.click(screen.getByTestId("review-drift-button"));
+    await user.click(screen.getByRole("button", { name: /View Diff/i }));
+
+    expect(screen.getByTestId("keep-actionsmanager-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("delete-everywhere-button")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("adopt-github-version-button")).not.toBeInTheDocument();
   });
 });

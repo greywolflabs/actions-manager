@@ -44,8 +44,8 @@ const WIDTH = 1440;
 const HEIGHT = 900;
 test.use({ viewport: { width: WIDTH, height: HEIGHT }, video: { mode: "on", size: { width: WIDTH, height: HEIGHT } } });
 
-const PROJECT = "Payments Platform";
-const REPOS = ["acme-corp/payments-service", "acme-corp/payments-worker", "acme-corp/payments-api"];
+const PROJECT = "NodeBuilds";
+const REPOS = ["acme-corp/node-api", "acme-corp/node-worker", "acme-corp/node-web"];
 const BASE_COMMITS = [
   "9c41f7ab26d3e5108b7c4f0da2e6913d5f8a0b47",
   "4e83d0c9157fa62b8d0e391c47a5b8206fd1e93c",
@@ -75,7 +75,7 @@ test.describe("readme demo", () => {
     const project = makeProject({
       project_id: 1,
       project_name: PROJECT,
-      project_code: "PAY",
+      project_code: "NODE",
       github_user: DOCS_USER,
       last_modified_by: DOCS_USER,
       updated_at: now,
@@ -115,7 +115,7 @@ test.describe("readme demo", () => {
         repo,
         success: true,
         pr_number: 128 + i,
-        branch_name: "actions-manager/payments-platform",
+        branch_name: "actions-manager/nodebuilds",
       })),
     });
     await mockDriftResponse(page, { driftedWorkflows: [], lastChecked: now });

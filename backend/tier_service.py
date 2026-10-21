@@ -17,6 +17,7 @@ import license
 SELF_HOSTED_BETA_LIMITS = {
     "standard_projects": 4,   # Caller Workflow Projects
     "rwx_projects": 2,        # Reusable Workflow Projects
+    "managed_files_projects": 3,  # Managed Files projects, every kind together
     "secrets_per_project": 6,
     "env_vars_per_project": 6,
     "environments_per_project": 6,
@@ -55,6 +56,17 @@ def normalize_tier_name(tier: Optional[str]) -> str:
     return "free"
 
 
+def _beta_project_limit(count: int, limit_key: str, noun: str) -> Tuple[bool, Optional[str]]:
+    limit = SELF_HOSTED_BETA_LIMITS[limit_key]
+    if count < limit:
+        return True, None
+    return False, (
+        f"Self-hosted beta allows up to {limit} {noun}(s). "
+        f"You have reached the beta limit for {noun}s. "
+        f"Paid plans are not available during the self-hosted beta."
+    )
+
+
 def check_project_type_limit(
     current_standard_count: int,
     current_rwx_count: int,
@@ -72,24 +84,9 @@ def check_project_type_limit(
         Tuple of (allowed: bool, error_message: Optional[str])
     """
     if project_type == "rwx":
-        limit = SELF_HOSTED_BETA_LIMITS["rwx_projects"]
-        if current_rwx_count >= limit:
-            return False, (
-                f"Self-hosted beta allows up to {limit} Reusable Workflow Project(s). "
-                f"You have reached the beta limit for Reusable Workflow Projects. "
-                f"Paid plans are not available during the self-hosted beta."
-            )
-    else:
-        # "standard" and any unrecognised project type
-        limit = SELF_HOSTED_BETA_LIMITS["standard_projects"]
-        if current_standard_count >= limit:
-            return False, (
-                f"Self-hosted beta allows up to {limit} Caller Workflow Project(s). "
-                f"You have reached the beta limit for Caller Workflow Projects. "
-                f"Paid plans are not available during the self-hosted beta."
-            )
-
-    return True, None
+        return _beta_project_limit(current_rwx_count, "rwx_projects", "Reusable Workflow Project")
+    # "standard" and any unrecognised project type
+    return _beta_project_limit(current_standard_count, "standard_projects", "Caller Workflow Project")
 
 
 class Entitlements:
@@ -112,6 +109,9 @@ class Entitlements:
     def check_new_project(
         self, account: Account, total_count: int, standard_count: int, rwx_count: int, project_type: str
     ) -> Tuple[bool, Optional[str]]:
+        raise NotImplementedError
+
+    def check_new_managed_files_project(self, account: Account, managed_count: int) -> Tuple[bool, Optional[str]]:
         raise NotImplementedError
 
     def check_private_visibility_scope(self, account: Account) -> Tuple[bool, Optional[str]]:
@@ -163,6 +163,9 @@ class SelfHostedEntitlements(Entitlements):
         self, account: Account, total_count: int, standard_count: int, rwx_count: int, project_type: str
     ) -> Tuple[bool, Optional[str]]:
         return check_project_type_limit(standard_count, rwx_count, project_type)
+
+    def check_new_managed_files_project(self, account: Account, managed_count: int) -> Tuple[bool, Optional[str]]:
+        return _beta_project_limit(managed_count, "managed_files_projects", "Managed Files project")
 
     def check_private_visibility_scope(self, account: Account) -> Tuple[bool, Optional[str]]:
         # Private repositories are allowed whenever the user's GitHub
@@ -216,10 +219,12 @@ class SelfHostedEntitlements(Entitlements):
     def plan(self, account: Account) -> dict:
         caller = SELF_HOSTED_BETA_LIMITS["standard_projects"]
         reusable = SELF_HOSTED_BETA_LIMITS["rwx_projects"]
+        managed = SELF_HOSTED_BETA_LIMITS["managed_files_projects"]
         limits = {
             "projects": None,
             "caller_projects": caller,
             "reusable_projects": reusable,
+            "managed_files_projects": managed,
             "secrets_per_project": self.secrets_limit(account),
             "env_vars_per_project": self.env_var_limit(account),
             "environments_per_project": self.environment_limit(account),
@@ -237,6 +242,7 @@ class SelfHostedEntitlements(Entitlements):
             "limit_messages": {
                 "caller_projects": f"Beta limit reached ({caller}/{caller} Caller Workflow Projects).",
                 "reusable_projects": f"Beta limit reached ({reusable}/{reusable} Reusable Workflow Projects).",
+                "managed_files_projects": f"Beta limit reached ({managed}/{managed} Managed Files projects).",
                 **{
                     key: (
                         f"Self-Hosted Beta: You can create up to {limits[limit_key]} {noun} per project. "
@@ -289,10 +295,21 @@ def check_new_project(
 ) -> Tuple[bool, Optional[str]]:
     """Check if the account can create another project of ``project_type``.
 
-    ``total_count`` counts every project the account owns; the other two count
-    its Caller Workflow and Reusable Workflow Projects.
+    ``total_count`` counts every workflow project the account owns; the other
+    two count its Caller Workflow and Reusable Workflow Projects. Managed Files
+    projects have their own limit (check_new_managed_files_project) and are in
+    none of these counts.
     """
     return _entitlements.check_new_project(account, total_count, standard_count, rwx_count, project_type)
+
+
+def check_new_managed_files_project(account: Account, managed_count: int) -> Tuple[bool, Optional[str]]:
+    """Check if the account can create another Managed Files project.
+
+    ``managed_count`` counts the account's Managed Files projects of every kind:
+    the limit is for the whole section.
+    """
+    return _entitlements.check_new_managed_files_project(account, managed_count)
 
 
 def check_private_visibility_scope(account: Account) -> Tuple[bool, Optional[str]]:

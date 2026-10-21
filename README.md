@@ -40,13 +40,14 @@ ActionsManager is in a free, self-hosted beta. See the [Beta Notes](BETA.md) for
 
 ## Features
 
-- **[Projects](https://actionsmanager.io/features/projects.html)** group repositories with the files you manage for them: workflows, custom files and a CODEOWNERS file.
+- **[Projects](https://actionsmanager.io/features/projects.html)** group repositories with the files you manage for them: workflows and custom files.
 - **[PR campaigns](https://actionsmanager.io/features/pr-campaigns.html)** deliver a change to every repository and branch in a project as pull requests, which you review, merge, close or roll back from one place.
-- **[Drift detection](https://actionsmanager.io/features/drift-detection.html)** re-checks every repository and branch in the background and shows when a delivered file was edited or deleted in GitHub. Adopt GitHub's version, or restore yours by pull request.
+- **[Drift detection](https://actionsmanager.io/features/drift-detection.html)** re-checks every repository and branch in the background and shows when a delivered file was edited or deleted in GitHub. Keep ActionsManager's version through a pull request, or use GitHub's, the same way for workflows, custom files and CODEOWNERS.
 - **[Reusable and caller workflows](https://actionsmanager.io/features/reusable-workflows.html)**: author reusable workflows in a Reusable Workflow Project and link them into the Caller Workflow Projects that use them.
 - **[Workflow editor](https://actionsmanager.io/features/workflows.html)** in YAML or a GUI view, with [build-type detection](https://actionsmanager.io/features/build-detection.html) (Maven, Gradle, npm, .NET, Python, Go, Rust, Docker and more) to start from a matching template.
 - **Secrets, variables, deploy environments and [rulesets](https://actionsmanager.io/features/rulesets.html)** managed across a project's repositories.
 - **[Managed actions](https://actionsmanager.io/features/managed-actions.html)**: a shared catalog of third-party actions and their inputs for the GUI editor.
+- **[Managed files](https://actionsmanager.io/features/managed-files.html)**: one project owns a repository file, such as CODEOWNERS, for each of its repositories, and delivers it by PR campaign.
 - **[Build metrics](https://actionsmanager.io/features/build-metrics.html)**, **[notifications](https://actionsmanager.io/features/notifications.html)**, **[permissions](https://actionsmanager.io/features/permissions.html)** and **[backup and restore](https://actionsmanager.io/features/backup-restore.html)**.
 
 ## How it compares

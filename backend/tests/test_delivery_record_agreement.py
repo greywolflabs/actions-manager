@@ -130,11 +130,10 @@ def _open_pr(db, s, number=1, branch=BRANCH):
     return db.query(ProjectPullRequest).filter_by(pr_number=number).one()
 
 
-def _direct_push(db, s):
-    with patch("workflows._direct_push_workflow_to_branch", return_value={"status_code": 201, "sha": "pushed"}):
-        entry = wf._direct_sync_to_branch(db, s.project, s.workflow, REPO, BRANCH, WORKFLOW_PATH,
-                                          s.workflow.workflow_yaml, "sync", {}, USER)
-    assert entry["status"] == "synced"
+def _delivered(db, s):
+    """The workflow on (REPO, BRANCH), as a merged campaign records it."""
+    deliveries.record_delivered(db, deliveries.WORKFLOW, s.workflow.workflow_id, REPO, BRANCH, WORKFLOW_PATH, "pushed")
+    db.commit()
 
 
 def _drifted(db, s):
@@ -206,7 +205,7 @@ def _workflow_answers(db, s, branch):
         "rename_blocked": wf._rename_blocker_open_pr(db, s.project, w) is not None,
         "blocks_another_project": wf._find_blocking_reusable_workflow_pr(
             db, w, s.project.project_id + 1) is not None,
-        "awaiting_delivery": REPO in _pending_delivery_repo_names(db, s.project.project_id, [w]),
+        "awaiting_delivery": REPO in _pending_delivery_repo_names(db, s.project, [w]),
         "delivered_at": (s.repo.repo_id, branch) in deliveries.delivered_at_by_target(
             db, deliveries.WORKFLOW, w.workflow_id),
     }
@@ -331,12 +330,6 @@ def test_a_merge_is_recorded_together_with_what_it_delivered(db, s):
     assert _workflow_answers(db, s, BRANCH) == DELIVERED
 
 
-def test_a_direct_push(db, s):
-    _direct_push(db, s)
-
-    assert _workflow_answers(db, s, BRANCH) == DELIVERED
-
-
 def test_an_adopt_from_github(db, s):
     with patch("workflows.get_workflow_from_github",
                return_value={"content": "name: ci\non: push\n# from GitHub\n", "sha": "adopted"}):
@@ -348,7 +341,7 @@ def test_an_adopt_from_github(db, s):
 
 
 def test_a_direct_delete(db, s):
-    _direct_push(db, s)
+    _delivered(db, s)
 
     # What delete_workflow records once the DELETE lands.
     with patch("workflows.requests.delete", return_value=_response(200)):

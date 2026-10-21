@@ -570,6 +570,23 @@ class TestPRWorkflowUpdates:
             assert pr["number"] == 43
             assert pr["html_url"] == "https://github.com/owner/repo/pull/43"
 
+    @pytest.mark.parametrize("workflows_committed, title", [
+        (["ci-build"], "[Actions Manager] Update MYAPP workflows"),
+        ([], "[Actions Manager] Update MYAPP files"),
+    ])
+    def test_the_default_title_says_files_when_no_workflow_rides_along(self, workflows_committed, title):
+        """A PR carrying only CODEOWNERS or custom files updates files, not workflows (#2367)."""
+        response = Mock(status_code=201)
+        response.json.return_value = {"number": 44, "html_url": "https://github.com/owner/repo/pull/44"}
+
+        with patch('workflows.requests.post', return_value=response) as mock_post:
+            _create_pull_request(
+                "owner", "repo", "actions-manager/myapp-main", "main", "MYAPP", workflows_committed,
+                {"Authorization": "token test123"},
+            )
+
+        assert mock_post.call_args.kwargs["json"]["title"] == title
+
     def test_create_pull_request_failure(self):
         """Test PR creation failure."""
         headers = {"Authorization": "token test123"}

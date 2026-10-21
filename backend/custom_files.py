@@ -29,6 +29,7 @@ import auth as auth_module
 from auth import user_tokens
 from database import get_db
 import deliveries
+from file_kinds import refuse_unless_accepted
 from drift_notifications import drop_drift, resolve_drift_for_local_edit
 from models import Account, CustomFile, Project, ProjectRepo
 from authorization import has_project_role, project_role
@@ -233,6 +234,7 @@ def create_custom_file(
     # project delivers, so seeing the project is not enough - the resolve
     # above proves only that. delete_custom_file already carried this.
     _require_project_editor(db, _project, user)
+    refuse_unless_accepted(_project, "custom_files", path=payload.file_path)
 
     path_error = validate_file_path(payload.file_path)
     if path_error:
@@ -297,10 +299,13 @@ def update_custom_file(
     # project delivers, so seeing the project is not enough - the resolve
     # above proves only that. delete_custom_file already carried this.
     _require_project_editor(db, _project, user)
+    refuse_unless_accepted(_project, "custom_files")
 
     cf = db.query(CustomFile).filter_by(id=file_id, project_id=project_id).first()
     if not cf:
         raise HTTPException(status_code=404, detail=_ERR_NOT_FOUND)
+    # The path it ends up at: one stored at a kind's path before that was refused may only move away.
+    refuse_unless_accepted(_project, path=payload.file_path or cf.file_path)
 
     # Whether the path changed is knowable only before the new one is assigned.
     moved = _move_custom_file(db, cf, project_id, payload.file_path)
@@ -496,7 +501,7 @@ def delete_custom_file(
     return _hard_delete(db, project, cf, outcome["targets"])
 
 
-@router.post("/api/projects/{project_id}/custom-files/{file_id}/restore", responses=_responses(401, 403, 404))
+@router.post("/api/projects/{project_id}/custom-files/{file_id}/restore", responses=_responses(400, 401, 403, 404))
 def restore_custom_file(
     project_id: int,
     file_id: int,
@@ -510,10 +515,12 @@ def restore_custom_file(
     # project delivers, so seeing the project is not enough - the resolve
     # above proves only that. delete_custom_file already carried this.
     _require_project_editor(db, _project, user)
+    refuse_unless_accepted(_project, "custom_files")
 
     cf = db.query(CustomFile).filter_by(id=file_id, project_id=project_id).first()
     if not cf:
         raise HTTPException(status_code=404, detail=_ERR_NOT_FOUND)
+    refuse_unless_accepted(_project, path=cf.file_path)
 
     cf.pending_delete = False
     cf.last_modified_by = user

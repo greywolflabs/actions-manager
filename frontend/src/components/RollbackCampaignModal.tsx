@@ -79,6 +79,12 @@ const TargetDiff: React.FC<{ target: RollbackTarget }> = ({ target }) => (
       </p>
     )}
 
+    {target.invertible && target.left_alone.map((path) => (
+      <p key={path} className="pr-rollback-reason" data-testid="rollback-left-alone">
+        <code>{path}</code> is left as it is, because Managed Files manages it now.
+      </p>
+    ))}
+
     {target.files.map((file) => (
       <div key={file.path} className="pr-rollback-file">
         <div className="pr-rollback-file-path">

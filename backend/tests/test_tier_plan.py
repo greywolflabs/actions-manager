@@ -33,6 +33,9 @@ def test_plan_limits_are_the_enforced_limits():
         limit = limits[key]
         assert tier_service.check_new_project(account, limit - 1, *counts(limit - 1), project_type)[0] is True
         assert tier_service.check_new_project(account, limit, *counts(limit), project_type)[0] is False
+    managed = limits["managed_files_projects"]
+    assert tier_service.check_new_managed_files_project(account, managed - 1)[0] is True
+    assert tier_service.check_new_managed_files_project(account, managed)[0] is False
 
 
 @pytest.mark.parametrize("license_tier", ["free", "professional", "enterprise"])
@@ -73,6 +76,7 @@ EXPECTED_PLAN = {
         "projects": None,
         "caller_projects": 4,
         "reusable_projects": 2,
+        "managed_files_projects": 3,
         "secrets_per_project": 6,
         "env_vars_per_project": 6,
         "environments_per_project": 6,
@@ -85,6 +89,7 @@ EXPECTED_PLAN = {
     "limit_messages": {
         "caller_projects": "Beta limit reached (4/4 Caller Workflow Projects).",
         "reusable_projects": "Beta limit reached (2/2 Reusable Workflow Projects).",
+        "managed_files_projects": "Beta limit reached (3/3 Managed Files projects).",
         "secrets": "Self-Hosted Beta: You can create up to 6 secrets per project. You have reached the limit.",
         "env_vars": (
             "Self-Hosted Beta: You can create up to 6 environment variables per project. "

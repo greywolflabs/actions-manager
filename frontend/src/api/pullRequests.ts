@@ -196,6 +196,8 @@ export interface RollbackTarget {
   /** Why this repo cannot be rolled back automatically; null when it can. */
   reason: string | null;
   files: RollbackFile[];
+  /** Paths the PR changed that a Managed Files project manages now, so the rollback leaves them as they are. */
+  left_alone: string[];
 }
 
 export interface RollbackPreviewResponse {

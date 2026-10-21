@@ -70,7 +70,7 @@ export default function ActionsProjectsList({ user }: ActionsProjectsListProps):
   }, [projects, searchQuery, selectedGroup]);
 
   return (
-    <div className="w-full max-w-[1400px] mx-auto px-6 lg:px-8" data-testid="actions-projects-list">
+    <div className="w-full" data-testid="actions-projects-list">
       <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h2 className="text-3xl font-bold text-gray-900 dark:text-white">Managed Actions</h2>

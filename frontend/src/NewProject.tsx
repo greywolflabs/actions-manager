@@ -355,7 +355,7 @@ const NewProject: React.FC<NewProjectProps> = ({ user, tourStep = null }) => {
   };
 
   return (
-    <div className="newProjectContainer w-full max-w-[1400px] mx-auto px-6 lg:px-8">
+    <div className="w-full">
       <div className="mb-6">
         <p className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-slate-400">
           {eyebrowLabel(tourStep)}

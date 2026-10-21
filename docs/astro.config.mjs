@@ -55,6 +55,7 @@ export default defineConfig({
 						'features/pr-campaigns',
 						'features/drift-detection',
 						'features/managed-actions',
+						'features/managed-files',
 						'features/rulesets',
 						'features/backup-restore',
 						'features/permissions',

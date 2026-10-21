@@ -49,44 +49,23 @@ describe('WorkflowCreationDialog', () => {
     expect(screen.queryByText('CODEOWNERS')).not.toBeInTheDocument();
   });
 
-  test('should render custom file and codeowners options when provided', async () => {
+  test('should render the custom file option when provided, and never CODEOWNERS (#2367)', async () => {
     const onAddCustomFile = vi.fn();
-    const onSelectCodeowners = vi.fn();
     render(
       <WorkflowCreationDialog
         {...defaultProps}
+        selectedRepos={['owner/repo-a']}
         onAddCustomFile={onAddCustomFile}
-        onSelectCodeowners={onSelectCodeowners}
       />
     );
 
     expect(screen.getByText('Custom File')).toBeInTheDocument();
-    expect(screen.getByText('CODEOWNERS')).toBeInTheDocument();
+    // Managed in Managed Files now, by its own project.
+    expect(screen.queryByText('CODEOWNERS')).not.toBeInTheDocument();
 
     await user.click(screen.getByText('Custom File').closest('button') as HTMLElement);
     expect(defaultProps.setShowWorkflowCreationDialog).toHaveBeenCalledWith(false);
     expect(onAddCustomFile).toHaveBeenCalledTimes(1);
-  });
-
-  test('clicking CODEOWNERS closes dialog and opens the project\'s CODEOWNERS file', async () => {
-    const onSelectCodeowners = vi.fn();
-    render(
-      <WorkflowCreationDialog
-        {...defaultProps}
-        selectedRepos={['owner/repo-a', 'owner/repo-b']}
-        onSelectCodeowners={onSelectCodeowners}
-      />
-    );
-
-    await user.click(screen.getByText('CODEOWNERS').closest('button') as HTMLElement);
-    expect(defaultProps.setShowWorkflowCreationDialog).toHaveBeenCalledWith(false);
-    expect(onSelectCodeowners).toHaveBeenCalledWith();
-  });
-
-  test('offers no CODEOWNERS card before the project has a repository', () => {
-    render(<WorkflowCreationDialog {...defaultProps} selectedRepos={[]} onSelectCodeowners={vi.fn()} />);
-
-    expect(screen.queryByText('CODEOWNERS')).not.toBeInTheDocument();
   });
 
   test('should not render custom file or codeowners options when not provided', () => {

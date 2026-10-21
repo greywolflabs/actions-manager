@@ -30,14 +30,14 @@ test.describe("docs video", () => {
     const projects = [
       makeProject({
         project_id: 1,
-        project_name: "Payments Platform",
-        project_code: "PAY",
+        project_name: "NodeBuilds",
+        project_code: "NODE",
         github_user: DOCS_USER,
         last_modified_by: DOCS_USER,
         updated_at: "2026-07-24T00:00:00Z",
         pr_state: "draft",
         project_color: "amber",
-        selected_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+        selected_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
         workflows: [makeWorkflow({ name: "build-and-test.yml", lastModifiedBy: DOCS_USER })],
       }),
       makeProject({
@@ -81,14 +81,14 @@ test.describe("docs video", () => {
     await seedDocsUserProfile(page);
 
     await page.goto(`/project/${DOCS_USER}`);
-    await page.getByText("Payments Platform", { exact: true }).waitFor({ timeout: 15000 });
+    await page.getByText("NodeBuilds", { exact: true }).waitFor({ timeout: 15000 });
     await page.waitForTimeout(500);
 
     // Light hover pauses over a few cards so the clip reads as a short loop
     // rather than a frozen frame — not a full product demo. Each card is a
     // full-bleed "Open project <name>" button overlaying the card content,
     // so that's the element to hover, not the underlying text span.
-    await page.getByRole("button", { name: "Open project Payments Platform" }).hover();
+    await page.getByRole("button", { name: "Open project NodeBuilds" }).hover();
     await page.waitForTimeout(700);
     await page.getByRole("button", { name: "Open project Web Storefront" }).hover();
     await page.waitForTimeout(700);

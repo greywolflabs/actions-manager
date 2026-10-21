@@ -476,6 +476,20 @@ class TestRollbackCampaignCreation:
         assert rollback.rollback_am_action == "revert"
         assert rollback.campaign_name == "Rollback of Bump runners"
 
+    @pytest.mark.parametrize("workflow_names, title", [
+        ("ci", "[Actions Manager] Roll back RBK workflows"),
+        (None, "[Actions Manager] Roll back RBK files"),
+    ])
+    def test_the_title_says_files_when_no_workflow_rides_along(self, db_session, workflow_names, title):
+        """A rollback of a PR that carried no workflow, e.g. a CODEOWNERS project's (#2367)."""
+        project = _create_project(db_session)
+        source = _add_campaign(db_session, project)
+        _add_pr(db_session, project, source, workflow_names=workflow_names)
+
+        _response, _commit, finalize = self._create(_github_with_simple_change(), source.campaign_id)
+
+        assert finalize.call_args.kwargs["delivery"]["pr_title"] == title
+
     def test_commits_the_pre_campaign_content(self, db_session):
         project = _create_project(db_session)
         source = _add_campaign(db_session, project)

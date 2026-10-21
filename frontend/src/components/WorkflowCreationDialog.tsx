@@ -26,7 +26,6 @@ interface WorkflowCreationDialogProps {
   existingWorkflowNames?: string[];
   selectedRepos: string[];
   onAddCustomFile?: () => void;
-  onSelectCodeowners?: () => void;
   setShowWorkflowCreationDialog: (show: boolean) => void;
   selectWorkflowType: (type: 'regular' | 'reusable') => void;
   onLinkReusableWorkflow?: () => void;
@@ -51,7 +50,6 @@ const WorkflowCreationDialog: React.FC<WorkflowCreationDialogProps> = ({
   existingWorkflowNames = [],
   selectedRepos,
   onAddCustomFile,
-  onSelectCodeowners,
   setShowWorkflowCreationDialog,
   selectWorkflowType,
   onLinkReusableWorkflow,
@@ -103,12 +101,6 @@ const WorkflowCreationDialog: React.FC<WorkflowCreationDialogProps> = ({
     if (!onAddCustomFile) return;
     setShowWorkflowCreationDialog(false);
     onAddCustomFile();
-  };
-
-  const handleSelectCodeownersCard = () => {
-    if (!onSelectCodeowners) return;
-    setShowWorkflowCreationDialog(false);
-    onSelectCodeowners();
   };
 
   const renderWorkflowNameField = () => (
@@ -241,24 +233,6 @@ const WorkflowCreationDialog: React.FC<WorkflowCreationDialogProps> = ({
                 </button>
               )}
 
-              {selectedRepos.length > 0 && onSelectCodeowners && (
-                <button
-                  className="border-2 border-slate-200 rounded-lg p-4 hover:border-blue-500 transition-all text-left dark:border-slate-700 dark:hover:border-blue-400"
-                  onClick={handleSelectCodeownersCard}
-                >
-                  <div className="flex items-start gap-4">
-                    <div className="text-3xl">👥</div>
-                    <div className="flex-1">
-                      <h4 className="font-semibold text-lg text-slate-900 mb-1 dark:text-slate-100">
-                        CODEOWNERS
-                      </h4>
-                      <p className="text-sm text-slate-600 dark:text-slate-400">
-                        Manage the code ownership rules every repository in this project receives
-                      </p>
-                    </div>
-                  </div>
-                </button>
-              )}
             </div>
           </div>
         ) : showDetectionResultsInModal ? (

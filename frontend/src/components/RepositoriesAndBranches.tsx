@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { fetchRepos } from "../api/repos";
+import { useTakenRepos } from "../hooks/useTakenRepos";
 import RepoBranchOverridesPanel from "./RepoBranchOverridesPanel";
 import RepositoryBranchSelector from "./RepositoryBranchSelector";
 
@@ -54,7 +55,76 @@ interface RepositoriesAndBranchesProps {
   setValidationRepo?: (repo: string | null) => void;
   preflightRequired?: boolean;
   setPreflightRequired?: (required: boolean) => void;
+  /**
+   * A Managed Files project's kind (#2367). Repositories another project of
+   * the kind holds are locked, and there is no validation repository: the
+   * project holds no workflows to validate.
+   */
+  fileKind?: string | null;
 }
+
+interface ValidationRepositoryCardProps {
+  readonly scopedRepos: Repository[];
+  readonly validationRepo: string | null;
+  readonly setValidationRepo?: (repo: string | null) => void;
+  readonly preflightRequired: boolean;
+  readonly setPreflightRequired?: (required: boolean) => void;
+}
+
+const ValidationRepositoryCard: React.FC<ValidationRepositoryCardProps> = ({
+  scopedRepos,
+  validationRepo,
+  setValidationRepo,
+  preflightRequired,
+  setPreflightRequired,
+}) => (
+  <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-6 shadow-sm">
+    <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-2">
+      Validation Repository
+    </h3>
+    <p className="text-sm text-slate-600 dark:text-slate-400 mb-4">
+      Optional. Used to test workflow changes before creating PR Campaigns.
+    </p>
+    {/* Descriptive text, not a form label — the select below carries its own aria-label. */}
+    <p className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+      Select a safe repository where ActionsManager can open a test PR and run the generated workflow before rollout.
+    </p>
+    <select
+      value={validationRepo || ""}
+      onChange={(event) => setValidationRepo?.(event.target.value || null)}
+      className="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+      aria-label="Validation Repository"
+    >
+      <option value="">No validation repository</option>
+      {scopedRepos.map((repo) => {
+        const name = repo.full_name || repo.name;
+        return (
+          <option key={repo.id || name} value={name}>
+            {name}
+          </option>
+        );
+      })}
+    </select>
+    <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+      This repository is not included in campaign targets unless it is also selected as a target repository.
+    </p>
+    {validationRepo && !scopedRepos.some((repo) => (repo.full_name || repo.name) === validationRepo) && (
+      <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+        Validation repository is not currently accessible in the repository list.
+      </div>
+    )}
+    <label className="mt-4 flex items-center gap-2 text-sm text-slate-800 dark:text-slate-200">
+      <input
+        type="checkbox"
+        checked={preflightRequired}
+        onChange={(event) => setPreflightRequired?.(event.target.checked)}
+        disabled={!validationRepo}
+        className="w-4 h-4"
+      />
+      <span>Require successful preflight before campaign creation</span>
+    </label>
+  </div>
+);
 
 const RepositoriesAndBranches: React.FC<RepositoriesAndBranchesProps> = ({
   user,
@@ -76,6 +146,7 @@ const RepositoriesAndBranches: React.FC<RepositoriesAndBranchesProps> = ({
   setValidationRepo,
   preflightRequired = false,
   setPreflightRequired,
+  fileKind = null,
 }) => {
   const [reposLoading, setReposLoading] = useState<boolean>(false);
   const [reposError, setReposError] = useState<string | null>(null);
@@ -144,8 +215,16 @@ const RepositoriesAndBranches: React.FC<RepositoriesAndBranchesProps> = ({
   // logic in NewProject.tsx so both creation and configuration show the same
   // filtered list. This ensures a private project can only select/show private
   // repos, and a public project can only select/show public repos.
-  const scopedRepos = repos.filter((repo) =>
-    repoMatchesVisibilityScope(repo, visibilityScope),
+  const scopedRepos = useMemo(
+    () => repos.filter((repo) => repoMatchesVisibilityScope(repo, visibilityScope)),
+    [repos, visibilityScope],
+  );
+  // Asked again after each save (repoConfigRefreshSignal), never as repositories are ticked.
+  const { taken, error: takenError } = useTakenRepos(
+    fileKind ?? "",
+    fileKind ? scopedRepos.map((repo) => repo.full_name || repo.name) : [],
+    projectId ? Number(projectId) : undefined,
+    repoConfigRefreshSignal,
   );
 
   return (
@@ -236,7 +315,9 @@ const RepositoriesAndBranches: React.FC<RepositoriesAndBranchesProps> = ({
           Target Repositories
         </h3>
         <p className="text-sm text-slate-600 dark:text-slate-400 mb-3">
-          These repositories receive workflow changes during PR Campaigns.
+          {fileKind
+            ? "These repositories receive the project's file during PR Campaigns."
+            : "These repositories receive workflow changes during PR Campaigns."}
         </p>
       </div>
 
@@ -252,6 +333,7 @@ const RepositoriesAndBranches: React.FC<RepositoriesAndBranchesProps> = ({
         onRemoveRepository={handleRemoveRepo}
         onClearSelectedRepositories={handleClearSelectedRepos}
         onRefresh={loadRepos}
+        unavailableRepos={taken}
         branchConfigSlot={
           projectId ? (
             <RepoBranchOverridesPanel
@@ -271,53 +353,21 @@ const RepositoriesAndBranches: React.FC<RepositoriesAndBranchesProps> = ({
           )
         }
       />
+      {takenError && (
+        <p className="-mt-4 text-xs text-amber-700 dark:text-amber-300" data-testid="repos-taken-error">
+          {takenError}
+        </p>
+      )}
 
-      <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-6 shadow-sm">
-        <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-2">
-          Validation Repository
-        </h3>
-        <p className="text-sm text-slate-600 dark:text-slate-400 mb-4">
-          Optional. Used to test workflow changes before creating PR Campaigns.
-        </p>
-        {/* Descriptive text, not a form label — the select below carries its own aria-label. */}
-        <p className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
-          Select a safe repository where ActionsManager can open a test PR and run the generated workflow before rollout.
-        </p>
-        <select
-          value={validationRepo || ""}
-          onChange={(event) => setValidationRepo?.(event.target.value || null)}
-          className="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-          aria-label="Validation Repository"
-        >
-          <option value="">No validation repository</option>
-          {scopedRepos.map((repo) => {
-            const name = repo.full_name || repo.name;
-            return (
-              <option key={repo.id || name} value={name}>
-                {name}
-              </option>
-            );
-          })}
-        </select>
-        <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
-          This repository is not included in campaign targets unless it is also selected as a target repository.
-        </p>
-        {validationRepo && !scopedRepos.some((repo) => (repo.full_name || repo.name) === validationRepo) && (
-          <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-            Validation repository is not currently accessible in the repository list.
-          </div>
-        )}
-        <label className="mt-4 flex items-center gap-2 text-sm text-slate-800 dark:text-slate-200">
-          <input
-            type="checkbox"
-            checked={preflightRequired}
-            onChange={(event) => setPreflightRequired?.(event.target.checked)}
-            disabled={!validationRepo}
-            className="w-4 h-4"
-          />
-          <span>Require successful preflight before campaign creation</span>
-        </label>
-      </div>
+      {!fileKind && (
+        <ValidationRepositoryCard
+          scopedRepos={scopedRepos}
+          validationRepo={validationRepo}
+          setValidationRepo={setValidationRepo}
+          preflightRequired={preflightRequired}
+          setPreflightRequired={setPreflightRequired}
+        />
+      )}
     </div>
   );
 };

@@ -1,7 +1,7 @@
 import React from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
-import CreatePRModal, { prResultFailureReasons } from "./CreatePRModal";
+import CreatePRModal, { prResultFailureReasons, type CampaignSelection } from "./CreatePRModal";
 import * as pullRequestApi from "../api/pullRequests";
 
 import type { Mock } from 'vitest';
@@ -616,11 +616,215 @@ describe("CreatePRModal", () => {
     });
   });
 
+  describe("workflows on a synced project", () => {
+    const synced = [
+      { name: "build", status: "synced_with_github" },
+      { name: "deploy", status: "synced_with_github" },
+    ];
+
+    it("pre-ticks none when none changed", () => {
+      // Ticking every one would re-push identical files to every repo.
+      render(<CreatePRModal {...baseProps} workflows={synced}
+        codeowners={{ filePath: ".github/CODEOWNERS", status: "committed_locally" }} />);
+
+      expect(screen.getByRole("button", { name: /create 2 pr.*1 file/i })).not.toHaveTextContent(/workflow/i);
+    });
+
+    it("pre-ticks every file for a draft project with nothing changed: its new repositories or branches need them", () => {
+      render(<CreatePRModal {...baseProps} workflows={synced} projectDraft
+        codeowners={{ filePath: ".github/CODEOWNERS", status: "synced_with_github" }} />);
+
+      expect(screen.getByRole("button", { name: /create 2 pr.*2 workflows.*1 file/i })).toBeInTheDocument();
+    });
+
+    it("keeps a draft project's campaign to what changed when something did", () => {
+      render(<CreatePRModal {...baseProps} workflows={[...synced, { name: "lint", status: "committed_locally" }]}
+        projectDraft />);
+
+      expect(screen.getByRole("button", { name: /create 2 pr.*1 workflow\b/i })).toBeInTheDocument();
+    });
+
+    it("sends an empty selection as an empty list, never as every workflow", async () => {
+      const onSuccess = vi.fn();
+      (pullRequestApi.createPullRequests as Mock).mockResolvedValue({
+        message: "ok", results: { "owner/repo-a on main": { status: "pr_created" } }, prs_created: 1,
+      });
+      render(
+        <CreatePRModal {...baseProps} workflows={synced} onSuccess={onSuccess}
+          codeowners={{ filePath: ".github/CODEOWNERS", status: "committed_locally" }} />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: /create 2 pr.*1 file/i }));
+
+      await waitFor(() => expect(onSuccess).toHaveBeenCalled());
+      expect((pullRequestApi.createPullRequests as Mock).mock.calls[0][2]).toMatchObject({ selectedWorkflows: [] });
+    });
+
+    it("leaves the workflows unset for a run carrying only reusable workflows", async () => {
+      // Sent as [], the caller repos would be recorded as targets of a run
+      // that never touches them.
+      const onSuccess = vi.fn();
+      (pullRequestApi.createPullRequests as Mock).mockResolvedValue({
+        message: "ok", results: { "owner/shared on main": { status: "pr_created" } }, prs_created: 1,
+      });
+      render(
+        <CreatePRModal {...baseProps} workflows={synced} onSuccess={onSuccess}
+          reusableWorkflows={[{ name: "shared-build", status: "committed_locally", sourceRepo: "owner/shared", isLinked: true }]} />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: /create .*pr/i }));
+
+      await waitFor(() => expect(onSuccess).toHaveBeenCalled());
+      expect((pullRequestApi.createPullRequests as Mock).mock.calls[0][2].selectedWorkflows).toBeUndefined();
+    });
+  });
+
+  it("reports a repository that already holds everything as up to date, not as an error", async () => {
+    (pullRequestApi.createPullRequests as Mock).mockResolvedValue({
+      message: "ok",
+      prs_created: 1,
+      results: {
+        "owner/repo-a on main": { status: "pr_created", pr_url: "https://github.com/owner/repo-a/pull/1", pr_number: 1 },
+        "owner/repo-b on main": { status: "error", nothing_to_deliver: true, error: "Nothing to deliver" },
+      },
+    });
+    render(<CreatePRModal {...baseProps} workflows={[]} codeowners={{ filePath: ".github/CODEOWNERS", status: "committed_locally" }} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /create 2 pr.*1 file/i }));
+
+    expect(await screen.findByText("➖ Already up to date")).toBeInTheDocument();
+    expect(screen.queryByText("❌ Error")).not.toBeInTheDocument();
+  });
+
+  describe("opened to keep the ActionsManager version of drifted files", () => {
+    const synced = [
+      { name: "build", status: "synced_with_github" },
+      { name: "deploy", status: "synced_with_github" },
+    ];
+    const edited = { name: "lint", status: "committed_locally" };
+    const syncedFile = { id: 1, file_path: ".github/scripts/build.sh", file_status: "synced_with_github", pending_delete: false };
+    const editedFile = { id: 2, file_path: ".github/scripts/lint.sh", file_status: "committed_locally", pending_delete: false };
+    const only = (selection: Partial<CampaignSelection>): CampaignSelection => ({
+      workflows: [], reusableWorkflows: [], customFileIds: [], codeowners: false, ...selection,
+    });
+    const createButton = () => screen.getByRole("button", { name: /^create \d+ pr/i });
+
+    it("ticks exactly the drifted workflow, synced as it is, in view, and nothing it was not opened for", () => {
+      render(
+        <CreatePRModal {...baseProps} workflows={[...synced, edited]} customFiles={[editedFile]}
+          codeowners={{ filePath: ".github/CODEOWNERS", status: "committed_locally" }}
+          initialSelection={only({ workflows: ["deploy"] })} />,
+      );
+
+      expect(createButton()).toHaveTextContent("Create 2 PRs (1 workflow)");
+      expect(screen.getByRole("checkbox", { name: /deploy\.yml/ })).toBeChecked();
+      expect(screen.getByRole("checkbox", { name: /lint\.yml/ })).not.toBeChecked();
+      expect(screen.getByRole("checkbox", { name: /lint\.sh/ })).not.toBeChecked();
+    });
+
+    it("ticks exactly the drifted custom file, offered although it is synced", () => {
+      render(
+        <CreatePRModal {...baseProps} workflows={[edited]} customFiles={[syncedFile, editedFile]}
+          initialSelection={only({ customFileIds: [syncedFile.id] })} />,
+      );
+
+      expect(screen.getByRole("checkbox", { name: /build\.sh/ })).toBeChecked();
+      expect(screen.getByRole("checkbox", { name: /lint\.sh/ })).not.toBeChecked();
+      expect(createButton()).toHaveTextContent("Create 2 PRs (1 file)");
+    });
+
+    it("ticks exactly the drifted CODEOWNERS", () => {
+      render(
+        <CreatePRModal {...baseProps} workflows={[edited]}
+          codeowners={{ filePath: ".github/CODEOWNERS", status: "synced_with_github" }}
+          initialSelection={only({ codeowners: true })} />,
+      );
+
+      expect(createButton()).toHaveTextContent("Create 2 PRs (1 file)");
+    });
+
+    it("never counts a CODEOWNERS file the project does not hold", () => {
+      render(<CreatePRModal {...baseProps} workflows={synced} initialSelection={only({ codeowners: true, workflows: ["build"] })} />);
+
+      expect(createButton()).toHaveTextContent("Create 2 PRs (1 workflow)");
+    });
+  });
+
+  describe("custom files a synced project can deliver", () => {
+    const synced = { id: 1, file_path: ".github/scripts/build.sh", file_status: "synced_with_github", pending_delete: false };
+    const edited = { id: 2, file_path: ".github/scripts/lint.sh", file_status: "committed_locally", pending_delete: false };
+    const checkbox = (path: string) => screen.queryByRole("checkbox", { name: new RegExp(path.replaceAll(".", String.raw`\.`)) });
+
+    it("leaves out a synced file nobody changed", () => {
+      render(<CreatePRModal {...baseProps} workflows={[]} customFiles={[synced, edited]} />);
+
+      expect(checkbox(synced.file_path)).not.toBeInTheDocument();
+      expect(checkbox(edited.file_path)).toBeChecked();
+    });
+
+    it("offers a synced file changed on GitHub, unticked, and sends it by id once ticked", async () => {
+      const onSuccess = vi.fn();
+      (pullRequestApi.createPullRequests as Mock).mockResolvedValue({
+        message: "ok", results: { "owner/repo-a on main": { status: "pr_created" } }, prs_created: 1,
+      });
+      render(
+        <CreatePRModal {...baseProps} workflows={[]} customFiles={[synced]} driftedCustomFileIds={new Set([synced.id])}
+          onSuccess={onSuccess} />,
+      );
+
+      expect(checkbox(synced.file_path)).not.toBeChecked();
+      fireEvent.click(checkbox(synced.file_path)!);
+      fireEvent.click(screen.getByRole("button", { name: /create 2 pr.*1 file/i }));
+
+      await waitFor(() => expect(onSuccess).toHaveBeenCalled());
+      expect((pullRequestApi.createPullRequests as Mock).mock.calls[0][2]).toMatchObject({
+        selectedCustomFileIds: [synced.id],
+      });
+    });
+
+    it("drops a ticked file that stops being offered, so it is not sent out of sight", async () => {
+      // Its drift resolved while the modal was open.
+      const onSuccess = vi.fn();
+      (pullRequestApi.createPullRequests as Mock).mockResolvedValue({
+        message: "ok", results: { "owner/repo-a on main": { status: "pr_created" } }, prs_created: 1,
+      });
+      const props = { ...baseProps, workflows: [], customFiles: [synced, edited], onSuccess };
+      const { rerender } = render(<CreatePRModal {...props} driftedCustomFileIds={new Set([synced.id])} />);
+      fireEvent.click(checkbox(synced.file_path)!);
+      expect(checkbox(synced.file_path)).toBeChecked();
+
+      rerender(<CreatePRModal {...props} driftedCustomFileIds={new Set<number>()} />);
+      fireEvent.click(screen.getByRole("button", { name: /create 2 pr.*1 file/i }));
+
+      await waitFor(() => expect(onSuccess).toHaveBeenCalled());
+      expect((pullRequestApi.createPullRequests as Mock).mock.calls[0][2].selectedCustomFileIds).toEqual([edited.id]);
+    });
+
+    it("ticks every file for a newly added repository, which has none of them", () => {
+      render(<CreatePRModal {...baseProps} workflows={[]} customFiles={[synced, edited]} preselectAllWorkflows />);
+
+      expect(checkbox(synced.file_path)).toBeChecked();
+      expect(checkbox(edited.file_path)).toBeChecked();
+    });
+
+    it("leaves a drifted file unticked for a newly added repository too, and says why it is offered", () => {
+      // Ticked, it would overwrite the change made on GitHub with no warning.
+      render(
+        <CreatePRModal {...baseProps} workflows={[]} customFiles={[synced, edited]} preselectAllWorkflows
+          driftedCustomFileIds={new Set([synced.id])} />,
+      );
+
+      expect(checkbox(synced.file_path)).not.toBeChecked();
+      expect(checkbox(edited.file_path)).toBeChecked();
+      expect(screen.getByText(`${synced.file_path} (changed on GitHub)`)).toBeInTheDocument();
+    });
+  });
+
   describe("CODEOWNERS", () => {
     const codeowners = (status: string) => ({ filePath: ".github/CODEOWNERS", status });
     const checkbox = () => screen.getByRole("checkbox", { name: /\.github\/CODEOWNERS/ });
 
-    it("rides the campaign to every caller repository as one file", async () => {
+    it("rides the campaign to every repository as one file", async () => {
       const onSuccess = vi.fn();
       (pullRequestApi.createPullRequests as Mock).mockResolvedValue({
         message: "ok", results: { "owner/repo-a on main": { status: "pr_created" } }, prs_created: 1,
@@ -628,7 +832,7 @@ describe("CreatePRModal", () => {
 
       render(<CreatePRModal {...baseProps} workflows={[]} codeowners={codeowners("committed_locally")} onSuccess={onSuccess} />);
       expect(checkbox()).toBeChecked();
-      expect(screen.getByText("every caller repository")).toBeInTheDocument();
+      expect(screen.getByText("every repository")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: /create 2 pr.*1 file/i }));
 
       await waitFor(() => expect(onSuccess).toHaveBeenCalled());
@@ -637,6 +841,29 @@ describe("CreatePRModal", () => {
         includeCodeowners: true,
       });
       expect(onSuccess.mock.calls[0][3]).toBe(true);
+    });
+
+    it("its progress lists the file it carries, and no empty workflow list", async () => {
+      (pullRequestApi.createPullRequests as Mock).mockReturnValue(new Promise(() => undefined));
+      render(<CreatePRModal {...baseProps} workflows={[]} codeowners={codeowners("committed_locally")} />);
+
+      fireEvent.click(screen.getByRole("button", { name: /create 2 pr.*1 file/i }));
+
+      const progress = await screen.findByTestId("pr-creation-progress");
+      expect(progress).toHaveTextContent("CODEOWNERS:");
+      expect(progress).toHaveTextContent(".github/CODEOWNERS");
+      expect(progress).not.toHaveTextContent("Workflow files:");
+    });
+
+    it("speaks of callers only when the campaign carries workflows (#2367)", () => {
+      const { unmount } = render(<CreatePRModal {...baseProps} workflows={[]} codeowners={codeowners("committed_locally")} />);
+      expect(screen.getByRole("heading", { name: "Repositories" })).toBeInTheDocument();
+      expect(screen.queryByText(/workflows? selected/)).not.toBeInTheDocument();
+      unmount();
+
+      render(<CreatePRModal {...baseProps} codeowners={codeowners("committed_locally")} />);
+      expect(screen.getByRole("heading", { name: "Caller Repositories" })).toBeInTheDocument();
+      expect(screen.getByText("every caller repository")).toBeInTheDocument();
     });
 
     it("leaves a synced file out unless asked, to put it back where it drifted", async () => {

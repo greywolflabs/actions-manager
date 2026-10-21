@@ -1,6 +1,9 @@
 import React from "react";
+import type { ProjectTypeValue } from "../api/projects";
 
-// Canonical project type union – shared across the entire frontend
+// The two workflow project types: what the create wizard offers and the
+// workflow components handle. Every type the server stores, Managed Files
+// included, is api/projects' ProjectTypeValue.
 export type ProjectType = "standard" | "rwx";
 
 export interface ProjectTypeDefinition {
@@ -18,6 +21,14 @@ export interface ProjectTypeDefinition {
     background: string;
     border: string;
   };
+  /**
+   * Holds workflows, and so the sections that go with them: the workflow
+   * editor, build metrics, environments, variables, secrets, rulesets and a
+   * validation repository.
+   */
+  holdsWorkflows: boolean;
+  /** Has an identity color the user picks. */
+  hasColour: boolean;
 }
 
 // ── Icons ──────────────────────────────────────────────────────────────────
@@ -59,9 +70,27 @@ const ReusableIcon: React.FC<{ size?: number }> = ({ size = 16 }) => (
   </svg>
 );
 
+/** File icon – Managed Files project */
+const ManagedFilesIcon: React.FC<{ size?: number }> = ({ size = 16 }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={2}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <polyline points="14 2 14 8 20 8" />
+  </svg>
+);
+
 // ── Config map ─────────────────────────────────────────────────────────────
 
-export const PROJECT_TYPE_CONFIG: Record<ProjectType, ProjectTypeDefinition> = {
+export const PROJECT_TYPE_CONFIG: Record<ProjectTypeValue, ProjectTypeDefinition> = {
   standard: {
     label: "Caller Workflow Project",
     tagline: "Manages workflows that call reusable workflows.",
@@ -72,6 +101,8 @@ export const PROJECT_TYPE_CONFIG: Record<ProjectType, ProjectTypeDefinition> = {
       background: "rgba(59,130,246,0.12)",
       border: "rgba(59,130,246,0.35)",
     },
+    holdsWorkflows: true,
+    hasColour: true,
   },
   rwx: {
     label: "Reusable Workflow Project",
@@ -83,6 +114,22 @@ export const PROJECT_TYPE_CONFIG: Record<ProjectType, ProjectTypeDefinition> = {
       background: "rgba(168,85,247,0.12)",
       border: "rgba(168,85,247,0.35)",
     },
+    holdsWorkflows: true,
+    hasColour: true,
+  },
+  managed_files: {
+    label: "Managed Files Project",
+    tagline: "Manages one repository file across its repositories.",
+    description: "Manage one file, such as CODEOWNERS, across a group of repositories.",
+    icon: ManagedFilesIcon,
+    // Neutral slate: a Managed Files project has no color (#2367).
+    badge: {
+      color: "#94a3b8",       // slate-400
+      background: "rgba(100,116,139,0.12)",
+      border: "rgba(100,116,139,0.35)",
+    },
+    holdsWorkflows: false,
+    hasColour: false,
   },
 };
 
@@ -92,5 +139,6 @@ export const PROJECT_TYPE_CONFIG: Record<ProjectType, ProjectTypeDefinition> = {
  */
 export function getProjectTypeConfig(type?: string | null): ProjectTypeDefinition {
   if (type === "rwx") return PROJECT_TYPE_CONFIG.rwx;
+  if (type === "managed_files") return PROJECT_TYPE_CONFIG.managed_files;
   return PROJECT_TYPE_CONFIG.standard;
 }

@@ -12,6 +12,7 @@
 /features/build-metrics.html
 /features/drift-detection.html
 /features/managed-actions.html
+/features/managed-files.html
 /features/notifications.html
 /features/permissions.html
 /features/pr-campaigns.html
