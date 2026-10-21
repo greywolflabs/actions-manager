@@ -219,9 +219,9 @@ Recommended permissions for the PAT:
 | Secrets | Read and write | Repository secrets management (optional) |
 | Variables | Read and write | Repository variables management (optional) |
 
-### 3. From the Saved Projects dashboard, choose `New Project`
+### 3. From the Projects page, choose `New Project`
 
-After signing in you land on the **Saved Projects** dashboard. The header shows beta usage limits. Click **New Project**.
+After signing in you land on the **Projects** page. Your plan shows as a chip beside your avatar, and your project usage shows beside **New Project**. Click **New Project**, or the dashed **New project** box.
 
 ### 4. Create a Caller Workflow Project
 
@@ -471,6 +471,7 @@ ActionsManager Self-Hosted is a **free beta preview**. The beta limits are:
 |---|---|
 | Caller Workflow Projects | 4 |
 | Reusable Workflow Projects | 2 |
+| Managed Files projects | 3 |
 | Secrets per project | 6 |
 | Environment variables per project | 6 |
 | GitHub environments per project | 6 |

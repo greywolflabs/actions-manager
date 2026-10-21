@@ -196,7 +196,7 @@ const OnboardingTour: React.FC<OnboardingTourProps> = ({ user, userDetails, onAd
   // only offer it when it actually goes somewhere.
   const canNavigate = destination !== location.pathname;
 
-  // On the dashboard mid-tour — the user pressed Back to Projects — point at
+  // On the dashboard mid-tour — the user left the project — point at
   // their project's card rather than at a control that is not on this screen.
   const onDashboard = location.pathname === `/project/${user}`;
   const showProjectCard = onDashboard && canNavigate && demoProject;

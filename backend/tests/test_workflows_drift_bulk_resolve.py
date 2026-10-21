@@ -7,8 +7,8 @@ Feature: bulk-fix workflow drift. This endpoint resolves multiple
 (workflow_id, repo, branch) drift items in one request, applying one
 resolution/delivery_mode uniformly across the batch. It reuses the same
 per-item helpers as the existing single-workflow resolve-drift endpoint
-(``_apply_use_github_resolution``, ``_direct_push_workflow_to_branch``) and
-the same multi-workflow-single-PR grouping used elsewhere
+(``_apply_use_github_resolution``) and the same multi-workflow-single-PR
+grouping used elsewhere
 (``create_pull_requests`` / ``_process_regular_workflows_update``).
 
 These tests follow the same conventions as
@@ -345,90 +345,6 @@ def test_bulk_use_github_fails_an_item_without_a_branch(db_state):
 # ----------------------------------------------------------------------------
 # restore_actionsmanager + direct
 # ----------------------------------------------------------------------------
-
-@patch('workflows._check_existing_workflow_content', return_value=("existing-sha", False))
-@patch('workflows.github_put')
-def test_bulk_restore_direct_pushes_both_workflows(mock_put, _check, db_state):
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"content": {"sha": "fresh-sha"}}
-    mock_put.return_value = mock_resp
-
-    resp = _bulk_resolve(
-        db_state["project_id"],
-        [
-            {"workflow_id": db_state["ci_id"], "repo": "alice/repo1", "branch": "main"},
-            {"workflow_id": db_state["deploy_id"], "repo": "alice/repo2", "branch": "main"},
-        ],
-        resolution="restore_actionsmanager",
-        delivery_mode="direct",
-    )
-
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["success"] is True
-    assert len(body["results"]) == 2
-    assert all(r["success"] for r in body["results"])
-    assert mock_put.call_count == 2
-
-    db = TestingSessionLocal()
-    try:
-        ci = db.query(Workflow).filter_by(workflow_id=db_state["ci_id"]).first()
-        deploy = db.query(Workflow).filter_by(workflow_id=db_state["deploy_id"]).first()
-        assert ci.workflow_git_hash == "fresh-sha"
-        assert deploy.workflow_git_hash == "fresh-sha"
-        # Regression: a direct push means the repo now matches our managed
-        # version - workflow_status and project.pr_state must reflect that.
-        assert ci.workflow_status == "synced_with_github"
-        assert deploy.workflow_status == "synced_with_github"
-        project = db.query(Project).filter_by(project_id=db_state["project_id"]).first()
-        assert project.pr_state == "synced"
-    finally:
-        db.close()
-
-
-@patch('workflows._check_existing_workflow_content', return_value=("existing-sha", False))
-@patch('workflows.github_put')
-def test_bulk_restore_direct_partial_failure_sets_project_pr_state_draft(mock_put, _check, db_state):
-    """One push succeeds, one fails - the failed workflow's status is left
-    untouched, the succeeded one is synced, and the project is left "draft"
-    (not "synced") since the batch didn't fully complete."""
-    ok_resp = MagicMock()
-    ok_resp.status_code = 200
-    ok_resp.json.return_value = {"content": {"sha": "fresh-sha"}}
-    fail_resp = MagicMock()
-    fail_resp.status_code = 502
-    fail_resp.text = "GitHub is down"
-    mock_put.side_effect = [ok_resp, fail_resp]
-
-    resp = _bulk_resolve(
-        db_state["project_id"],
-        [
-            {"workflow_id": db_state["ci_id"], "repo": "alice/repo1", "branch": "main"},
-            {"workflow_id": db_state["deploy_id"], "repo": "alice/repo2", "branch": "main"},
-        ],
-        resolution="restore_actionsmanager",
-        delivery_mode="direct",
-    )
-
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["success"] is False
-    results_by_id = {r["workflow_id"]: r for r in body["results"]}
-    assert results_by_id[db_state["ci_id"]]["success"] is True
-    assert results_by_id[db_state["deploy_id"]]["success"] is False
-
-    db = TestingSessionLocal()
-    try:
-        ci = db.query(Workflow).filter_by(workflow_id=db_state["ci_id"]).first()
-        deploy = db.query(Workflow).filter_by(workflow_id=db_state["deploy_id"]).first()
-        assert ci.workflow_status == "synced_with_github"  # succeeded item advanced
-        assert deploy.workflow_status == "committed_locally"  # failed item untouched (fixture default)
-        project = db.query(Project).filter_by(project_id=db_state["project_id"]).first()
-        assert project.pr_state == "draft"
-    finally:
-        db.close()
-
 
 # ----------------------------------------------------------------------------
 # restore_actionsmanager + pr

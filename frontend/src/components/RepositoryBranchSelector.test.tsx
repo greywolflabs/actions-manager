@@ -365,4 +365,84 @@ describe('RepositoryBranchSelector', () => {
     await u.click(screen.getByTestId('selected-clear-all'));
     expect(onClear).toHaveBeenCalled();
   });
+
+  describe('repositories that cannot be picked', () => {
+    const unavailable = new Map([['whatsupdawg/test1', 'Used by Payments services']]);
+
+    it('locks the row, labels it, and never selects it', async () => {
+      const onSelect = vi.fn();
+      render(
+        <RepositoryBranchSelector
+          availableRepositories={REPOS}
+          selectedRepositoryNames={[]}
+          unavailableRepos={unavailable}
+          onSelectRepository={onSelect}
+          onRemoveRepository={vi.fn()}
+        />,
+      );
+
+      const row = screen.getByTestId('available-repo-whatsupdawg/test1');
+      expect(row).toHaveAttribute('data-unavailable', 'true');
+      expect(within(row).getByTestId('unavailable-repo-badge')).toHaveTextContent('Used by Payments services');
+      expect(screen.getByTestId('available-checkbox-whatsupdawg/test1')).toBeDisabled();
+      expect(screen.getByTestId('available-checkbox-whatsupdawg/test2')).toBeEnabled();
+
+      await u.click(row);
+      expect(onSelect).not.toHaveBeenCalled();
+    });
+
+    it('tells a screen reader why a locked row cannot be picked', () => {
+      render(
+        <RepositoryBranchSelector
+          availableRepositories={REPOS}
+          selectedRepositoryNames={[]}
+          unavailableRepos={unavailable}
+          onSelectRepository={vi.fn()}
+          onRemoveRepository={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByTestId('available-checkbox-whatsupdawg/test1'))
+        .toHaveAccessibleDescription('Used by Payments services');
+      expect(screen.getByTestId('available-checkbox-whatsupdawg/test2')).not.toHaveAttribute('aria-describedby');
+    });
+
+    it('still lets a selected one be removed', async () => {
+      const onRemove = vi.fn();
+      render(
+        <RepositoryBranchSelector
+          availableRepositories={REPOS}
+          selectedRepositoryNames={['whatsupdawg/test1']}
+          unavailableRepos={unavailable}
+          onSelectRepository={vi.fn()}
+          onRemoveRepository={onRemove}
+        />,
+      );
+
+      expect(screen.getByTestId('available-repo-whatsupdawg/test1')).toHaveAttribute('data-unavailable', 'false');
+      await u.click(screen.getByTestId('available-checkbox-whatsupdawg/test1'));
+      expect(onRemove).toHaveBeenCalledWith('whatsupdawg/test1');
+    });
+  });
+
+  it('compact shows only the searchable list', async () => {
+    const onSelect = vi.fn();
+    render(
+      <RepositoryBranchSelector
+        compact
+        availableRepositories={REPOS}
+        selectedRepositoryNames={[]}
+        onSelectRepository={onSelect}
+        onRemoveRepository={vi.fn()}
+        branchConfigSlot={<div>branches</div>}
+      />,
+    );
+
+    expect(screen.queryByTestId('selected-repositories-panel')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('branch-configuration-panel')).not.toBeInTheDocument();
+    await u.type(screen.getByTestId('available-search-input'), 'personal');
+    expect(screen.queryByTestId('available-repo-whatsupdawg/test1')).not.toBeInTheDocument();
+    await u.click(screen.getByTestId('available-checkbox-octocat/personal-tools'));
+    expect(onSelect).toHaveBeenCalledWith('octocat/personal-tools');
+  });
 });

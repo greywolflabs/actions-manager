@@ -51,7 +51,8 @@ export function useTourDemoSeeding({
     let cancelled = false;
 
     const seed = async (): Promise<void> => {
-      const existing = await fetchProjects(user);
+      // A name is unique among all of the owner's projects, Managed Files ones included.
+      const existing = await fetchProjects(user, "all");
       if (cancelled) return;
       const name = pickDemoProjectName(existing.map((p) => p.project_name));
       setProjectName((current) => current || name);

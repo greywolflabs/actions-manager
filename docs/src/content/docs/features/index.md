@@ -14,6 +14,7 @@ ActionsManager provides a comprehensive set of tools for managing GitHub Actions
 - [PR Campaigns](features/pr-campaigns.html): roll out a change across many repositories as coordinated pull requests.
 - [Drift Detection](features/drift-detection.html): find repositories that diverge from their managed workflows, and resolve it.
 - [Managed Actions](features/managed-actions.html): a shared catalog of third-party actions with their inputs ready to use.
+- [Managed Files](features/managed-files.html): one project owns a repository file, such as CODEOWNERS, for each of its repositories.
 - [Environment Rulesets](features/rulesets.html): keep one repository ruleset and apply it across a project.
 - [Backup & Restore](features/backup-restore.html): copy your installation before an upgrade and restore it if needed.
 - [Permissions](features/permissions.html): who can see a project, and who can change it.

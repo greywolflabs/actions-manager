@@ -33,7 +33,7 @@ SMTP_FROM_NAME=ActionsManager
 
 `SMTP_HOST` and `SMTP_FROM_ADDRESS` are required; the rest have sensible defaults. See `.env.self-hosted.example` for the full reference.
 
-From **Workspace menu → Notifications**, use **Send Test Email** to confirm the configuration works. Connection, TLS, and authentication failures are reported with their specific cause, not a generic error.
+Open **Notifications** from the account menu and use **Send Test Email** to confirm the configuration works. Connection, TLS, and authentication failures are reported with their specific cause, not a generic error.
 
 ![Notifications settings page showing the test email form, a subscription, and delivery history](../assets/screenshots/notifications/notifications-settings.png)
 
@@ -46,7 +46,7 @@ A subscription tells ActionsManager who to email, and about what:
 - **Events** — which event types to notify on (leave empty for all)
 - **Notify on drift resolved** — whether resolution emails are sent in addition to detection emails
 
-Workspace admins manage subscriptions from **Workspace menu → Notifications**.
+Workspace admins manage subscriptions under **Notifications** in the account menu.
 
 ## Delivery History
 

@@ -97,9 +97,10 @@ has ever completed.
 
 ![Project drift status row reading "No drift detected — last checked 7/24/2026, 9:12:00 AM" with a Check Now button](../assets/screenshots/drift-detection/drift-status-row.png)
 
-**Actions that fix drift update the stored state directly.** Merging a fix PR, restoring the managed
-version, adopting GitHub's version, syncing other repositories, and deleting a workflow all clear
-the drift they resolved, for exactly the repositories and branches they touched. The banner clears
+**Actions that fix drift update the stored state directly.** Merging a pull request that puts the
+project's version back, using GitHub's version, and merging the pull requests that delete a
+workflow everywhere all clear the drift they resolved, for exactly the repositories and branches
+they touched. The banner clears
 straight away — there is no wait for the next sweep, and no extra GitHub calls.
 
 Two things the background sweep deliberately does **not** do:
@@ -231,38 +232,42 @@ which is what makes checking every project on a schedule affordable.
 
 | State | Where it appears | Description |
 |-------|------------------|-------------|
-| No drift detected | Project status row | The saved result is clean: every workflow checked matches the managed definition |
+| No drift detected | Project status row | The saved result is clean: every file checked matches the managed definition |
 | Drift detected | Drift row, project badge | The file in the repository differs from the managed definition |
-| Deleted in GitHub | Drift row | The workflow file was removed from the repository outside ActionsManager |
+| Deleted in GitHub | Drift row | The file was removed from the repository outside ActionsManager |
 | Needs attention / Couldn't check | Project badge, status row | The last check could not complete for one or more repositories |
 | Not checked (yet) / Drift status unknown | Project badge, status row | No drift check has ever completed, or the last one could not complete and automatic checks are paused |
 
-Each drift row is one **(workflow, repository, branch)**. The same workflow can be drifted in one
-repository and in sync in another, or drifted on one branch and clean on another, and each is
-resolved on its own.
+Each drift row is one **(file, repository, branch)**, where the file is a workflow, a custom file
+or CODEOWNERS. The same file can be drifted in one repository and in sync in another, or drifted on
+one branch and clean on another, and each is resolved on its own.
 
-### When the workflow was deleted in GitHub
+### When the file was deleted in GitHub
 
-If someone removes the workflow file from a repository outside ActionsManager, the drift panel says
-**Deleted in GitHub** rather than showing an empty diff, and offers the two choices that actually
+If someone removes a file from a repository outside ActionsManager, the drift panel says
+**Deleted in GitHub** rather than showing an empty diff, and offers the choices that actually
 apply:
 
-- **Recreate via Pull Request** (or directly, without review) — puts the managed workflow back in
-  that repository.
-- **Delete Everywhere** — accepts the deletion. Removes the workflow file from the project's other
-  repositories *and* removes the workflow from ActionsManager, including its version history. The
-  confirmation names every repository that will be affected, and it cannot be undone.
+- **Keep ActionsManager Version** — opens a [PR campaign](pr-campaigns.html) for that repository
+  that adds the file back. It works the same for workflows, custom files and CODEOWNERS.
+- **Delete Everywhere** (workflows only) — accepts the deletion. Opens pull requests removing the
+  workflow from the project's other repositories; once they merge, the workflow leaves
+  ActionsManager, version history included. The confirmation names every repository that will be
+  affected.
 
-![Drift review list with a workflow marked "Deleted in GitHub", showing the Recreate via Pull Request and Delete Everywhere actions](../assets/screenshots/drift-detection/drift-deleted-in-github.png)
+![Drift review list with a workflow marked "Deleted in GitHub", showing the Keep ActionsManager Version and Delete Everywhere actions](../assets/screenshots/drift-detection/drift-deleted-in-github.png)
 
-"Adopt GitHub Version" is not offered here: there is no content in GitHub to adopt.
+**Use GitHub Version** is not offered here, because there is no content in GitHub to use. To accept
+the deletion of a custom file, [remove it from the project](workflows.html#removing-a-custom-file).
+CODEOWNERS is what its project is for, so to stop managing it in a repository, remove that
+repository from the project.
 
-Until you choose one, the workflow keeps being reported as drifted — ActionsManager still manages a
+Until you choose one, the file keeps being reported as drifted: ActionsManager still manages a
 file that no longer exists in the repository.
 
 **Deleted means a file that was really there is gone.** ActionsManager only reports a workflow as
 deleted from a repository and branch where it has a record of the file being there: a pull request
-that delivered it merged, a direct commit wrote it, or a drift check saw it. A workflow
+that delivered it merged, a drift check saw it, or you made that copy the project's version. A workflow
 whose pull request is still open has never been on the target branch, so its absence there is
 pending merge — opening a campaign does not put the project into drift. The same holds for a
 repository or branch newly added to an existing project: nothing has been delivered there yet, so
@@ -272,7 +277,7 @@ has no bearing on it.
 
 Because a newly added repository is silent in the drift list, ActionsManager says so elsewhere
 instead: saving a repository into a project prompts you to
-[deliver the project's workflows to it](projects.html#adding-a-repository-to-a-project-that-already-has-workflows)
+[deliver the project's files to it](projects.html#adding-a-repository-to-a-project-that-already-has-files)
 or keep the change local, and if you keep it local a
 [standing reminder](projects.html#keeping-track-of-whats-still-waiting) tracks what
 is still waiting. "Not drifted" here means "nothing has been delivered yet", not "in sync" — the two
@@ -313,27 +318,28 @@ Inside a project:
   some workflows couldn't be checked, "Drift status unknown — last checked …" when automatic checks
   are paused after a failed check, or "Not checked yet". It always carries a **Check Now** button, so
   a clean or never-checked project still has a way to trigger a live check.
-- A **drift banner** when something is drifted: "N workflows changed in GitHub", with **Review
-  Drift**.
-- **Review Drift** opens the full list — one row per workflow, repository and branch, with its
-  state, its last-checked time, and a **View Diff** action. Rows for a repository using a
-  repo-specific override are labelled *Repo Override*.
+- A **drift banner** when something is drifted, naming what changed — for example "2 workflows and
+  CODEOWNERS changed in GitHub" — with **Review Drift**.
+- **Review Drift** opens the full list: one row per file, repository and branch, with workflows,
+  custom files and CODEOWNERS in one table. Each row shows its state, its last-checked time, and a
+  **View Diff** action. A custom file or CODEOWNERS row carries a badge naming its kind. A workflow
+  row for a repository using a repo-specific override is labelled *Repo Override*.
 
 Everything on this screen comes from the stored result of the last check, so it renders immediately
 and without touching GitHub.
 
 ## Managed version vs. GitHub version
 
-Every drift is a difference between two versions of the same workflow:
+Every drift is a difference between two versions of the same file:
 
-- **ActionsManager managed version** — the workflow definition ActionsManager stores and delivers for the project (or this repository's override, if it has one). Shown in the left column of the diff.
-- **Current GitHub version** — the workflow file as it exists in the repository right now. Shown in the right column of the diff.
+- **ActionsManager managed version** — the file ActionsManager stores and delivers for the project (for a workflow, this repository's override, if it has one). Shown in the left column of the diff.
+- **Current GitHub version** — the file as it exists in the repository right now. Shown in the right column of the diff.
 
 The GitHub side is fetched when you open a diff, not replayed from the last check, so you are always
 deciding against the file as it stands. That is also why the drift list itself is free: it stores
 only what it needs to list the row, and pays for content when you actually look at one.
 
-Resolving a drift means deciding which of these two should win, and how the change is applied.
+Resolving a drift means deciding which of these two should win.
 
 Here's an example: a `lint` step was added straight to the workflow file in GitHub, bypassing ActionsManager. The added line is highlighted on the GitHub side:
 
@@ -341,80 +347,110 @@ Here's an example: a `lint` step was added straight to the workflow file in GitH
 
 ## Who Can Resolve Drift
 
-Resolving drift writes to GitHub — "Restore Directly" commits straight to the target branch — so it requires **editor** access to the project. Project viewers can see drift and open the diff, but the resolution actions are rejected. Project owners and workspace admins always qualify.
+Resolving drift changes the project, and the pull requests it opens write to GitHub, so it requires **editor** access to the project. Project viewers can see drift and open the diff, but the resolution actions are rejected. Project owners and workspace admins always qualify.
 
 Resolution is also scoped to the project's own repositories: a resolve targeting a repository that is not part of the project is rejected, even if your GitHub token could write to it.
 
 ## Resolving Drift
 
-Open **Review Drift** to see every drifted workflow across the project. Select a single workflow's **View Diff** to see the side-by-side diff and the resolution actions, or select multiple drifted workflows using the checkboxes to resolve them together. Each action names the repository and target branch it affects — or, for a bulk action, every repository and branch among the selected workflows. There are three actions.
+Open **Review Drift** to see every drifted file across the project: workflows, custom files and
+CODEOWNERS in one list. **View Diff** on a row shows the side-by-side diff and the two ways to put
+it right. To resolve several rows together, select them with their checkboxes. Each action names
+the repository and target branch it affects.
 
-### Create Fix Pull Request
+The two actions are the same for every kind of file:
 
-Opens a pull request **only** in the drifted repository that restores the workflow to the ActionsManager-managed version. No other repository is changed.
+- **Keep ActionsManager Version** puts the project's version back through a pull request.
+- **Use GitHub Version** makes GitHub's copy the project's version.
 
-- **Writes to GitHub?** Yes, but only as a pull request branch — nothing lands on the target branch until you merge it.
-- **Pull request created?** Yes, one, in the affected repository, against that repository's configured target branch.
-- **Repository affected:** just the one shown in the drift record.
-- **Resulting state:** the workflow moves to `under_review` and the project's PR state becomes `open`. The drift is **not** cleared yet — it still shows as drifted until the PR is merged.
-- **After the PR merges:** the target branch now matches the managed version, ActionsManager marks the workflow `synced_with_github`, and clears the drift for that repository and branch straight away — whether you merge from ActionsManager or on GitHub, as long as the pull request webhook is configured. Without the webhook, a merge done on GitHub clears at the next check instead.
+Every change to GitHub goes through a pull request. ActionsManager never commits a drift fix
+straight to a branch.
 
-This is the recommended option: the change is reviewable and reversible before it reaches your default branch.
+### Keep ActionsManager Version
 
-### Restore Directly
+Opens the [PR campaign](pr-campaigns.html) dialog for the repositories where the file drifted, with
+only that file ticked. You see exactly what will be proposed before any pull request opens.
 
-Immediately overwrites the workflow on the target branch in the drifted repository with the ActionsManager-managed version. No pull request is created.
+- **Writes to GitHub?** Only as pull requests. Nothing lands on the target branch until you merge.
+- **Repositories affected:** the ones where the file drifted. A campaign delivers to each
+  repository's configured branches, so a branch that already holds the project's version is
+  reported as already up to date and gets no pull request.
+- **Resulting state:** the project's PR state becomes `open`, and a workflow's status becomes
+  **Under Review**. The drift stays listed until the pull request merges, or until the next check,
+  which reports the file as under review.
+- **After the PR merges:** the branch holds the project's version again, and the drift for that
+  repository and branch clears straight away. That holds whether you merge from ActionsManager or on
+  GitHub, as long as the pull request webhook is configured. Without the webhook, a merge done on
+  GitHub clears at the next check instead.
 
-- **Writes to GitHub?** Yes, immediately, straight to the target branch.
-- **Pull request created?** No.
-- **Repository affected:** just the one shown in the drift record.
-- **Resulting state:** the commit is pushed, the workflow is marked `synced_with_github`, and the drift for that repository and branch clears immediately — GitHub now matches, so there is nothing left to re-check.
-- **Why it is riskier:** there is no review step. The current GitHub version is replaced right away, so a mistake reaches your default branch (and anyone watching it) with no chance to catch it in a PR. ActionsManager asks you to confirm the repository and target branch before running it.
+This is the recommended option, because the change is reviewed before it reaches your branch.
+Putting the file back is the point, so the campaign dialog does not warn that it overwrites a
+change made on GitHub.
 
-### Adopt GitHub Version
+The editors offer the same action. The drift banner in the CODEOWNERS editor and in a custom
+file's editor has a **Keep ActionsManager version** button that opens the same campaign.
 
-Imports the current GitHub version into ActionsManager instead of restoring the managed version. Opening this action presents three sub-modes:
+### Use GitHub Version
 
-| Sub-mode | Writes to GitHub? | What it does |
-|----------|-------------------|--------------|
-| Adopt for project and sync other repositories (recommended) | **Yes** | Makes the GitHub version the new managed project workflow, then delivers it to the project's other repositories via pull request or direct commit (your choice). |
-| Adopt locally only | **No** | Updates the ActionsManager managed draft to the GitHub version and stops. The draft is reviewed and delivered later through the normal workflow flow. |
-| Create repo-specific override | **No** | Pins this repository to its own GitHub version as a per-repo override. The shared project workflow and the other repositories are left unchanged. |
+Makes the copy on GitHub the project's version. ActionsManager reads it from that repository and
+branch, and refuses if GitHub changed it since the drift check, so you never take content you were
+not shown.
 
-**Effect on other repositories:** because a project workflow is shared across its repositories, changing the managed version affects them all. "Adopt for project and sync" brings the others into line immediately. "Adopt locally only" changes the managed draft without touching GitHub, so the other repositories may now show drift against the new managed version until they are delivered to. "Create repo-specific override" isolates this one repository and leaves everything else as it was.
+For a **workflow**, you choose how far the change goes:
 
-### Resolving Several Workflows at Once
+| Choice | Writes to GitHub? | What it does |
+|--------|-------------------|--------------|
+| Adopt for project and sync other repositories (recommended) | Pull requests only | Makes the GitHub version the project's workflow, then opens pull requests delivering it to the project's other repositories. |
+| Adopt locally only | No | Makes the GitHub version the project's workflow and stops. The other repositories keep the previous version until you deliver it to them. |
+| Create repo-specific override | No | Pins this repository to its GitHub version as an override. The project's workflow and the other repositories are left unchanged. |
 
-Workflows that drifted with the **identical** GitHub-side change are grouped automatically — a "N identical — select all" link appears next to any workflow that shares a group, so a change that landed the same way across several repositories can be selected in one click instead of one at a time.
+A **custom file** or **CODEOWNERS** has one copy for every repository, so it has no override. Its
+GitHub version becomes the project's file, saved as a local change after you confirm. Drift clears
+wherever GitHub holds that copy. Deliver it to the other repositories with a PR campaign. To edit
+the GitHub version before saving it, use **Load GitHub version** in the file's editor instead, then
+**Commit Locally**.
+
+### Resolving Several Files at Once
+
+Files that drifted with the **identical** GitHub-side change are grouped automatically. A
+"N identical — select all" link appears next to any row that shares a group, so a change that
+landed the same way across several repositories can be selected in one click.
 
 ![Drift review list with checkboxes and a "2 identical — select all" grouping link](../assets/screenshots/drift-detection/drift-bulk-select.png)
 
-Select any combination of drifted workflows — individually via their checkboxes, or a whole identical group at once — to reveal a bulk action toolbar with the same three resolution actions, applied to every selected workflow.
+Selecting rows, one at a time or a whole identical group at once, shows a toolbar with the same two
+actions:
 
-![Bulk action toolbar showing 2 of 2 selected and the three bulk resolution actions](../assets/screenshots/drift-detection/drift-bulk-toolbar.png)
+- **Keep ActionsManager Version** opens one campaign dialog with every selected file ticked, for
+  every repository among the selected rows.
+- **Use GitHub Version** uses each selected file's GitHub copy. It is unavailable when a selected
+  file was deleted on GitHub, or when the same file is selected in two copies that differ, because
+  then there is no single version to use.
 
-Restoring directly still asks for confirmation before overwriting GitHub, naming how many workflows are affected.
+![Bulk action toolbar showing 2 of 2 selected, with Keep ActionsManager Version and Use GitHub Version](../assets/screenshots/drift-detection/drift-bulk-toolbar.png)
 
 ## Which option should I use?
 
 | Option | Writes to GitHub | Pull request | Repositories changed |
 |--------|------------------|--------------|----------------------|
-| Create Fix Pull Request | One repository, via a reviewable PR | Yes | One |
-| Adopt GitHub Version | Only "adopt & sync" writes; local-only and override make no GitHub change | Only in "adopt & sync" (PR mode) | "Adopt & sync": the project's repos; otherwise none |
-| Restore Directly | One repository, immediately | No | One |
+| Keep ActionsManager Version | The drifted repositories, by reviewable pull requests | Yes | Those where the file drifted |
+| Use GitHub Version, adopt and sync (workflows) | The other repositories, by pull requests | Yes | The project's other repositories |
+| Use GitHub Version, local, override or a file | No | No | None |
+| Delete Everywhere (workflow deleted on GitHub) | The other repositories, by pull requests | Yes | The project's other repositories |
 
 ## When Resolution Fails
 
 Resolution talks to GitHub with your stored credentials, so most failures come from GitHub itself. ActionsManager surfaces the specific reason (not a generic error); common cases:
 
 - **Insufficient permissions** — your token lacks write access (or `workflow` scope) for the repository. Reconnect with a token that can push and open pull requests.
-- **Branch protection** — the target branch requires reviews, status checks, or blocks direct pushes. "Restore Directly" will be rejected; use "Create Fix Pull Request" so the change goes through review.
 - **Missing branch** — the configured target branch no longer exists in the repository. Recreate it or update the project's branch configuration.
-- **Existing pull request conflict** — an open ActionsManager PR/branch for this workflow already exists. Merge or close it before opening a new fix PR; ActionsManager will not silently reuse an unrelated PR.
+- **Existing pull request conflict** — an open ActionsManager PR/branch for this file already exists. Merge or close it before opening a new one; ActionsManager will not silently reuse an unrelated PR.
 - **Expired or revoked credentials** — the GitHub token is no longer valid. Re-authenticate, then retry.
-- **The file changed since you checked** — someone edited or fixed the workflow in GitHub after your drift view was loaded. ActionsManager refuses the resolve rather than overwriting their change, and tells you to re-run the drift check. Refresh, review the current difference, and decide again. In a bulk resolve only the affected rows are rejected; the rest still apply.
+- **The file changed since you checked** — someone edited or fixed the file in GitHub after the drift check. ActionsManager refuses to use that version rather than take content you were not shown, and tells you to run **Check Now**. Review the current difference, and decide again. When you use the GitHub version of several rows, a workflow that changed is refused on its own and the rest still apply. Among custom files and CODEOWNERS, one that changed refuses them all, so none is saved.
 
-If a resolution fails, the diff stays open with the reason shown, and no partial state is left behind — nothing is marked synced and no PR record is created.
+If using the GitHub version fails, the review stays open with the reason shown, and nothing is
+saved for the rows that failed. A campaign that cannot open a pull request in a repository reports
+that repository in the campaign's results, like any other campaign.
 
 ## Drift Notifications
 
@@ -459,12 +495,12 @@ caller projects linked to it — not as drift — until that PR is merged or clo
 
 ## CODEOWNERS Drift
 
-A project has one CODEOWNERS file (**Project Files → CODEOWNERS**). Its PR campaigns deliver that
-file to every repository in the campaign, the same way they deliver custom files, so there is no
-separate copy per repository to manage.
+A CODEOWNERS project in [Managed Files](managed-files.html) has one CODEOWNERS file, edited on the
+project's page. Its PR campaigns deliver that file to every repository in the campaign, so there is
+no separate copy per repository to manage.
 
-Its drift is checked with the project's workflows, by **Check Now** and the automatic checks, on
-every branch the project delivers to, and follows the same rules:
+Its drift is checked by **Check Now** and the automatic checks, on every branch the project
+delivers to, by the same rules as a workflow's:
 
 - **Commit Locally neither makes drift nor hides it.** Saving a change marks the file as modified
   locally — pending sync — and it reads **Draft changes** until a PR campaign delivers it. Drift the
@@ -480,36 +516,38 @@ every branch the project delivers to, and follows the same rules:
 CODEOWNERS drift appears everywhere workflow drift does:
 
 - the drift banner and the **Review Drift** list;
-- the project's badge on the Projects list;
 - drift notifications;
-- the **CODEOWNERS** row under **Project Files**;
+- the project's card in the Managed Files section, which names the repository that changed it;
 - the CODEOWNERS editor.
 
 As for a workflow, a change someone makes to the file on GitHub is reported as drift even while a
 local change waits to be delivered. Delivering your change replaces it.
 
-![CODEOWNERS editor showing a "Drift detected" badge next to "Synced", and a banner reading "the CODEOWNERS file on GitHub has changed on acme-corp/payments-service @ main since ActionsManager last delivered it" with a Load GitHub version button](../assets/screenshots/drift-detection/codeowners-drift.png)
+![CODEOWNERS editor showing a "Drift detected" badge next to "Synced", and a banner reading "the CODEOWNERS file on GitHub has changed on acme-corp/node-api @ main since ActionsManager last delivered it" with Keep ActionsManager version and Load GitHub version buttons](../assets/screenshots/drift-detection/codeowners-drift.png)
 
-The editor's drift banner names each repository and branch that changed. To resolve it:
+CODEOWNERS drift is [resolved like any other file's](#resolving-drift), from **Review Drift** or
+from the editor's drift banner, which names each repository and branch that changed:
 
-- **Keep the change made on GitHub.** Choose **Load GitHub version** in the banner (**Load from** a
-  repository and branch, when more than one changed), review it in the editor, and choose
-  **Commit Locally**. The project's file then becomes that version, drift on that branch is resolved
-  at once, and the other repositories receive it with your next PR campaign.
-- **Put the project's version back.** Include **CODEOWNERS** in a
-  [PR campaign](pr-campaigns.html). The campaign offers it ticked when it has changes to deliver,
-  and unticked when it is already synced, so you can still include it to overwrite a change made
-  on GitHub. A CODEOWNERS change on its own is enough to start a campaign.
-
-**Open CODEOWNERS** in the **Review Drift** list takes you to the editor.
+- **Put the project's version back.** Choose **Keep ActionsManager version**: a PR campaign
+  carrying only CODEOWNERS opens for the repositories where it drifted. You can also include
+  **CODEOWNERS** in any [PR campaign](pr-campaigns.html). The campaign offers it ticked when it has
+  changes to deliver, and unticked when it is already synced, so you can still include it to
+  overwrite a change made on GitHub. A CODEOWNERS change on its own is enough to start a campaign,
+  and so is CODEOWNERS drift on a synced project. A campaign you start from **Create Pull
+  Requests** warns you first that it would overwrite a change made on GitHub.
+- **Keep the change made on GitHub.** Choose **Use GitHub Version** in **Review Drift**. To edit it
+  first, choose **Load GitHub version** in the banner (**Load from** a repository and branch, when
+  more than one changed), review it in the editor, and choose **Commit Locally**. Either way the
+  project's file becomes that version, drift on that branch is resolved at once, and the other
+  repositories receive it with your next PR campaign.
 
 A project with no CODEOWNERS file yet can start from one of its repositories' files: choose the
 repository in the editor and **Load from repository**, then **Commit Locally**.
 
-:::note[Projects from before one file per project]
-CODEOWNERS used to be kept per repository. On upgrade, each project keeps its most recently saved
-copy. If its repositories held different copies, the project's file reads **Draft changes** until a
-PR campaign delivers it to all of them.
+:::note[CODEOWNERS in workflow projects]
+Caller and Reusable Workflow Projects no longer manage CODEOWNERS, and upgrading removes what they
+kept of it without touching your repositories. See
+[CODEOWNERS moved here from workflow projects](managed-files.html#codeowners-moved-here-from-workflow-projects).
 :::
 
 ## Custom File Drift
@@ -526,13 +564,20 @@ the move removes the copy at the old path on each branch it was delivered to, in
 request, and so does one delivering a moved CODEOWNERS.
 
 Custom file drift appears in the drift banner, the **Review Drift** list, the project's badge, drift
-notifications, the file's row under **Project Files**, and the file's editor. The editor's banner
-names each repository and branch that changed. To resolve it:
+notifications, the file's row under **Project Files**, and the file's editor. It is
+[resolved like any other file's](#resolving-drift), from **Review Drift** or from the editor's
+banner, which names each repository and branch that changed:
 
-- **Keep the change made on GitHub.** Choose **Load GitHub version** (**Load from** a repository and
-  branch, when more than one changed), review it, and choose **Commit Locally**. Drift on that
-  branch is resolved at once.
-- **Put the project's version back.** Include the file in a [PR campaign](pr-campaigns.html).
+- **Put the project's version back.** Choose **Keep ActionsManager version**: a PR campaign
+  carrying only that file opens for the repositories where it drifted. You can also include the
+  file in any [PR campaign](pr-campaigns.html). A drifted file is offered even when it is synced,
+  unticked so that overwriting the change made on GitHub is your choice, and **Create Pull
+  Requests** stays available on a synced project while a file has drifted. Repositories that still
+  hold the project's version get no pull request.
+- **Keep the change made on GitHub.** Choose **Use GitHub Version** in **Review Drift**, or, to edit
+  it first, **Load GitHub version** in the editor (**Load from** a repository and branch, when more
+  than one changed), review it, and choose **Commit Locally**. Drift on that branch is resolved at
+  once.
 
 Deleting a custom file from the project, or starting the campaign that removes it from GitHub,
 stops its drift counting towards the project.

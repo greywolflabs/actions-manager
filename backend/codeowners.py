@@ -29,6 +29,7 @@ from custom_files import _get_project_for_user, _mark_project_draft
 from database import get_db
 import deliveries
 from drift_notifications import resolve_drift_for_local_edit
+from file_kinds import FILE_KINDS, refuse_unless_accepted
 from models import Codeowners, Project, ProjectRepo, Repo
 from workflows import (
     _find_project_by_name,
@@ -43,10 +44,13 @@ GITHUB_API_URL = "https://api.github.com"
 ACCEPT_HEADER = "application/vnd.github+json"
 X_API_VERSION = "2022-11-28"
 
-# Allowed GitHub locations for CODEOWNERS, in priority order when reading.
-# Note: GitHub also supports ``docs/CODEOWNERS`` but the issue specifies only
-# the two most common locations.
-ALLOWED_PATHS = (".github/CODEOWNERS", "CODEOWNERS")
+# CODEOWNERS' key in file_kinds.FILE_KINDS. Only a Managed Files project of
+# this kind holds the file (#2367).
+KIND = "codeowners"
+
+# Every location GitHub reads CODEOWNERS from, in the order it looks. The kind
+# definition is the one list; the editor and the import read it too.
+ALLOWED_PATHS = FILE_KINDS[KIND].paths
 
 
 # --------------------------------------------------------------------------- #
@@ -250,7 +254,7 @@ def get_project_codeowners(
 
 
 @router.put("/api/projects/{project_id}/codeowners", responses={
-    400: {"description": "Invalid file path"},
+    400: {"description": "Invalid file path, or a project that is not a CODEOWNERS project"},
     401: {"description": "Not authenticated"},
     403: {"description": "Not a project editor"},
     404: {"description": "Project not found"},
@@ -270,6 +274,7 @@ def save_project_codeowners(
     user = account.github_user
     project = _get_project_for_user(db, project_id, user)
     _require_project_editor(db, user, project)
+    refuse_unless_accepted(project, kind=KIND)
     file_path = _validate_file_path(payload.file_path)
 
     record, changed = _save(db, project, payload, file_path, user)
@@ -291,7 +296,7 @@ def save_project_codeowners(
 
 
 @router.get("/api/repos/{repo_ref:path}/codeowners", responses={
-    400: {"description": "Invalid file path or repository name"},
+    400: {"description": "Invalid file path or repository name, or a project that is not a CODEOWNERS project"},
     409: {"description": "More than one project has this name"},
     502: {"description": "GitHub could not be read"},
 })
@@ -312,6 +317,7 @@ def get_codeowners(
     ``repo_ref`` is either the integer ``repo_id`` or the full ``owner/repo`` name.
     """
     token, project = _resolve_caller_and_project(db, account.github_user, project_name)
+    refuse_unless_accepted(project, kind=KIND)
     repo = _resolve_repo_in_project(db, project, repo_ref)
     owner, repo_short = _split_repo(repo.repo_name)
     paths = (_validate_file_path(path),) if path else ALLOWED_PATHS

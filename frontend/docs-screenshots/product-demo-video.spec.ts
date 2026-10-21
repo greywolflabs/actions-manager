@@ -37,12 +37,12 @@ const WIDTH = 1920;
 const HEIGHT = 1080;
 test.use({ viewport: { width: WIDTH, height: HEIGHT }, video: { mode: "on", size: { width: WIDTH, height: HEIGHT } } });
 
-const REPOS = ["payments-service", "payments-worker", "checkout-web"];
+const REPOS = ["node-api", "node-worker", "node-web"];
 // A project's repositories share its workflows, so all three build the same way.
 const BUILD_TYPES: Record<string, { name: string; technology: string; confidence: number }> = {
-  "payments-service": { name: "npm", technology: "Node.js", confidence: 0.96 },
-  "payments-worker": { name: "npm", technology: "Node.js", confidence: 0.93 },
-  "checkout-web": { name: "npm", technology: "Node.js", confidence: 0.91 },
+  "node-api": { name: "npm", technology: "Node.js", confidence: 0.96 },
+  "node-worker": { name: "npm", technology: "Node.js", confidence: 0.93 },
+  "node-web": { name: "npm", technology: "Node.js", confidence: 0.91 },
 };
 const NODE_WORKFLOW = [
   "name: Build and Test",
@@ -147,12 +147,12 @@ test.describe("product demo", () => {
       title: "Add build-and-test.yml",
       author: DOCS_USER,
       createdAt: now,
-      workflowNames: "AM_PAY_build-and-test.yml",
+      workflowNames: "AM_NODE_build-and-test.yml",
       repoResults: REPOS.map((repo, i) => ({
         repo: `${DOCS_USER}/${repo}`,
         success: true,
         pr_number: 41 + i,
-        branch_name: "actions-manager/payments-platform",
+        branch_name: "actions-manager/nodebuilds",
       })),
     });
     await installOverlays(page);
@@ -175,7 +175,7 @@ test.describe("product demo", () => {
     at("chapter 2");
     await showChapter(page, 2, "Create a Caller Workflow Project");
     await click(page, page.getByRole("button", { name: /New Project/ }).first());
-    await type(page, page.getByLabel(/Project Name:/i), "Payments Platform");
+    await type(page, page.getByLabel(/Project Name:/i), "NodeBuilds");
     await page.waitForTimeout(800);
     await click(page, page.getByTestId("wizard-continue"));
     await page.waitForTimeout(1100);
@@ -188,12 +188,12 @@ test.describe("product demo", () => {
     await click(page, page.locator('input[name="resourceNamingMode"][value="prefix"]'));
     await click(page, page.getByRole("button", { name: "Advanced Options" }));
     await click(page, page.getByLabel("Use custom project key"));
-    await type(page, page.getByPlaceholder("Enter project key (2-10 chars, letters/numbers)"), "PAY");
+    await type(page, page.getByPlaceholder("Enter project key (2-10 chars, letters/numbers)"), "NODE");
     await page.waitForTimeout(800);
     await click(page, page.getByTestId("create-project-button"));
-    await page.getByRole("button", { name: "Open project Payments Platform" }).waitFor({ timeout: 15000 });
+    await page.getByRole("button", { name: "Open project NodeBuilds" }).waitFor({ timeout: 15000 });
     await page.waitForTimeout(2400);
-    await click(page, page.getByRole("button", { name: "Open project Payments Platform" }));
+    await click(page, page.getByRole("button", { name: "Open project NodeBuilds" }));
     await page.getByRole("button", { name: "Add Workflow" }).waitFor({ timeout: 15000 });
     await page.waitForTimeout(1600);
 

@@ -1,11 +1,13 @@
 /* eslint-disable no-restricted-syntax -- Legacy: TODO migrate inline styles to Tailwind CSS classes */
 import React, { useState, useEffect, useCallback } from "react";
-import { BrowserRouter as Router, Routes, Route, useParams, Navigate, Link} from "react-router";
+import { BrowserRouter as Router, Routes, Route, useParams, Navigate } from "react-router";
 import ProjectMgmt from "./ProjectMgmt";
 import NewProject from "./NewProject";
 import ActionsProjectsList from "./ActionsProjectsList";
 import AddActionsProject from "./AddActionsProject";
 import ActionsProjectDetail from "./ActionsProjectDetail";
+import ManagedFilesList from "./ManagedFilesList";
+import { AppShell } from "./components/AppHeader";
 import DarkModeToggle from "./components/DarkModeToggle";
 import BrandLogo from "./components/BrandLogo";
 import WorkspaceMembers from "./components/WorkspaceMembers";
@@ -32,7 +34,8 @@ const WEBSOCKET_URL = config.WEBSOCKET_URL;
 
 // TypeScript interfaces
 
-interface ProjectMgmtWrapperProps {
+// Every page that renders the shared app header needs these for its avatar menu.
+interface ShellPageProps {
   readonly userDetails: UserDetails | undefined;
   readonly onLogout: () => void;
 }
@@ -319,7 +322,7 @@ function App(): React.ReactElement {
                 />
                 <Route
                   path="/project/:user/new"
-                  element={<NewProjectWrapper tourStep={runningTourStep(userDetails?.onboarding)} />}
+                  element={<NewProjectWrapper tourStep={runningTourStep(userDetails?.onboarding)} userDetails={userDetails} onLogout={handleLogout} />}
                 />
                 <Route
                   path="/project/:user"
@@ -327,31 +330,35 @@ function App(): React.ReactElement {
                 />
                 <Route
                   path="/workspace/members"
-                  element={<WorkspaceMembersWrapper currentUser={user || ""} currentUserRole={userDetails?.workspace_role} onLogout={handleLogout} />}
+                  element={<WorkspaceMembersWrapper currentUser={user || ""} userDetails={userDetails} onLogout={handleLogout} />}
                 />
                 <Route
                   path="/workspace/notifications"
-                  element={<WorkspaceNotificationsWrapper currentUser={user || ""} currentUserRole={userDetails?.workspace_role} onLogout={handleLogout} />}
+                  element={<WorkspaceNotificationsWrapper currentUser={user || ""} userDetails={userDetails} onLogout={handleLogout} />}
                 />
                 <Route
                   path="/workspace/backup"
-                  element={<WorkspaceBackupWrapper currentUser={user || ""} currentUserRole={userDetails?.workspace_role} onLogout={handleLogout} />}
+                  element={<WorkspaceBackupWrapper currentUser={user || ""} userDetails={userDetails} onLogout={handleLogout} />}
                 />
                 <Route
                   path="/workspace/drift"
-                  element={<WorkspaceDriftSettingsWrapper currentUser={user || ""} currentUserRole={userDetails?.workspace_role} onLogout={handleLogout} />}
+                  element={<WorkspaceDriftSettingsWrapper currentUser={user || ""} userDetails={userDetails} onLogout={handleLogout} />}
                 />
                 <Route
                   path="/project/:user/actions-projects/new"
-                  element={<AddActionsProjectWrapper />}
+                  element={<AddActionsProjectWrapper userDetails={userDetails} onLogout={handleLogout} />}
                 />
                 <Route
                   path="/project/:user/actions-projects/:actionsProjectId"
-                  element={<ActionsProjectDetailWrapper />}
+                  element={<ActionsProjectDetailWrapper userDetails={userDetails} onLogout={handleLogout} />}
                 />
                 <Route
                   path="/project/:user/actions-projects"
-                  element={<ActionsProjectsListWrapper />}
+                  element={<ActionsProjectsListWrapper userDetails={userDetails} onLogout={handleLogout} />}
+                />
+                <Route
+                  path="/project/:user/managed-files"
+                  element={<ManagedFilesListWrapper userDetails={userDetails} onLogout={handleLogout} />}
                 />
                 <Route path="*" element={<Navigate to={`/project/${user}`} replace />} />
               </Routes>
@@ -491,198 +498,90 @@ function App(): React.ReactElement {
 }
 
 // Wrapper to pass URL parameters to ProjectMgmt
-function ProjectMgmtWrapper({ userDetails, onLogout }: ProjectMgmtWrapperProps): React.ReactElement {
+function ProjectMgmtWrapper({ userDetails, onLogout }: ShellPageProps): React.ReactElement {
   return <ProjectMgmt userDetails={userDetails} onLogout={onLogout} />;
 }
 
-// Wrapper to pass URL parameters to NewProject
-function NewProjectWrapper({ tourStep }: { readonly tourStep: string | null }): React.ReactElement {
+// The wizard's URL names no section, so the header marks Projects: that's where it starts and ends.
+function NewProjectWrapper({ tourStep, userDetails, onLogout }: ShellPageProps & { readonly tourStep: string | null }): React.ReactElement {
   const { user } = useParams<{ user: string }>();
-  return <NewProject user={user || ""} tourStep={tourStep} />;
-}
-
-// Shared header for the standalone Actions Projects pages (list/add/detail).
-function ActionsProjectsPageShell({
-  user,
-  children,
-}: {
-  readonly user: string;
-  readonly children: React.ReactNode;
-}): React.ReactElement {
   return (
-    <div className="w-full min-h-screen bg-background dark:bg-background-dark">
-      <div className="flex items-center justify-between px-6 py-4 border-b border-border dark:border-border-dark">
-        <BrandLogo variant="full" size="sm" />
-        <Link
-          to={`/project/${user}`}
-          className="text-sm text-text-secondary dark:text-secondary-dark hover:text-text-primary dark:hover:text-text-primary-dark transition-colors"
-        >
-          ← Back to Projects
-        </Link>
-      </div>
-      <div className="p-6">{children}</div>
-    </div>
+    <AppShell user={user || ""} userDetails={userDetails} onLogout={onLogout} currentSection="projects">
+      <NewProject user={user || ""} tourStep={tourStep} />
+    </AppShell>
   );
 }
 
-function ActionsProjectsListWrapper(): React.ReactElement {
+function ActionsProjectsListWrapper({ userDetails, onLogout }: ShellPageProps): React.ReactElement {
   const { user } = useParams<{ user: string }>();
   return (
-    <ActionsProjectsPageShell user={user || ""}>
+    <AppShell user={user || ""} userDetails={userDetails} onLogout={onLogout}>
       <ActionsProjectsList user={user || ""} />
-    </ActionsProjectsPageShell>
+    </AppShell>
   );
 }
 
-function AddActionsProjectWrapper(): React.ReactElement {
+function ManagedFilesListWrapper({ userDetails, onLogout }: ShellPageProps): React.ReactElement {
   const { user } = useParams<{ user: string }>();
   return (
-    <ActionsProjectsPageShell user={user || ""}>
-      <AddActionsProject user={user || ""} />
-    </ActionsProjectsPageShell>
+    <AppShell user={user || ""} userDetails={userDetails} onLogout={onLogout}>
+      <ManagedFilesList user={user || ""} plan={userDetails?.plan} />
+    </AppShell>
   );
 }
 
-function ActionsProjectDetailWrapper(): React.ReactElement {
+function AddActionsProjectWrapper({ userDetails, onLogout }: ShellPageProps): React.ReactElement {
+  const { user } = useParams<{ user: string }>();
+  return (
+    <AppShell user={user || ""} userDetails={userDetails} onLogout={onLogout}>
+      <AddActionsProject user={user || ""} />
+    </AppShell>
+  );
+}
+
+function ActionsProjectDetailWrapper({ userDetails, onLogout }: ShellPageProps): React.ReactElement {
   const { user, actionsProjectId } = useParams<{ user: string; actionsProjectId: string }>();
   return (
-    <ActionsProjectsPageShell user={user || ""}>
+    <AppShell user={user || ""} userDetails={userDetails} onLogout={onLogout}>
       <ActionsProjectDetail user={user || ""} actionsProjectId={Number(actionsProjectId)} />
-    </ActionsProjectsPageShell>
+    </AppShell>
   );
 }
 
-// Wrapper for workspace members page with header/navigation
-interface WorkspaceMembersWrapperProps {
+// Workspace pages have no :user in their URL, so the tabs open the signed-in user's sections.
+interface WorkspacePageProps extends ShellPageProps {
   readonly currentUser: string;
-  readonly currentUserRole?: string;
-  readonly onLogout: () => void;
 }
 
-function WorkspaceMembersWrapper({ currentUser, currentUserRole, onLogout }: WorkspaceMembersWrapperProps): React.ReactElement {
+function WorkspaceMembersWrapper({ currentUser, userDetails, onLogout }: WorkspacePageProps): React.ReactElement {
   return (
-    <div className="w-full min-h-screen bg-background dark:bg-background-dark">
-      <div className="flex items-center justify-between px-6 py-4 border-b border-border dark:border-border-dark">
-        <BrandLogo variant="full" size="sm" />
-        <div className="flex items-center gap-4">
-          <Link
-            to={`/project/${currentUser}`}
-            className="text-sm text-text-secondary dark:text-secondary-dark hover:text-text-primary dark:hover:text-text-primary-dark transition-colors"
-          >
-            ← Back to Projects
-          </Link>
-          <button
-            className="text-sm text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 transition-colors"
-            onClick={onLogout}
-          >
-            Log out
-          </button>
-        </div>
-      </div>
-      <div className="p-6">
-        <WorkspaceMembers currentUser={currentUser} currentUserRole={currentUserRole} />
-      </div>
-    </div>
+    <AppShell user={currentUser} userDetails={userDetails} onLogout={onLogout}>
+      <WorkspaceMembers currentUser={currentUser} currentUserRole={userDetails?.workspace_role} />
+    </AppShell>
   );
 }
 
-// Wrapper for workspace notifications page with header/navigation
-interface WorkspaceNotificationsWrapperProps {
-  readonly currentUser: string;
-  readonly currentUserRole?: string;
-  readonly onLogout: () => void;
-}
-
-function WorkspaceNotificationsWrapper({ currentUser, currentUserRole, onLogout }: WorkspaceNotificationsWrapperProps): React.ReactElement {
+function WorkspaceNotificationsWrapper({ currentUser, userDetails, onLogout }: WorkspacePageProps): React.ReactElement {
   return (
-    <div className="w-full min-h-screen bg-background dark:bg-background-dark">
-      <div className="flex items-center justify-between px-6 py-4 border-b border-border dark:border-border-dark">
-        <BrandLogo variant="full" size="sm" />
-        <div className="flex items-center gap-4">
-          <Link
-            to={`/project/${currentUser}`}
-            className="text-sm text-text-secondary dark:text-secondary-dark hover:text-text-primary dark:hover:text-text-primary-dark transition-colors"
-          >
-            ← Back to Projects
-          </Link>
-          <button
-            className="text-sm text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 transition-colors"
-            onClick={onLogout}
-          >
-            Log out
-          </button>
-        </div>
-      </div>
-      <div className="p-6">
-        <WorkspaceNotifications currentUser={currentUser} currentUserRole={currentUserRole} />
-      </div>
-    </div>
+    <AppShell user={currentUser} userDetails={userDetails} onLogout={onLogout}>
+      <WorkspaceNotifications currentUser={currentUser} currentUserRole={userDetails?.workspace_role} />
+    </AppShell>
   );
 }
 
-interface WorkspaceBackupWrapperProps {
-  readonly currentUser: string;
-  readonly currentUserRole?: string;
-  readonly onLogout: () => void;
-}
-
-function WorkspaceBackupWrapper({ currentUser, currentUserRole, onLogout }: WorkspaceBackupWrapperProps): React.ReactElement {
+function WorkspaceBackupWrapper({ currentUser, userDetails, onLogout }: WorkspacePageProps): React.ReactElement {
   return (
-    <div className="w-full min-h-screen bg-background dark:bg-background-dark">
-      <div className="flex items-center justify-between px-6 py-4 border-b border-border dark:border-border-dark">
-        <BrandLogo variant="full" size="sm" />
-        <div className="flex items-center gap-4">
-          <Link
-            to={`/project/${currentUser}`}
-            className="text-sm text-text-secondary dark:text-secondary-dark hover:text-text-primary dark:hover:text-text-primary-dark transition-colors"
-          >
-            ← Back to Projects
-          </Link>
-          <button
-            className="text-sm text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 transition-colors"
-            onClick={onLogout}
-          >
-            Log out
-          </button>
-        </div>
-      </div>
-      <div className="p-6">
-        <WorkspaceBackup currentUserRole={currentUserRole} />
-      </div>
-    </div>
+    <AppShell user={currentUser} userDetails={userDetails} onLogout={onLogout}>
+      <WorkspaceBackup currentUserRole={userDetails?.workspace_role} />
+    </AppShell>
   );
 }
 
-interface WorkspaceDriftSettingsWrapperProps {
-  readonly currentUser: string;
-  readonly currentUserRole?: string;
-  readonly onLogout: () => void;
-}
-
-function WorkspaceDriftSettingsWrapper({ currentUser, currentUserRole, onLogout }: WorkspaceDriftSettingsWrapperProps): React.ReactElement {
+function WorkspaceDriftSettingsWrapper({ currentUser, userDetails, onLogout }: WorkspacePageProps): React.ReactElement {
   return (
-    <div className="w-full min-h-screen bg-background dark:bg-background-dark">
-      <div className="flex items-center justify-between px-6 py-4 border-b border-border dark:border-border-dark">
-        <BrandLogo variant="full" size="sm" />
-        <div className="flex items-center gap-4">
-          <Link
-            to={`/project/${currentUser}`}
-            className="text-sm text-text-secondary dark:text-secondary-dark hover:text-text-primary dark:hover:text-text-primary-dark transition-colors"
-          >
-            ← Back to Projects
-          </Link>
-          <button
-            className="text-sm text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 transition-colors"
-            onClick={onLogout}
-          >
-            Log out
-          </button>
-        </div>
-      </div>
-      <div className="p-6">
-        <WorkspaceDriftSettings currentUserRole={currentUserRole} />
-      </div>
-    </div>
+    <AppShell user={currentUser} userDetails={userDetails} onLogout={onLogout}>
+      <WorkspaceDriftSettings currentUserRole={userDetails?.workspace_role} />
+    </AppShell>
   );
 }
 

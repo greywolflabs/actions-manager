@@ -99,7 +99,8 @@ vi.mock("./components/RulesetManager", stub("rulesets"));
 vi.mock("./components/CodeownersManager", stub("codeowners"));
 vi.mock("./components/UserAvatar", stub("user-avatar"));
 vi.mock("./components/PlanUsagePill", stub("plan-usage-pill"));
-vi.mock("./components/BrandLogo", stub("brand-logo"));
+// The app header's tabs need a real router, and this file mocks react-router.
+vi.mock("./components/AppHeader", () => import("./test/appHeaderStub"));
 vi.mock("./components/SaveResultsModal", nothing);
 vi.mock("./components/ProjectMembers", nothing);
 vi.mock("./components/DriftDetection", nothing);

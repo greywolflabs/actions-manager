@@ -1,5 +1,7 @@
 /**
- * The page owns the project's one CODEOWNERS file and its drift.
+ * The page owns a CODEOWNERS project's one file and its drift. Only a Managed
+ * Files project of the kind holds CODEOWNERS (#2367); its editor is the
+ * kind's, CodeownersManager.
  *
  * - A CODEOWNERS-only edit can be delivered on its own: Create Pull Requests
  *   only enables while the project is a draft, and the save says whether it is.
@@ -17,6 +19,7 @@ const mockUseParams = vi.fn();
 // Captured so tests can drive the section nav the way a user would, without
 // rendering the real Sidebar.
 let capturedOnSectionChange: ((section: string) => void) | null = null;
+let capturedEditorProps: any = null;
 let capturedWorkflowsProps: any = null;
 let capturedDriftProps: any = null;
 let capturedPRModalProps: any = null;
@@ -38,6 +41,7 @@ vi.mock("react-router", () => ({
 
 vi.mock("./api/projects", () => ({
   __esModule: true,
+  fetchPendingDelivery: vi.fn().mockResolvedValue({ pending_delivery_repos: [], pending_delivery_known: true }),
   fetchProjects: vi.fn(),
   loadProject: vi.fn(),
   updateProjectName: vi.fn(),
@@ -65,6 +69,8 @@ vi.mock("./api/actionsProjects", () => ({ listActionsProjects: vi.fn().mockResol
 vi.mock("./api/actionGroups", () => ({ listActionGroups: vi.fn().mockResolvedValue([]) }));
 vi.mock("./api/codeowners", () => ({
   getProjectCodeowners: vi.fn(),
+  getCodeowners: vi.fn(),
+  saveProjectCodeowners: vi.fn(),
 }));
 
 vi.mock("./components/Sidebar", () => ({
@@ -127,9 +133,18 @@ vi.mock("./components/RulesetManager", () => ({
 }));
 
 vi.mock("./components/CodeownersManager", () => ({
-  default: function CodeownersManager() {
+  default: function CodeownersManager(props: any) {
+    capturedEditorProps = props;
     return <div data-testid="codeowners" />;
   },
+}));
+
+vi.mock("./api/managedFiles", () => ({
+  fetchManagedFiles: vi.fn().mockResolvedValue({
+    kinds: [{ kind: "codeowners", label: "CODEOWNERS", paths: [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"] }],
+    owned_count: 1, limit: 3, limit_message: null,
+  }),
+  fetchTakenRepos: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock("./components/UserAvatar", () => ({
@@ -144,11 +159,8 @@ vi.mock("./components/PlanUsagePill", () => ({
   },
 }));
 
-vi.mock("./components/BrandLogo", () => ({
-  default: function BrandLogo() {
-    return null;
-  },
-}));
+// The app header's tabs need a real router, and this file mocks react-router.
+vi.mock("./components/AppHeader", () => import("./test/appHeaderStub"));
 
 vi.mock("./components/SaveResultsModal", () => ({
   default: function SaveResultsModal() {
@@ -222,7 +234,7 @@ import { fetchProjects, loadProject } from "./api/projects";
 import { getSecrets } from "./api/secrets";
 import { getEnvVars } from "./api/envVars";
 import { getProjectPRStatus } from "./api/pullRequests";
-import { getProjectCodeowners } from "./api/codeowners";
+import { getCodeowners, getProjectCodeowners, saveProjectCodeowners } from "./api/codeowners";
 
 import type { Mock } from "vitest";
 
@@ -238,26 +250,35 @@ const record = (overrides: Record<string, unknown> = {}) => ({
   status: "synced_with_github", last_modified_by: "alice", created_at: null, updated_at: null, ...overrides,
 });
 
+// A CODEOWNERS row as the drift list hands it to the page.
+const driftRow = () => ({
+  key: "codeowners:1::acme/existing::main", kind: "codeowners", fileId: 1, name: ".github/CODEOWNERS",
+  repo: "acme/existing", branch: "main", deleted: false, githubSha: "b".repeat(40), lastChecked: "", message: "",
+});
+
 const drifted = {
   file_path: ".github/CODEOWNERS", repo: "acme/existing", repo_id: 3, branch: "main", has_drift: true,
   actionsmanager_sha: "a".repeat(40), github_sha: "b".repeat(40), last_checked: "",
   message: "CODEOWNERS content differs between local and acme/existing",
 };
 
-function projectPayload(prState: string, codeownersDrifted = false) {
+function projectPayload(prState: string, codeownersDrifted = false, projectType = "managed_files") {
   return {
     project_name: "proj-a",
     project_id: 42,
     project_code: "PROJA",
     selected_repos: ["acme/existing"],
-    workflows: [{ name: "ci", content: "name: CI\non: push\n", workflow_status: "synced_with_github" }],
+    workflows: projectType === "managed_files"
+      ? []
+      : [{ name: "ci", content: "name: CI\non: push\n", workflow_status: "synced_with_github" }],
     rxworkflows: [],
     branch_regex: "",
     branch_option: "default",
     branch_max_age_days: 30,
     reusable_workflows_enabled: false,
     use_prefix: false,
-    project_type: "standard",
+    project_type: projectType,
+    file_kind: projectType === "managed_files" ? "codeowners" : null,
     pr_state: prState,
     codeowners_drifted: codeownersDrifted,
   };
@@ -268,6 +289,7 @@ describe("ProjectMgmt – the project's CODEOWNERS file", () => {
     vi.clearAllMocks();
     capturedOnSectionChange = null;
     capturedWorkflowsProps = null;
+    capturedEditorProps = null;
     capturedDriftProps = null;
     capturedPRModalProps = null;
     mockUseParams.mockReturnValue({ user: "alice", projectName: "proj-a" });
@@ -286,14 +308,14 @@ describe("ProjectMgmt – the project's CODEOWNERS file", () => {
     await waitFor(() => expect(capturedOnSectionChange).not.toBeNull());
     await waitFor(() => expect(loadProject).toHaveBeenCalled());
     act(() => capturedOnSectionChange!("workflows"));
-    await waitFor(() => expect(capturedWorkflowsProps?.codeowners).toEqual(codeowners));
+    await waitFor(() => expect(capturedEditorProps?.codeowners).toEqual(codeowners));
   }
 
   test("loads the project's file once, by project id, for the editor and the list", async () => {
     await renderWorkflows("synced");
 
     expect(getProjectCodeowners).toHaveBeenCalledWith(42);
-    expect(capturedWorkflowsProps.codeownersDrift).toEqual([]);
+    expect(capturedEditorProps.drift).toEqual([]);
   });
 
   test("a synced project enables the button as soon as CODEOWNERS is saved, with no reload", async () => {
@@ -301,7 +323,7 @@ describe("ProjectMgmt – the project's CODEOWNERS file", () => {
     const button = await screen.findByTestId("create-pull-requests-button");
     expect(button).toBeDisabled();
 
-    act(() => capturedWorkflowsProps.onCodeownersSaved(record({ status: "committed_locally" }), "draft"));
+    act(() => capturedEditorProps.onSaved(record({ status: "committed_locally" }), "draft"));
 
     await waitFor(() => expect(button).toBeEnabled());
     expect(loadProject).toHaveBeenCalledTimes(1);
@@ -313,7 +335,7 @@ describe("ProjectMgmt – the project's CODEOWNERS file", () => {
     await renderWorkflows("synced");
     const button = await screen.findByTestId("create-pull-requests-button");
 
-    act(() => capturedWorkflowsProps.onCodeownersSaved(record({ status: "committed_locally" }), "open"));
+    act(() => capturedEditorProps.onSaved(record({ status: "committed_locally" }), "open"));
 
     await waitFor(() =>
       expect(button).toHaveAttribute("title", "Pull requests are already open and under review"),
@@ -325,9 +347,9 @@ describe("ProjectMgmt – the project's CODEOWNERS file", () => {
     await renderWorkflows("draft");
     const saved = record({ content: "* @acme/new\n", status: "committed_locally" });
 
-    act(() => capturedWorkflowsProps.onCodeownersSaved(saved, "draft"));
+    act(() => capturedEditorProps.onSaved(saved, "draft"));
 
-    await waitFor(() => expect(capturedWorkflowsProps.codeowners).toEqual(saved));
+    await waitFor(() => expect(capturedEditorProps.codeowners).toEqual(saved));
     expect(getProjectCodeowners).toHaveBeenCalledTimes(1);
   });
 
@@ -335,15 +357,15 @@ describe("ProjectMgmt – the project's CODEOWNERS file", () => {
     // The reported bug: "Drift detected" stayed up after Commit Locally.
     await renderWorkflows("draft");
     act(() => capturedDriftProps.onDriftLoaded([], [drifted]));
-    await waitFor(() => expect(capturedWorkflowsProps.codeownersDrift).toEqual([drifted]));
+    await waitFor(() => expect(capturedEditorProps.drift).toEqual([drifted]));
     const signal = capturedDriftProps.refreshSignal;
 
-    act(() => capturedWorkflowsProps.onCodeownersSaved(record({ status: "committed_locally" }), "draft"));
+    act(() => capturedEditorProps.onSaved(record({ status: "committed_locally" }), "draft"));
 
     await waitFor(() => expect(capturedDriftProps.refreshSignal).toBe(signal + 1));
     // What the re-read returns once the save has resolved the file's drift.
     act(() => capturedDriftProps.onDriftLoaded([], []));
-    await waitFor(() => expect(capturedWorkflowsProps.codeownersDrift).toEqual([]));
+    await waitFor(() => expect(capturedEditorProps.drift).toEqual([]));
     expect(loadProject).toHaveBeenCalledTimes(1);
   });
 
@@ -353,15 +375,43 @@ describe("ProjectMgmt – the project's CODEOWNERS file", () => {
     await waitFor(() => expect(capturedDriftProps.seededCodeownersDrift).toBe(true));
   });
 
-  test("the drift panel opens the CODEOWNERS editor", async () => {
-    await renderWorkflows("synced");
-    act(() => capturedOnSectionChange!("secrets"));
+  test.each([
+    ["the drift list", () => capturedDriftProps.onKeepActionsManagerVersion([driftRow()])],
+    ["the editor's drift banner", () => capturedEditorProps.onKeepActionsManagerVersion(["acme/existing"])],
+  ])("keeping the ActionsManager version from %s opens a campaign carrying only CODEOWNERS", async (_from, keep) => {
+    await renderWorkflows("synced", { codeownersDrifted: true });
 
-    act(() => capturedDriftProps.onOpenCodeowners());
+    act(() => keep());
 
-    await waitFor(() => expect(capturedWorkflowsProps.codeownersOpenRequested).toBe(true));
-    act(() => capturedWorkflowsProps.onCodeownersOpened());
-    await waitFor(() => expect(capturedWorkflowsProps.codeownersOpenRequested).toBe(false));
+    await waitFor(() => expect(capturedPRModalProps).not.toBeNull());
+    expect(capturedPRModalProps.repositories).toEqual([{ name: "acme/existing" }]);
+    expect(capturedPRModalProps.initialSelection).toEqual({
+      workflows: [], reusableWorkflows: [], customFileIds: [], codeowners: true,
+    });
+    expect(capturedPRModalProps.preselectAllWorkflows).toBe(false);
+  });
+
+  test("using the GitHub version saves it, and the editor and the campaign button show it without a reload", async () => {
+    await renderWorkflows("synced", { codeownersDrifted: true });
+    const button = await screen.findByTestId("create-pull-requests-button");
+    (getCodeowners as Mock).mockResolvedValue({
+      success: true, repo_id: 3, repo_name: "acme/existing", branch: "main", local: null,
+      github: { exists: true, content: "* @acme/other\n", sha: "b".repeat(40), path: ".github/CODEOWNERS" },
+    });
+    (saveProjectCodeowners as Mock).mockResolvedValue({
+      success: true, message: "saved", validation_warnings: [], pr_state: "draft",
+      codeowners: record({ content: "* @acme/other\n", status: "committed_locally" }),
+    });
+
+    let message = "";
+    await act(async () => { message = await capturedDriftProps.onUseGithubVersionOfFiles([driftRow()]); });
+
+    expect(getCodeowners).toHaveBeenCalledWith("acme/existing", "alice", "proj-a", { branch: "main", path: ".github/CODEOWNERS" });
+    expect(saveProjectCodeowners).toHaveBeenCalledWith(42, "* @acme/other\n", ".github/CODEOWNERS");
+    expect(message).toMatch(/now holds the GitHub version from acme\/existing/);
+    await waitFor(() => expect(capturedEditorProps.codeowners.content).toBe("* @acme/other\n"));
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(loadProject).toHaveBeenCalledTimes(1);
   });
 
   test("a campaign can carry the file, and one that did reloads it to show it under review", async () => {
@@ -373,7 +423,7 @@ describe("ProjectMgmt – the project's CODEOWNERS file", () => {
 
     act(() => capturedPRModalProps.onSuccess([], [], [], true, ["acme/existing"]));
 
-    await waitFor(() => expect(capturedWorkflowsProps.codeowners.status).toBe("under_review"));
+    await waitFor(() => expect(capturedEditorProps.codeowners.status).toBe("under_review"));
   });
 
   test("a project without CODEOWNERS offers none to a campaign", async () => {
@@ -388,8 +438,36 @@ describe("ProjectMgmt – the project's CODEOWNERS file", () => {
     await renderWorkflows("synced");
     const listFetches = (fetchProjects as Mock).mock.calls.length;
 
-    act(() => capturedWorkflowsProps.onCodeownersSaved(record({ status: "committed_locally" }), "draft"));
+    act(() => capturedEditorProps.onSaved(record({ status: "committed_locally" }), "draft"));
 
     await waitFor(() => expect(fetchProjects).toHaveBeenCalledTimes(listFetches + 1));
+  });
+});
+
+describe("ProjectMgmt – a workflow project holds no CODEOWNERS (#2367)", () => {
+  test.each(["standard", "rwx"])("a %s project does not load one, offers none to a campaign, and points to Managed Files", async (projectType) => {
+    vi.clearAllMocks();
+    capturedWorkflowsProps = null;
+    capturedPRModalProps = null;
+    mockUseParams.mockReturnValue({ user: "alice", projectName: "proj-a" });
+    (fetchProjects as Mock).mockResolvedValue([{ project_id: 42, project_name: "proj-a", project_code: "PROJA" }]);
+    (loadProject as Mock).mockResolvedValue(projectPayload("draft", false, projectType));
+    (getSecrets as Mock).mockResolvedValue([]);
+    (getEnvVars as Mock).mockResolvedValue([]);
+    (getProjectPRStatus as Mock).mockResolvedValue({ project_state: "draft", open_prs: 0, merged_prs: 0, total_prs: 0 });
+
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+    await waitFor(() => expect(capturedOnSectionChange).not.toBeNull());
+    act(() => capturedOnSectionChange!("workflows"));
+    await waitFor(() => expect(capturedWorkflowsProps).not.toBeNull());
+    act(() => screen.getByTestId("create-pull-requests-button").click());
+    await waitFor(() => expect(capturedPRModalProps).not.toBeNull());
+
+    expect(getProjectCodeowners).not.toHaveBeenCalled();
+    expect(capturedPRModalProps.codeowners).toBeNull();
+    expect(capturedPRModalProps.projectDraft).toBe(true);
+    expect(capturedWorkflowsProps).not.toHaveProperty("codeowners");
+    act(() => capturedWorkflowsProps.onOpenManagedFiles());
+    expect(mockNavigate).toHaveBeenCalledWith("/project/alice/managed-files");
   });
 });

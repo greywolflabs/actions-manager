@@ -362,10 +362,7 @@ them and never take the consuming project's prefix.
 
 New and edited workflows reach GitHub only through pull requests, opened as a [PR Campaign](pr-campaigns.html), so every change can be reviewed before it merges.
 
-ActionsManager commits straight to a branch, with no review, only when you choose it:
-
-- **Restore Directly**, or **Adopt for project and sync** with direct commit, when [resolving drift](drift-detection.html#resolving-drift)
-- **Commit directly to the target branch**, when [removing a workflow](#removing-a-workflow) or [a custom file](#removing-a-custom-file)
+ActionsManager commits straight to a branch, with no review, only when you choose **Commit directly to the target branch** while [removing a workflow](#removing-a-workflow) or [a custom file](#removing-a-custom-file). [Resolving drift](drift-detection.html#resolving-drift) always goes through pull requests.
 
 ## Build Detection
 

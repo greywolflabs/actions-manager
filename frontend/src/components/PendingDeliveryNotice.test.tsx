@@ -26,6 +26,14 @@ describe("PendingDeliveryNotice", () => {
     ).toBeInTheDocument();
   });
 
+  it("names what a project with no workflows waits for", () => {
+    render(<PendingDeliveryNotice repos={["acme/checkout-web"]} deliverable="CODEOWNERS" />);
+
+    expect(
+      screen.getByText("acme/checkout-web doesn't have this project's CODEOWNERS yet"),
+    ).toBeInTheDocument();
+  });
+
   it("counts them and lists them when several are waiting", () => {
     render(<PendingDeliveryNotice repos={["acme/checkout-web", "acme/billing-api"]} />);
 

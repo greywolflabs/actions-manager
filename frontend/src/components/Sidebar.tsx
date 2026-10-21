@@ -21,10 +21,11 @@ import {
   Radar,
   LucideIcon,
 } from 'lucide-react';
-import BrandLogo from './BrandLogo';
 import EditableNameField from './EditableNameField';
 import { getPrefixModeConfig, projectKeyFixedNote } from '../utils/prefixModeConfig';
 import { getProjectTypeConfig } from '../utils/projectTypeConfig';
+import { fileKindIcon } from '../utils/fileKinds';
+import type { ProjectTypeValue } from '../api/projects';
 import ProjectTypeBadge from './ProjectTypeBadge';
 import PrefixModeBadge from './PrefixModeBadge';
 import RepositoryVisibilityBadge from './RepositoryVisibilityBadge';
@@ -47,7 +48,11 @@ interface SidebarProps {
   projectName?: string;
   onProjectNameSave?: (newValue: string) => void;
   projectCode?: string;
-  projectType?: 'standard' | 'rwx';
+  projectType?: ProjectTypeValue;
+  /** A Managed Files project's kind, whose icon its file's item shows. */
+  fileKind?: string | null;
+  /** A Managed Files project's kind label, the name of its file's item. */
+  fileKindLabel?: string;
   /** Saved backend `repository_visibility_scope` for the current project. */
   repositoryVisibilityScope?: 'public' | 'private';
   usePrefix?: boolean;
@@ -98,6 +103,8 @@ const Sidebar: React.FC<SidebarProps> = ({
   projectName,
   projectCode,
   projectType = 'standard',
+  fileKind = null,
+  fileKindLabel,
   repositoryVisibilityScope,
   usePrefix,
   isReadOnly,
@@ -142,30 +149,39 @@ const Sidebar: React.FC<SidebarProps> = ({
 
   // Determine which project-config sections to display based on project type
   const currentProjectConfigSections = projectType === 'rwx' ? rwxProjectConfigSections : standardProjectConfigSections;
+  // A Managed Files project holds one file and no workflows, so it has no
+  // build metrics, environments, variables, secrets or rulesets (#2367).
+  const { holdsWorkflows } = getProjectTypeConfig(projectType);
+  const visibleRepoConfigSections = holdsWorkflows
+    ? repoConfigSections
+    : repoConfigSections.filter(section => section.key === 'repos-and-branches');
+  const filesLabel = holdsWorkflows ? 'Project Files' : (fileKindLabel ?? 'Project File');
+  const FilesIcon = holdsWorkflows ? FileText : fileKindIcon(fileKind);
+  const showPrefixMode = holdsWorkflows && usePrefix !== undefined;
+  const visibilityLabel = repositoryVisibilityScope === 'private' ? 'Private Repos' : 'Public Repos';
+  // The collapsed sidebar shows only the key; hovering it names what the badges said.
+  const collapsedTitle = [
+    `Project Key: ${projectCode}`,
+    getProjectTypeConfig(projectType).label,
+    repositoryVisibilityScope && visibilityLabel,
+    showPrefixMode && `${getPrefixModeConfig(usePrefix).shortLabel} Mode`,
+    isReadOnly && '🔒 Read Only',
+  ].filter(Boolean).join(' · ');
 
   return (
     <div className={`sidebar ${isCollapsed ? 'collapsed' : 'expanded'}${isMobileOpen ? ' mobile-open' : ''}`}>
       <div className="sidebar-header">
-        <div className="sidebar-title-row">
-          <div className="sidebar-title">
-            {isCollapsed ? (
-              <BrandLogo variant="icon" size="sm" />
-            ) : (
-              <BrandLogo variant="full" size="md" />
-            )}
-          </div>
-          <button
-            className="sidebar-collapse-button"
-            onClick={toggleSidebar}
-            title={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          >
-            {isCollapsed ? (
-              <ChevronRight className="sidebar-collapse-icon" />
-            ) : (
-              <ChevronLeft className="sidebar-collapse-icon" />
-            )}
-          </button>
-        </div>
+        {/* The app header above carries the logo, so the sidebar's top strip is
+            its collapse toggle. One chevron; the stylesheet turns it to point
+            right while collapsed. */}
+        <button
+          type="button"
+          className="sidebar-collapse-button"
+          onClick={toggleSidebar}
+          title={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        >
+          <ChevronLeft className="sidebar-collapse-icon" strokeWidth={2.25} aria-hidden="true" />
+        </button>
         {(projectName || projectCode) && !isCollapsed && (
           <div className="sidebar-project">
             <span className="sidebar-project-label">Project</span>
@@ -199,7 +215,7 @@ const Sidebar: React.FC<SidebarProps> = ({
                 // prefix-mode wording for a No Prefix Mode project.
                 title={usePrefix === undefined
                   ? undefined
-                  : projectKeyFixedNote(usePrefix, projectCode)}
+                  : projectKeyFixedNote(usePrefix, projectCode, holdsWorkflows)}
               >
                 Project Key: {projectCode}
                 <span className="sidebar-project-key-fixed"> (fixed)</span>
@@ -210,7 +226,7 @@ const Sidebar: React.FC<SidebarProps> = ({
               {repositoryVisibilityScope && (
                 <RepositoryVisibilityBadge visibilityScope={repositoryVisibilityScope} size="sm" data-testid="sidebar-project-visibility-badge" />
               )}
-              {usePrefix !== undefined && (
+              {showPrefixMode && (
                 <PrefixModeBadge usePrefix={usePrefix} size="sm" />
               )}
               {isReadOnly && <ReadOnlyBadge size="sm" />}
@@ -218,7 +234,7 @@ const Sidebar: React.FC<SidebarProps> = ({
           </div>
         )}
         {projectCode && isCollapsed && (
-          <div className="sidebar-project-collapsed" title={`Project Key: ${projectCode} · ${getProjectTypeConfig(projectType).label}${repositoryVisibilityScope ? ` · ${repositoryVisibilityScope === 'private' ? 'Private Repos' : 'Public Repos'}` : ''}${usePrefix !== undefined ? ` · ${getPrefixModeConfig(usePrefix).shortLabel} Mode` : ''}${isReadOnly ? ' · 🔒 Read Only' : ''}`}>
+          <div className="sidebar-project-collapsed" title={collapsedTitle}>
             <span className="sidebar-project-code">{projectCode}</span>
           </div>
         )}
@@ -230,15 +246,16 @@ const Sidebar: React.FC<SidebarProps> = ({
           {/* FILES Section Label */}
           {!isCollapsed && <div className="sidebar-section-label">Files</div>}
 
-          {/* Project Files – unified workspace: workflows, custom files, CODEOWNERS */}
+          {/* Project Files – unified workspace: workflows and custom files;
+              a Managed Files project's one file */}
           <button
             className={`sidebar-item ${activeSection === 'workflows' || activeSection === 'custom-files' || activeSection === 'codeowners' ? 'active' : ''}`}
-            aria-label="Project Files"
+            aria-label={filesLabel}
             onClick={() => handleSectionChange('workflows')}
-            title={isCollapsed ? 'Project Files' : ''}
+            title={isCollapsed ? filesLabel : ''}
           >
-            <span className="sidebar-icon" aria-hidden="true"><FileText size={18} strokeWidth={1.75} /></span>
-            {!isCollapsed && <span className="sidebar-label">Project Files</span>}
+            <span className="sidebar-icon" aria-hidden="true"><FilesIcon size={18} strokeWidth={1.75} /></span>
+            {!isCollapsed && <span className="sidebar-label">{filesLabel}</span>}
           </button>
 
           {/* PR Campaigns – rollout management and audit */}
@@ -254,21 +271,23 @@ const Sidebar: React.FC<SidebarProps> = ({
           </button>
 
           {/* Build Metrics – GitHub Actions run success rates, durations, trend */}
-          <button
-            className={`sidebar-item ${activeSection === 'build-metrics' ? 'active' : ''}`}
-            aria-label="Build Metrics"
-            onClick={() => handleSectionChange('build-metrics')}
-            title={isCollapsed ? 'Build Metrics' : ''}
-          >
-            <span className="sidebar-icon" aria-hidden="true"><BarChart3 size={18} strokeWidth={1.75} /></span>
-            {!isCollapsed && <span className="sidebar-label">Build Metrics</span>}
-          </button>
+          {holdsWorkflows && (
+            <button
+              className={`sidebar-item ${activeSection === 'build-metrics' ? 'active' : ''}`}
+              aria-label="Build Metrics"
+              onClick={() => handleSectionChange('build-metrics')}
+              title={isCollapsed ? 'Build Metrics' : ''}
+            >
+              <span className="sidebar-icon" aria-hidden="true"><BarChart3 size={18} strokeWidth={1.75} /></span>
+              {!isCollapsed && <span className="sidebar-label">Build Metrics</span>}
+            </button>
+          )}
 
           {/* CONFIGURATION Section Label */}
           {!isCollapsed && <div className="sidebar-section-label">Configuration</div>}
 
           {/* Repository Configs – flat first-class items (no parent grouping) */}
-          {repoConfigSections.map(section => {
+          {visibleRepoConfigSections.map(section => {
             const Icon = section.Icon;
             // Only Repositories & Branches carries the count: one badge for one
             // piece of state. Repeating it on a second item would read as two
@@ -310,7 +329,7 @@ const Sidebar: React.FC<SidebarProps> = ({
             work inside it. Editors and viewers do not see it at all. The
             sections are guarded where they render too; hiding a button is not
             access control. */}
-        {isWorkspaceAdmin && (projectType === 'standard' || projectType === 'rwx') && (
+        {isWorkspaceAdmin && (
           <div className="mt-auto border-t border-slate-200 dark:border-slate-700 pt-4 space-y-1">
             <button
               className={`sidebar-item sidebar-group-header ${isProjectConfigActive ? 'active' : ''}`}

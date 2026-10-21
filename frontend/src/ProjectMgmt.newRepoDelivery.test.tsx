@@ -14,7 +14,7 @@
  * ProjectRepo row yet would be filtered out and 400.
  */
 import React from "react";
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { render, screen, waitFor, act, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom";
 
@@ -30,6 +30,9 @@ let capturedPRModalProps: any = null;
 let capturedPendingDeliveryRepos: string[] | undefined;
 let capturedSidebarPendingCount: number | undefined;
 let capturedOnReposDelivered: ((repos: string[]) => void) | undefined;
+let capturedOnCustomFilesChange: ((files: unknown[]) => void) | undefined;
+let capturedOnCodeownersSaved: ((record: unknown, prState?: string) => void) | undefined;
+let capturedOnProjectStateChange: ((state: string) => void) | undefined;
 
 vi.mock("react-router", () => ({
   useNavigate: () => mockNavigate,
@@ -49,6 +52,7 @@ vi.mock("react-router", () => ({
 vi.mock("./api/projects", () => ({
   __esModule: true,
   fetchProjects: vi.fn(),
+  fetchPendingDelivery: vi.fn(),
   loadProject: vi.fn(),
   updateProjectName: vi.fn(),
   updateProjectColor: vi.fn(),
@@ -129,6 +133,8 @@ vi.mock("./components/Secrets", () => ({
 vi.mock("./components/UnifiedWorkflows", () => ({
   default: function UnifiedWorkflows(props: any) {
     capturedOnReposDelivered = props.onReposDelivered;
+    capturedOnCustomFilesChange = props.onCustomFilesChange;
+    capturedOnProjectStateChange = props.onProjectStateChange;
     return <div data-testid="unified-workflows" />;
   },
 }));
@@ -139,10 +145,20 @@ vi.mock("./components/RulesetManager", () => ({
   },
 }));
 
+// Only a CODEOWNERS project in Managed Files holds the file (#2367); this is its editor.
 vi.mock("./components/CodeownersManager", () => ({
-  default: function CodeownersManager() {
+  default: function CodeownersManager(props: any) {
+    capturedOnCodeownersSaved = props.onSaved;
     return <div data-testid="codeowners" />;
   },
+}));
+
+vi.mock("./api/managedFiles", () => ({
+  fetchManagedFiles: vi.fn().mockResolvedValue({
+    kinds: [{ kind: "codeowners", label: "CODEOWNERS", paths: [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"] }],
+    owned_count: 1, limit: 3, limit_message: null,
+  }),
+  fetchTakenRepos: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock("./components/UserAvatar", () => ({
@@ -157,11 +173,8 @@ vi.mock("./components/PlanUsagePill", () => ({
   },
 }));
 
-vi.mock("./components/BrandLogo", () => ({
-  default: function BrandLogo() {
-    return null;
-  },
-}));
+// The app header's tabs need a real router, and this file mocks react-router.
+vi.mock("./components/AppHeader", () => import("./test/appHeaderStub"));
 
 vi.mock("./components/SaveResultsModal", () => ({
   default: function SaveResultsModal() {
@@ -230,11 +243,12 @@ vi.mock("./components/WorkflowImportPanel", () => ({
 }));
 
 import ProjectMgmt, { reposAddedSinceSnapshot } from "./ProjectMgmt";
-import { fetchProjects, loadProject } from "./api/projects";
+import { fetchPendingDelivery, fetchProjects, loadProject } from "./api/projects";
 import { getSecrets } from "./api/secrets";
 import { getEnvVars } from "./api/envVars";
 import { getProjectPRStatus } from "./api/pullRequests";
 import { handleSaveProjectWithModal } from "./api/handlers";
+import { getProjectCodeowners } from "./api/codeowners";
 
 import type { Mock } from "vitest";
 
@@ -248,11 +262,22 @@ const userDetails = {
 const SAVED_REPO = "acme/existing";
 const NEW_REPO = "acme/added";
 
+const CUSTOM_FILE = {
+  id: 5,
+  file_path: ".github/scripts/build.sh",
+  file_content: "echo build\n",
+  file_status: "synced_with_github",
+  pending_delete: false,
+};
+
 const CI_WORKFLOW = {
   name: "ci",
   content: "name: CI\n",
   workflow_status: "synced_with_github",
 };
+
+// A CODEOWNERS project in Managed Files: its one file is what it delivers.
+const CODEOWNERS_PROJECT = { workflows: [], project_type: "managed_files", file_kind: "codeowners" };
 
 function projectPayload(overrides: Record<string, unknown> = {}) {
   return {
@@ -312,8 +337,7 @@ describe("reposAddedSinceSnapshot", () => {
   });
 });
 
-describe("ProjectMgmt – delivery prompt when a repository is added", () => {
-  beforeEach(() => {
+function resetMocks() {
     vi.clearAllMocks();
     capturedOnSectionChange = null;
     capturedSetSelectedRepos = null;
@@ -342,7 +366,15 @@ describe("ProjectMgmt – delivery prompt when a repository is added", () => {
       projectCode: "PROJA",
       prState: "synced",
     });
-  });
+    (fetchPendingDelivery as Mock).mockResolvedValue({ pending_delivery_repos: [], pending_delivery_known: true });
+    (getProjectCodeowners as Mock).mockResolvedValue(null);
+    capturedOnCustomFilesChange = undefined;
+    capturedOnCodeownersSaved = undefined;
+    capturedOnProjectStateChange = undefined;
+}
+
+describe("ProjectMgmt – delivery prompt when a repository is added", () => {
+  beforeEach(resetMocks);
 
   test("adding a repo and saving prompts, naming only the added repo", async () => {
     await openRepoSection();
@@ -449,10 +481,10 @@ describe("ProjectMgmt – delivery prompt when a repository is added", () => {
     expect(dialog).toHaveTextContent(NEW_REPO);
   });
 
-  test("a campaign clears only the repos the user left ticked", async () => {
-    // Review finding: keying the clear on what the modal was *offered* dropped
-    // the badge for a repo the user unticked, which gets no PR and is still
-    // genuinely waiting.
+  test("a campaign takes the repos still waiting from the server", async () => {
+    // The user unticked SAVED_REPO, which gets no PR and is still waiting; the
+    // server says so, and the page shows its answer without a reload.
+    (fetchPendingDelivery as Mock).mockResolvedValue({ pending_delivery_repos: [SAVED_REPO], pending_delivery_known: true });
     (loadProject as Mock).mockResolvedValue(
       projectPayload({
         selected_repos: [SAVED_REPO, NEW_REPO],
@@ -471,15 +503,17 @@ describe("ProjectMgmt – delivery prompt when a repository is added", () => {
     );
     await waitFor(() => expect(screen.getByTestId("create-pr-modal")).toBeInTheDocument());
 
-    // The user unticked SAVED_REPO in the modal, so only NEW_REPO gets a PR.
-    act(() => capturedPRModalProps.onSuccess([], [], [], [], [NEW_REPO]));
+    act(() => capturedPRModalProps.onSuccess([], [], [], false, [NEW_REPO]));
 
     await waitFor(() => expect(capturedPendingDeliveryRepos).toEqual([SAVED_REPO]));
+    expect(fetchPendingDelivery).toHaveBeenCalledWith(42);
+    expect(loadProject).toHaveBeenCalledTimes(1);
   });
 
   test("a commit-and-update push clears the repos it opened a pull request in", async () => {
     // The push runs as a campaign now, and the server records the PR it opens,
-    // so the repo stops waiting there; the editor has to say so in place.
+    // so the repo stops waiting there; the page re-reads that in place.
+    (fetchPendingDelivery as Mock).mockResolvedValue({ pending_delivery_repos: [SAVED_REPO], pending_delivery_known: true });
     (loadProject as Mock).mockResolvedValue(
       projectPayload({
         selected_repos: [SAVED_REPO, NEW_REPO],
@@ -538,8 +572,33 @@ describe("ProjectMgmt – delivery prompt when a repository is added", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
-  test("a project with no workflows does not prompt", async () => {
+  test("a project with nothing to deliver does not prompt", async () => {
     (loadProject as Mock).mockResolvedValue(projectPayload({ workflows: [] }));
+    await openRepoSection();
+    await setReposAndSave([SAVED_REPO, NEW_REPO]);
+
+    await waitFor(() => expect(handleSaveProjectWithModal).toHaveBeenCalled());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  test("a CODEOWNERS project prompts", async () => {
+    // With no workflows, the CODEOWNERS is what a new repository waits for.
+    (loadProject as Mock).mockResolvedValue(projectPayload(CODEOWNERS_PROJECT));
+    (getProjectCodeowners as Mock).mockResolvedValue({
+      id: 1, project_id: 42, content: "* @acme/owners\n", file_path: ".github/CODEOWNERS",
+      status: "synced_with_github",
+    });
+    await openRepoSection();
+    await setReposAndSave([SAVED_REPO, NEW_REPO]);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent(/Deliver this project's CODEOWNERS to the new repositor/);
+    expect(dialog).toHaveTextContent(NEW_REPO);
+  });
+
+  test("custom files alone do not prompt", async () => {
+    // The delivery record cannot say a repo is waiting for a custom file.
+    (loadProject as Mock).mockResolvedValue(projectPayload({ workflows: [], custom_files: [CUSTOM_FILE] }));
     await openRepoSection();
     await setReposAndSave([SAVED_REPO, NEW_REPO]);
 
@@ -619,5 +678,148 @@ describe("ProjectMgmt – delivery prompt when a repository is added", () => {
       { name: NEW_REPO },
     ]);
     expect(capturedPRModalProps.preselectAllWorkflows).toBe(false);
+  });
+});
+
+describe("ProjectMgmt – a synced project's campaign", () => {
+  beforeEach(resetMocks);
+
+  async function renderCampaignButton() {
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+    return screen.findByTestId("create-pull-requests-button");
+  }
+
+  test("with nothing drifted or waiting, there is nothing to deliver", async () => {
+    const button = await renderCampaignButton();
+
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", "Workflows are synced with GitHub – commit changes locally first");
+  });
+
+  test("a custom file changed on GitHub can be put back, after the drift warning", async () => {
+    (loadProject as Mock).mockResolvedValue(
+      projectPayload({ custom_files: [CUSTOM_FILE], drifted_custom_file_ids: [CUSTOM_FILE.id] }),
+    );
+    const button = await renderCampaignButton();
+    await waitFor(() => expect(button).toBeEnabled());
+
+    await userEvent.click(button);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("Create Pull Requests with unresolved drift?");
+    expect(dialog).toHaveTextContent("One or more workflows or files have been changed directly in GitHub");
+    expect(capturedPRModalProps).toBeNull();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create Pull Requests" }));
+    await waitFor(() => expect(capturedPRModalProps).not.toBeNull());
+  });
+
+  test("a CODEOWNERS changed on GitHub can be put back", async () => {
+    (loadProject as Mock).mockResolvedValue(projectPayload({ codeowners_drifted: true }));
+    const button = await renderCampaignButton();
+
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(button).not.toHaveAttribute("title");
+  });
+
+  test("a repository waiting for delivery gets the campaign scoped to it", async () => {
+    // Nothing changed or drifted, so the button is on only for that repo: it
+    // opens the campaign the reminder would, with every file pre-selected.
+    (loadProject as Mock).mockResolvedValue(
+      projectPayload({ selected_repos: [SAVED_REPO, NEW_REPO], pending_delivery_repos: [NEW_REPO] }),
+    );
+    const button = await renderCampaignButton();
+    await waitFor(() => expect(button).toBeEnabled());
+
+    await userEvent.click(button);
+
+    await waitFor(() => expect(capturedPRModalProps).not.toBeNull());
+    expect(capturedPRModalProps.repositories).toEqual([{ name: NEW_REPO }]);
+    expect(capturedPRModalProps.preselectAllWorkflows).toBe(true);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  test("a drifted file elsewhere does not warn a campaign for a new repository", async () => {
+    // The campaign reaches only the waiting repo, which holds no copy to overwrite.
+    (loadProject as Mock).mockResolvedValue(
+      projectPayload({
+        selected_repos: [SAVED_REPO, NEW_REPO],
+        pending_delivery_repos: [NEW_REPO],
+        custom_files: [CUSTOM_FILE],
+        drifted_custom_file_ids: [CUSTOM_FILE.id],
+      }),
+    );
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+    await userEvent.click(await screen.findByTestId("pending-delivery-create-pr-button"));
+
+    await waitFor(() => expect(capturedPRModalProps).not.toBeNull());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  test("a campaign that put back a synced custom file leaves it synced", async () => {
+    // As the server does: only a file with a local change goes under review.
+    (loadProject as Mock).mockResolvedValue(
+      projectPayload({ custom_files: [CUSTOM_FILE], drifted_custom_file_ids: [CUSTOM_FILE.id] }),
+    );
+    let capturedCustomFiles: Array<{ id: number; file_status: string }> = [];
+    const button = await renderCampaignButton();
+    await waitFor(() => expect(button).toBeEnabled());
+    await userEvent.click(button);
+    await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Create Pull Requests" }));
+    await waitFor(() => expect(capturedPRModalProps).not.toBeNull());
+
+    act(() => capturedPRModalProps.onSuccess([], [], [CUSTOM_FILE.id], false, [SAVED_REPO]));
+
+    await waitFor(() => {
+      capturedCustomFiles = capturedPRModalProps.customFiles;
+      expect(capturedCustomFiles[0].file_status).toBe("synced_with_github");
+    });
+  });
+
+  test("a pull request found closed on GitHub at load puts its repository back on the waiting list", async () => {
+    // The project load's list predates the live settle that finds the close.
+    (loadProject as Mock).mockResolvedValue(projectPayload({ pr_state: "open" }));
+    (getProjectPRStatus as Mock).mockResolvedValue({
+      project_state: "draft", open_prs: 0, merged_prs: 0, total_prs: 1,
+    });
+    (fetchPendingDelivery as Mock).mockResolvedValue({
+      pending_delivery_repos: [SAVED_REPO],
+      pending_delivery_known: true,
+    });
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+
+    await waitFor(() => expect(capturedSidebarPendingCount).toBe(1));
+    expect(fetchPendingDelivery).toHaveBeenCalledWith(42);
+    expect(loadProject).toHaveBeenCalledTimes(1);
+  });
+
+  test("a closed pull request puts its repository back on the waiting list without a reload", async () => {
+    (loadProject as Mock).mockResolvedValue(projectPayload({ pr_state: "open" }));
+    (fetchPendingDelivery as Mock).mockResolvedValue({
+      pending_delivery_repos: [SAVED_REPO],
+      pending_delivery_known: true,
+    });
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+    await waitFor(() => expect(capturedOnProjectStateChange).toBeDefined());
+    expect(capturedSidebarPendingCount).toBe(0);
+
+    act(() => capturedOnProjectStateChange!("draft"));
+
+    await waitFor(() => expect(capturedSidebarPendingCount).toBe(1));
+    expect(loadProject).toHaveBeenCalledTimes(1);
+  });
+
+  test("a CODEOWNERS save re-reads the repos waiting for delivery", async () => {
+    (loadProject as Mock).mockResolvedValue(projectPayload(CODEOWNERS_PROJECT));
+    (fetchPendingDelivery as Mock).mockResolvedValue({
+      pending_delivery_repos: [SAVED_REPO],
+      pending_delivery_known: true,
+    });
+    render(<ProjectMgmt userDetails={userDetails} onLogout={vi.fn()} />);
+    await waitFor(() => expect(capturedOnCodeownersSaved).toBeDefined());
+
+    act(() => capturedOnCodeownersSaved!({ id: 1, content: "* @acme/owners\n", status: "committed_locally" }, "draft"));
+
+    await waitFor(() => expect(capturedSidebarPendingCount).toBe(1));
+    expect(loadProject).toHaveBeenCalledTimes(1);
   });
 });

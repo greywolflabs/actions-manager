@@ -1,4 +1,4 @@
-import { test, type Page } from "@playwright/test";
+import { test, type Page, type Route } from "@playwright/test";
 import {
   corsHeaders,
   createMockState,
@@ -11,7 +11,7 @@ import {
   seedAuthenticatedSession,
   NO_CREDENTIAL_REASON,
 } from "../e2e/fixtures/mocks";
-import { DOCS_REPOS, DOCS_USER, seedDocsRepos, seedDocsUserProfile } from "./docs-fixtures";
+import { DOCS_REPOS, DOCS_USER, seedDocsRepos, seedDocsUserProfile, waitForAppHeader } from "./docs-fixtures";
 import { BETA_PLAN } from "../src/test/plans";
 
 /**
@@ -36,28 +36,108 @@ import { BETA_PLAN } from "../src/test/plans";
 const DOCS_LAST_CHECKED = "2026-07-24T09:12:00Z";
 
 const DOCS_DRIFT_PROJECT = {
-  project_name: "Payments Platform",
-  project_code: "PAY",
+  project_name: "NodeBuilds",
+  project_code: "NODE",
   github_user: DOCS_USER,
   last_modified_by: DOCS_USER,
   updated_at: "2026-07-24T00:00:00Z",
   pr_state: "draft",
-  selected_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+  selected_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
 } as const;
 
 const DOCS_BUILD_METRICS_PROJECT = {
-  project_name: "Payments Platform",
-  project_code: "PAY",
+  project_name: "NodeBuilds",
+  project_code: "NODE",
   github_user: DOCS_USER,
   last_modified_by: DOCS_USER,
   updated_at: "2026-07-24T00:00:00Z",
   pr_state: "synced",
-  selected_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+  selected_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
 } as const;
 
 /** The same synced project, for scenes that only need one to exist. The
  *  "workflow removal scope" scene above predates this and still inlines it. */
 const DOCS_SYNCED_PROJECT = DOCS_BUILD_METRICS_PROJECT;
+
+/** A synced CODEOWNERS project in Managed Files. */
+const DOCS_CODEOWNERS_PROJECT = {
+  ...DOCS_SYNCED_PROJECT,
+  project_name: "NodeBuilds owners",
+  project_code: "NBOWN",
+  project_type: "managed_files",
+  file_kind: "codeowners",
+} as const;
+
+/** What GET /api/projects/?section=managed_files adds to that project's row. */
+const DOCS_MANAGED_ROW = {
+  owner: DOCS_USER,
+  repo_count: DOCS_CODEOWNERS_PROJECT.selected_repos.length,
+  file_path: ".github/CODEOWNERS",
+  drifted_repos: [],
+  drift_status: "clean",
+  last_drift_check_at: DOCS_LAST_CHECKED,
+};
+
+const DOCS_CODEOWNERS = "* @acme-corp/node-team\n/infra/ @acme-corp/platform\n/docs/ @acme-corp/tech-writers\n";
+
+const CODEOWNERS_KIND = {
+  kind: "codeowners",
+  label: "CODEOWNERS",
+  paths: [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"],
+};
+
+function fulfillJson(route: Route, body: unknown) {
+  return route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    headers: corsHeaders(route),
+    body: JSON.stringify(body),
+  });
+}
+
+/** GET /api/managed-files on the self-hosted beta, and the repositories other CODEOWNERS projects hold. */
+async function mockManagedFiles(
+  page: Page,
+  { ownedCount = 1, taken = {} }: { ownedCount?: number; taken?: Record<string, object> } = {},
+) {
+  await page.route(
+    (url) => url.pathname === "/api/managed-files",
+    (route) => fulfillJson(route, {
+      kinds: [CODEOWNERS_KIND],
+      owned_count: ownedCount,
+      limit: 3,
+      limit_message: "Beta limit reached (3/3 Managed Files projects).",
+    }),
+  );
+  await page.route(
+    (url) => url.pathname === "/api/managed-files/codeowners/taken-repos",
+    (route) => {
+      const names: string[] = route.request().postDataJSON()?.repo_names ?? [];
+      return fulfillJson(route, { taken: Object.fromEntries(names.filter((n) => n in taken).map((n) => [n, taken[n]])) });
+    },
+  );
+}
+
+/** DOCS_CODEOWNERS_PROJECT, with the PR status that agrees it is synced. */
+function codeownersProjectState() {
+  const state = createMockState({ projects: [makeProject(DOCS_CODEOWNERS_PROJECT)] });
+  state.prStatus.project_state = "synced";
+  return state;
+}
+
+/** The project's synced CODEOWNERS file. */
+async function mockCodeowners(page: Page, content: string) {
+  await page.route(
+    (url) => /^\/api\/projects\/\d+\/codeowners$/.test(url.pathname),
+    (route) => fulfillJson(route, {
+      codeowners: {
+        id: 1, project_id: 1, content, file_path: ".github/CODEOWNERS",
+        git_hash: "a".repeat(40), status: "synced_with_github", last_modified_by: DOCS_USER,
+        created_at: DOCS_LAST_CHECKED, updated_at: DOCS_LAST_CHECKED,
+      },
+    }),
+  );
+}
 
 /** `confirmed_present_at` as the server renders it: _utc_iso emits +00:00,
  *  never a Z. */
@@ -101,7 +181,7 @@ const DOCS_BUILD_METRICS = (() => {
         success_rate: 94.1,
         avg_duration_seconds: 214,
         actions_url:
-          "https://github.com/acme-corp/payments-service/actions/workflows/build-and-test.yml",
+          "https://github.com/acme-corp/node-api/actions/workflows/build-and-test.yml",
       },
       {
         workflow_name: "deploy-production",
@@ -110,15 +190,15 @@ const DOCS_BUILD_METRICS = (() => {
         success_rate: 75.8,
         avg_duration_seconds: 379,
         actions_url:
-          "https://github.com/acme-corp/payments-service/actions/workflows/deploy-production.yml",
+          "https://github.com/acme-corp/node-api/actions/workflows/deploy-production.yml",
       },
     ],
     recentRuns: [
-      { github_run_id: 4821, run_number: 214, workflow_name: "build-and-test", repo: "acme-corp/payments-service", branch: "main", conclusion: "success", duration_seconds: 203, created_at: day(0) },
-      { github_run_id: 4820, run_number: 96, workflow_name: "deploy-production", repo: "acme-corp/payments-service", branch: "main", conclusion: "failure", duration_seconds: 412, created_at: day(0) },
-      { github_run_id: 4816, run_number: 213, workflow_name: "build-and-test", repo: "acme-corp/payments-worker", branch: "main", conclusion: "success", duration_seconds: 188, created_at: day(1) },
-      { github_run_id: 4810, run_number: 95, workflow_name: "deploy-production", repo: "acme-corp/payments-service", branch: "release/4.2", conclusion: "success", duration_seconds: 366, created_at: day(1) },
-      { github_run_id: 4804, run_number: 212, workflow_name: "build-and-test", repo: "acme-corp/payments-service", branch: "main", conclusion: "success", duration_seconds: 221, created_at: day(2) },
+      { github_run_id: 4821, run_number: 214, workflow_name: "build-and-test", repo: "acme-corp/node-api", branch: "main", conclusion: "success", duration_seconds: 203, created_at: day(0) },
+      { github_run_id: 4820, run_number: 96, workflow_name: "deploy-production", repo: "acme-corp/node-api", branch: "main", conclusion: "failure", duration_seconds: 412, created_at: day(0) },
+      { github_run_id: 4816, run_number: 213, workflow_name: "build-and-test", repo: "acme-corp/node-worker", branch: "main", conclusion: "success", duration_seconds: 188, created_at: day(1) },
+      { github_run_id: 4810, run_number: 95, workflow_name: "deploy-production", repo: "acme-corp/node-api", branch: "release/4.2", conclusion: "success", duration_seconds: 366, created_at: day(1) },
+      { github_run_id: 4804, run_number: 212, workflow_name: "build-and-test", repo: "acme-corp/node-api", branch: "main", conclusion: "success", duration_seconds: 221, created_at: day(2) },
     ],
     scoped: {
       "deploy-production.yml": {
@@ -138,9 +218,9 @@ const DOCS_BUILD_METRICS = (() => {
           return { date: day(13 - i).slice(0, 10), total, success: total - failure, failure };
         }),
         recent_runs: [
-          { github_run_id: 4820, run_number: 96, workflow_name: "deploy-production", repo: "acme-corp/payments-service", branch: "main", event: "push", status: "completed", conclusion: "failure", duration_seconds: 412, created_at: day(0), html_url: "https://github.com/acme-corp/payments-service/actions/runs/4820" },
-          { github_run_id: 4810, run_number: 95, workflow_name: "deploy-production", repo: "acme-corp/payments-service", branch: "release/4.2", event: "push", status: "completed", conclusion: "success", duration_seconds: 366, created_at: day(1), html_url: "https://github.com/acme-corp/payments-service/actions/runs/4810" },
-          { github_run_id: 4795, run_number: 94, workflow_name: "deploy-production", repo: "acme-corp/payments-service", branch: "main", event: "workflow_dispatch", status: "completed", conclusion: "success", duration_seconds: 344, created_at: day(3), html_url: "https://github.com/acme-corp/payments-service/actions/runs/4795" },
+          { github_run_id: 4820, run_number: 96, workflow_name: "deploy-production", repo: "acme-corp/node-api", branch: "main", event: "push", status: "completed", conclusion: "failure", duration_seconds: 412, created_at: day(0), html_url: "https://github.com/acme-corp/node-api/actions/runs/4820" },
+          { github_run_id: 4810, run_number: 95, workflow_name: "deploy-production", repo: "acme-corp/node-api", branch: "release/4.2", event: "push", status: "completed", conclusion: "success", duration_seconds: 366, created_at: day(1), html_url: "https://github.com/acme-corp/node-api/actions/runs/4810" },
+          { github_run_id: 4795, run_number: 94, workflow_name: "deploy-production", repo: "acme-corp/node-api", branch: "main", event: "workflow_dispatch", status: "completed", conclusion: "success", duration_seconds: 344, created_at: day(3), html_url: "https://github.com/acme-corp/node-api/actions/runs/4795" },
         ],
       },
     },
@@ -217,6 +297,7 @@ test.describe("docs screenshots", () => {
 
     await page.goto("/workspace/backup");
     await page.getByText(/1284 row\(s\)/).waitFor({ timeout: 15000 });
+    await waitForAppHeader(page);
     await page.waitForTimeout(300);
 
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/backup-restore/workspace-backup.png" });
@@ -240,6 +321,7 @@ test.describe("docs screenshots", () => {
 
     await page.goto("/workspace/drift");
     await page.getByTestId("drift-settings-form").waitFor({ timeout: 15000 });
+    await waitForAppHeader(page);
     await page.waitForTimeout(300);
 
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/drift-detection/drift-settings.png" });
@@ -247,13 +329,13 @@ test.describe("docs screenshots", () => {
 
   test("workflow editor page view", async ({ page }) => {
     const project = makeProject({
-      project_name: "Payments Platform",
-      project_code: "PAY",
+      project_name: "NodeBuilds",
+      project_code: "NODE",
       github_user: DOCS_USER,
       last_modified_by: DOCS_USER,
       updated_at: "2026-07-24T00:00:00Z",
       pr_state: "draft",
-      selected_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+      selected_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
       workflows: [
         makeWorkflow({ name: "build-and-test.yml", lastModifiedBy: DOCS_USER }),
         makeWorkflow({ name: "deploy-production.yml", lastModifiedBy: DOCS_USER }),
@@ -262,7 +344,7 @@ test.describe("docs screenshots", () => {
     await installApiMocks(page, createMockState({ projects: [project] }));
     await seedDocsUserProfile(page);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     await page
       .getByText("build-and-test.yml", { exact: false })
       .first()
@@ -270,6 +352,7 @@ test.describe("docs screenshots", () => {
     await page.getByText("build-and-test.yml", { exact: false }).first().click();
     await page.waitForTimeout(500);
 
+    await waitForAppHeader(page);
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/workflows/workflow-page-view.png" });
 
     // Expanded editor, in GUI mode: that's where the extra room actually
@@ -284,13 +367,13 @@ test.describe("docs screenshots", () => {
 
   test("workflow removal scope choice", async ({ page }) => {
     const project = makeProject({
-      project_name: "Payments Platform",
-      project_code: "PAY",
+      project_name: "NodeBuilds",
+      project_code: "NODE",
       github_user: DOCS_USER,
       last_modified_by: DOCS_USER,
       updated_at: "2026-07-24T00:00:00Z",
       pr_state: "synced",
-      selected_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+      selected_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
       // Delivered, so the dialog offers the GitHub option rather than
       // disabling it for a workflow GitHub has never seen.
       workflows: [
@@ -305,7 +388,7 @@ test.describe("docs screenshots", () => {
     await installApiMocks(page, createMockState({ projects: [project] }));
     await seedDocsUserProfile(page);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     await page
       .getByText("build-and-test.yml", { exact: false })
       .first()
@@ -318,6 +401,7 @@ test.describe("docs screenshots", () => {
     await page.getByRole("dialog").waitFor({ timeout: 5000 });
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/workflows/workflow-removal-scope.png" });
   });
 
@@ -358,14 +442,14 @@ test.describe("docs screenshots", () => {
           new_filename: "build-and-verify.yml",
           targets: [
             {
-              repo: "acme-corp/payments-service",
+              repo: "acme-corp/node-api",
               branch: "main",
               old_file_present: true,
               new_file_present: false,
               confirmed_present_at: DOCS_CONFIRMED_PRESENT_AT,
             },
             {
-              repo: "acme-corp/payments-worker",
+              repo: "acme-corp/node-worker",
               branch: "main",
               old_file_present: true,
               new_file_present: false,
@@ -373,7 +457,7 @@ test.describe("docs screenshots", () => {
             },
           ],
           consumers: [],
-          overrides: ["acme-corp/payments-worker"],
+          overrides: ["acme-corp/node-worker"],
           warnings: [
             "Build metrics recorded under the old filename stay attached to it, so this " +
               "workflow's run history will show a break at the rename.",
@@ -383,7 +467,7 @@ test.describe("docs screenshots", () => {
     );
     await seedDocsUserProfile(page);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     await page
       .getByText("build-and-test.yml", { exact: false })
       .first()
@@ -404,6 +488,7 @@ test.describe("docs screenshots", () => {
     await page.getByTestId("rename-targets").waitFor({ timeout: 5000 });
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/workflows/workflow-rename-impact.png" });
   });
 
@@ -470,13 +555,14 @@ test.describe("docs screenshots", () => {
     // 16:10, the landing page's card ratio, so the card shows the whole frame.
     await page.setViewportSize({ width: 1710, height: 1069 });
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     const linkedRow = page.getByTestId("linked-rwx-workflow-card");
     await linkedRow.waitFor({ timeout: 15000 });
     await linkedRow.click();
     await page.getByText("workflow_call", { exact: false }).first().waitFor({ timeout: 5000 });
     await page.waitForTimeout(500);
 
+    await waitForAppHeader(page);
     await page.screenshot({
       path: "../docs/src/content/docs/assets/screenshots/reusable-workflows/linked-reusable-workflow.png",
     });
@@ -484,13 +570,13 @@ test.describe("docs screenshots", () => {
 
   test("PR campaign dashboard", async ({ page }) => {
     const project = makeProject({
-      project_name: "Payments Platform",
-      project_code: "PAY",
+      project_name: "NodeBuilds",
+      project_code: "NODE",
       github_user: DOCS_USER,
       last_modified_by: DOCS_USER,
       updated_at: "2026-07-24T00:00:00Z",
       pr_state: "open",
-      selected_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+      selected_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
       workflows: [makeWorkflow({ name: "build-and-test.yml", lastModifiedBy: DOCS_USER })],
     });
     const state = createMockState({
@@ -499,11 +585,11 @@ test.describe("docs screenshots", () => {
         project_state: "open",
         pull_requests: [
           {
-            repo_name: "acme-corp/payments-service",
+            repo_name: "acme-corp/node-api",
             pr_number: 128,
-            pr_url: "https://github.com/acme-corp/payments-service/pull/128",
+            pr_url: "https://github.com/acme-corp/node-api/pull/128",
             pr_state: "open",
-            branch_name: "actions-manager/payments-platform",
+            branch_name: "actions-manager/nodebuilds",
             target_branch: "main",
             title: "Update build-and-test.yml",
             author: DOCS_USER,
@@ -512,11 +598,11 @@ test.describe("docs screenshots", () => {
             updated_at: "2026-07-24T00:00:00Z",
           },
           {
-            repo_name: "acme-corp/payments-worker",
+            repo_name: "acme-corp/node-worker",
             pr_number: 74,
-            pr_url: "https://github.com/acme-corp/payments-worker/pull/74",
+            pr_url: "https://github.com/acme-corp/node-worker/pull/74",
             pr_state: "merged",
-            branch_name: "actions-manager/payments-platform",
+            branch_name: "actions-manager/nodebuilds",
             target_branch: "main",
             title: "Update build-and-test.yml",
             author: DOCS_USER,
@@ -538,23 +624,23 @@ test.describe("docs screenshots", () => {
       // matching what the docs describe.
       campaignExtras: {
         branch_option: "default",
-        target_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+        target_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
         base_commits: {
-          "acme-corp/payments-service on main": "9c41f7ab26d3e5108b7c4f0da2e6913d5f8a0b47",
-          "acme-corp/payments-worker on main": "4e83d0c9157fa62b8d0e391c47a5b8206fd1e93c",
+          "acme-corp/node-api on main": "9c41f7ab26d3e5108b7c4f0da2e6913d5f8a0b47",
+          "acme-corp/node-worker on main": "4e83d0c9157fa62b8d0e391c47a5b8206fd1e93c",
         },
         target_pr_urls: {
-          "acme-corp/payments-service on main": "https://github.com/acme-corp/payments-service/pull/128",
-          "acme-corp/payments-worker on main": "https://github.com/acme-corp/payments-worker/pull/74",
+          "acme-corp/node-api on main": "https://github.com/acme-corp/node-api/pull/128",
+          "acme-corp/node-worker on main": "https://github.com/acme-corp/node-worker/pull/74",
         },
         branch_protection: {
-          "acme-corp/payments-service on main": {
+          "acme-corp/node-api on main": {
             status: "protected",
             required_reviews: 2,
             required_status_checks: ["ci/build", "ci/test"],
             enforce_admins: true,
           },
-          "acme-corp/payments-worker on main": { status: "none" },
+          "acme-corp/node-worker on main": { status: "none" },
         },
       },
     });
@@ -568,7 +654,7 @@ test.describe("docs screenshots", () => {
     // the app scrolls an inner container rather than the document.
     await page.setViewportSize({ width: 1710, height: 1500 });
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     await page.getByRole("button", { name: "PR Campaigns" }).click();
     await page
       .getByText("Update build-and-test.yml", { exact: false })
@@ -580,6 +666,7 @@ test.describe("docs screenshots", () => {
     // the docs describe sit at both ends of it — the header tiles and rollback
     // control at the top, the per-repository base commits and bulk-operation
     // buttons at the bottom. A viewport shot can only ever show one end.
+    await waitForAppHeader(page);
     await page.screenshot({
       path: "../docs/src/content/docs/assets/screenshots/pr-campaigns/pr-campaign.png",
       fullPage: true,
@@ -588,17 +675,17 @@ test.describe("docs screenshots", () => {
 
   test("PR campaign rollback review", async ({ page }) => {
     const project = makeProject({
-      project_name: "Payments Platform",
-      project_code: "PAY",
+      project_name: "NodeBuilds",
+      project_code: "NODE",
       github_user: DOCS_USER,
       last_modified_by: DOCS_USER,
       updated_at: "2026-07-24T00:00:00Z",
       pr_state: "open",
-      selected_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+      selected_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
       workflows: [makeWorkflow({ name: "build-and-test.yml", lastModifiedBy: DOCS_USER })],
     });
-    // The campaign bumped the runner image everywhere. payments-service can be
-    // inverted cleanly; payments-worker was edited by hand after the merge, so it
+    // The campaign bumped the runner image everywhere. node-api can be
+    // inverted cleanly; node-worker was edited by hand after the merge, so it
     // is flagged rather than clobbered — the two cases the docs describe.
     const beforeRollback = [
       "name: Build and Test",
@@ -622,11 +709,11 @@ test.describe("docs screenshots", () => {
         project_state: "open",
         pull_requests: [
           {
-            repo_name: "acme-corp/payments-service",
+            repo_name: "acme-corp/node-api",
             pr_number: 128,
-            pr_url: "https://github.com/acme-corp/payments-service/pull/128",
+            pr_url: "https://github.com/acme-corp/node-api/pull/128",
             pr_state: "merged",
-            branch_name: "actions-manager/payments-platform",
+            branch_name: "actions-manager/nodebuilds",
             target_branch: "main",
             title: "Update build-and-test.yml",
             author: DOCS_USER,
@@ -647,12 +734,13 @@ test.describe("docs screenshots", () => {
         invertible_count: 1,
         targets: [
           {
-            repo_name: "acme-corp/payments-service",
+            repo_name: "acme-corp/node-api",
             target_branch: "main",
             pr_number: 128,
-            pr_url: "https://github.com/acme-corp/payments-service/pull/128",
+            pr_url: "https://github.com/acme-corp/node-api/pull/128",
             workflow_names: "build-and-test.yml",
             invertible: true,
+            left_alone: [],
             reason: null,
             files: [
               {
@@ -664,12 +752,13 @@ test.describe("docs screenshots", () => {
             ],
           },
           {
-            repo_name: "acme-corp/payments-worker",
+            repo_name: "acme-corp/node-worker",
             target_branch: "main",
             pr_number: 74,
-            pr_url: "https://github.com/acme-corp/payments-worker/pull/74",
+            pr_url: "https://github.com/acme-corp/node-worker/pull/74",
             workflow_names: "build-and-test.yml",
             invertible: false,
+            left_alone: [],
             reason:
               ".github/workflows/build-and-test.yml changed on main after this campaign merged — rolling back would discard that change.",
             files: [],
@@ -684,7 +773,7 @@ test.describe("docs screenshots", () => {
     // "once the rollback merges" choice, which the docs walk through as a step.
     await page.setViewportSize({ width: 1710, height: 1200 });
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     await page.getByRole("button", { name: "PR Campaigns" }).click();
     // Every PR merged, so the campaign lives in Completed and starts collapsed.
     await page.getByRole("button", { name: /Completed Campaigns/i }).click();
@@ -693,18 +782,19 @@ test.describe("docs screenshots", () => {
     await page.getByTestId("rollback-summary").waitFor({ timeout: 15000 });
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/pr-campaigns/pr-campaign-rollback.png" });
   });
 
   test("drift detection — bulk resolve", async ({ page }) => {
     const project = makeProject({
-      project_name: "Payments Platform",
-      project_code: "PAY",
+      project_name: "NodeBuilds",
+      project_code: "NODE",
       github_user: DOCS_USER,
       last_modified_by: DOCS_USER,
       updated_at: "2026-07-24T00:00:00Z",
       pr_state: "draft",
-      selected_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+      selected_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
       workflows: [makeWorkflow({ name: "build-and-test.yml", lastModifiedBy: DOCS_USER })],
     });
     // Realistic managed vs. GitHub content so the diff view screenshot shows
@@ -748,7 +838,7 @@ test.describe("docs screenshots", () => {
         {
           workflow_name: "build-and-test.yml",
           workflow_filename: "build-and-test.yml",
-          repo: "acme-corp/payments-service",
+          repo: "acme-corp/node-api",
           has_drift: true,
           github_sha: "f4a1c9e",
           actionsmanager_yaml: managedYaml,
@@ -757,7 +847,7 @@ test.describe("docs screenshots", () => {
         {
           workflow_name: "build-and-test.yml",
           workflow_filename: "build-and-test.yml",
-          repo: "acme-corp/payments-worker",
+          repo: "acme-corp/node-worker",
           has_drift: true,
           github_sha: "f4a1c9e",
           actionsmanager_yaml: managedYaml,
@@ -768,12 +858,13 @@ test.describe("docs screenshots", () => {
     await installApiMocks(page, createMockState({ projects: [project] }));
     await seedDocsUserProfile(page);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     await page.getByTestId("drift-banner").waitFor({ timeout: 15000 });
     await page.getByTestId("review-drift-button").click();
     await page.getByTestId("drift-modal").waitFor();
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/drift-detection/drift-bulk-select.png" });
 
     // Expand one row's diff to show what an actual drift looks like -
@@ -803,7 +894,7 @@ test.describe("docs screenshots", () => {
     await installApiMocks(page, createMockState({ projects: [project] }));
     await seedDocsUserProfile(page);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     const statusRow = page.getByTestId("drift-status-row");
     await statusRow.waitFor({ timeout: 15000 });
     await page.waitForTimeout(300);
@@ -836,13 +927,14 @@ test.describe("docs screenshots", () => {
       })
     );
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     // The Project Configs group is collapsed until opened.
     await page.getByRole("button", { name: "Project Configs" }).click();
     await page.getByRole("button", { name: /Drift Detection/i }).click();
     await page.getByTestId("project-drift-interval").waitFor({ timeout: 15000 });
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({
       path: "../docs/src/content/docs/assets/screenshots/drift-detection/project-drift-schedule.png",
     });
@@ -861,7 +953,7 @@ test.describe("docs screenshots", () => {
     await installApiMocks(page, createMockState({ projects: [project] }));
     await seedDocsUserProfile(page);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     const statusRow = page.getByTestId("drift-status-row");
     await statusRow.waitFor({ timeout: 15000 });
     await page.waitForTimeout(300);
@@ -882,20 +974,20 @@ test.describe("docs screenshots", () => {
         {
           workflow_name: "deploy-production.yml",
           workflow_filename: "deploy-production.yml",
-          repo: "acme-corp/payments-worker",
+          repo: "acme-corp/node-worker",
           has_drift: true,
           deleted_in_github: true,
           // Empty rather than absent: the panel replaces the diff either way,
           // but a null here makes the row fetch GitHub's side on expand.
           github_yaml: "",
-          message: "Workflow was deleted from acme-corp/payments-worker",
+          message: "Workflow was deleted from acme-corp/node-worker",
         },
       ],
     });
     await installApiMocks(page, createMockState({ projects: [project] }));
     await seedDocsUserProfile(page);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     await page.getByTestId("drift-banner").waitFor({ timeout: 15000 });
     await page.getByTestId("review-drift-button").click();
     await page.getByTestId("drift-modal").waitFor();
@@ -903,48 +995,108 @@ test.describe("docs screenshots", () => {
     await page.getByTestId("deleted-in-github-panel").waitFor({ timeout: 5000 });
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({
       path: "../docs/src/content/docs/assets/screenshots/drift-detection/drift-deleted-in-github.png",
     });
   });
 
   test("drift detection — CODEOWNERS changed on GitHub", async ({ page }) => {
-    const repo = "acme-corp/payments-service";
-    const synced = "* @acme-corp/payments-team\n/infra/ @acme-corp/platform\n";
-    const project = makeProject({
-      ...DOCS_SYNCED_PROJECT,
-      workflows: [
-        makeWorkflow({ name: "build-and-test.yml", lastModifiedBy: DOCS_USER, workflowStatus: "synced_with_github" }),
-      ],
-    });
-    await installApiMocks(page, createMockState({ projects: [project] }));
+    const repo = "acme-corp/node-api";
+    await installApiMocks(page, codeownersProjectState());
     await seedDocsUserProfile(page);
+    await mockManagedFiles(page);
     await mockDriftResponse(page, { lastChecked: DOCS_LAST_CHECKED, driftedCodeowners: [{ repo }] });
-    await page.route(
-      (url) => /^\/api\/projects\/\d+\/codeowners$/.test(url.pathname),
-      (route) => route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        headers: corsHeaders(route),
-        body: JSON.stringify({
-          codeowners: {
-            id: 1, project_id: 1, content: synced, file_path: ".github/CODEOWNERS",
-            git_hash: "a".repeat(40), status: "synced_with_github", last_modified_by: DOCS_USER,
-            created_at: DOCS_LAST_CHECKED, updated_at: DOCS_LAST_CHECKED,
-          },
-        }),
-      }),
-    );
+    await mockCodeowners(page, DOCS_CODEOWNERS);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
-    const codeownersRow = page.getByRole("button", { name: /^\.github\/CODEOWNERS, Synced, Drift detected/ });
-    await codeownersRow.waitFor({ timeout: 15000 });
-    await codeownersRow.click();
-    await page.getByRole("button", { name: "Load GitHub version" }).waitFor({ timeout: 10000 });
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent(DOCS_CODEOWNERS_PROJECT.project_name)}`);
+    await page.getByRole("button", { name: "Load GitHub version" }).waitFor({ timeout: 15000 });
+    await page.waitForTimeout(300);
+
+    await waitForAppHeader(page);
+    await page.screenshot({
+      path: "../docs/src/content/docs/assets/screenshots/drift-detection/codeowners-drift.png",
+    });
+  });
+
+  test("managed files — the section", async ({ page }) => {
+    const checkout = makeProject({
+      ...DOCS_CODEOWNERS_PROJECT,
+      ...DOCS_MANAGED_ROW,
+      project_id: 2,
+      project_name: "Checkout",
+      project_code: "CHK",
+      repo_count: 5,
+      file_path: "CODEOWNERS",
+      drift_status: "drifted",
+      drifted_repos: ["acme-corp/checkout-api"],
+    });
+    const owners = makeProject({ ...DOCS_CODEOWNERS_PROJECT, ...DOCS_MANAGED_ROW });
+    await installApiMocks(page, createMockState({ projects: [owners, checkout] }));
+    await seedDocsUserProfile(page);
+    await mockManagedFiles(page, { ownedCount: 2 });
+
+    await page.goto(`/project/${DOCS_USER}/managed-files`);
+    await page.getByTestId("managed-files-new-card").waitFor({ timeout: 15000 });
+    await waitForAppHeader(page);
     await page.waitForTimeout(300);
 
     await page.screenshot({
-      path: "../docs/src/content/docs/assets/screenshots/drift-detection/codeowners-drift.png",
+      path: "../docs/src/content/docs/assets/screenshots/managed-files/section.png",
+    });
+  });
+
+  test("managed files — a new project", async ({ page }) => {
+    const repos = ["node-api", "node-worker", "ledger-service", "identity-api", "notifications-service"]
+      .map((name, index) => ({
+        id: index + 1, name, full_name: `${DOCS_USER}/${name}`, private: false, default_branch: "main",
+      }));
+    const owners = { project_id: 1, project_name: DOCS_CODEOWNERS_PROJECT.project_name };
+    await installApiMocks(page, createMockState({
+      projects: [makeProject({ ...DOCS_CODEOWNERS_PROJECT, ...DOCS_MANAGED_ROW })],
+    }));
+    await seedDocsUserProfile(page);
+    await seedDocsRepos(page, repos);
+    await mockManagedFiles(page, {
+      ownedCount: 1,
+      taken: {
+        [`${DOCS_USER}/node-api`]: owners,
+        [`${DOCS_USER}/ledger-service`]: { project_id: null, project_name: null },
+      },
+    });
+
+    // Tall enough for the whole dialog: below 90vh of its height it scrolls, hiding Create project.
+    await page.setViewportSize({ width: 1710, height: 1069 });
+    await page.goto(`/project/${DOCS_USER}/managed-files`);
+    await page.getByTestId("managed-files-new-card").click({ timeout: 15000 });
+    await page.getByTestId("managed-files-project-name").fill("Platform services");
+    await page.getByText("Used by another project").waitFor({ timeout: 10000 });
+    await waitForAppHeader(page);
+    for (const name of ["identity-api", "notifications-service"]) {
+      await page.getByRole("checkbox", { name: `Select ${DOCS_USER}/${name}` }).click();
+    }
+    await page.waitForTimeout(300);
+
+    await page.screenshot({
+      path: "../docs/src/content/docs/assets/screenshots/managed-files/new-project.png",
+    });
+  });
+
+  test("managed files — a CODEOWNERS project", async ({ page }) => {
+    await installApiMocks(page, codeownersProjectState());
+    await seedDocsUserProfile(page);
+    await mockManagedFiles(page);
+    await mockDriftResponse(page, { lastChecked: DOCS_LAST_CHECKED });
+    await mockCodeowners(page, DOCS_CODEOWNERS);
+
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent(DOCS_CODEOWNERS_PROJECT.project_name)}`);
+    await page.getByRole("button", { name: "Commit Locally" }).waitFor({ timeout: 15000 });
+    await page.getByText("No drift detected").waitFor({ timeout: 10000 });
+    await page.waitForTimeout(300);
+
+    await waitForAppHeader(page);
+    await page.screenshot({
+      path: "../docs/src/content/docs/assets/screenshots/managed-files/codeowners-project.png",
     });
   });
 
@@ -953,9 +1105,9 @@ test.describe("docs screenshots", () => {
     // many repositories, with a couple left available so the picker still
     // reads as a choice.
     const repos = [
-      "payments-service",
-      "payments-worker",
-      "checkout-web",
+      "node-api",
+      "node-worker",
+      "node-web",
       "checkout-api",
       "ledger-service",
       "notifications-worker",
@@ -989,13 +1141,14 @@ test.describe("docs screenshots", () => {
     // 16:10, the landing page's card ratio, so the card shows the whole frame.
     await page.setViewportSize({ width: 1710, height: 1069 });
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     const reposNav = page.getByRole("button", { name: "Repositories & Branches" });
     await reposNav.waitFor({ timeout: 15000 });
     await reposNav.click();
     await page.getByTestId(`selected-repo-${selected[5].full_name}`).waitFor({ timeout: 15000 });
     await page.waitForTimeout(500);
 
+    await waitForAppHeader(page);
     await page.screenshot({
       path: "../docs/src/content/docs/assets/screenshots/projects/project-repositories.png",
     });
@@ -1003,13 +1156,13 @@ test.describe("docs screenshots", () => {
 
   test("projects — new repository delivery prompt", async ({ page }) => {
     const project = makeProject({
-      project_name: "Payments Platform",
-      project_code: "PAY",
+      project_name: "NodeBuilds",
+      project_code: "NODE",
       github_user: DOCS_USER,
       last_modified_by: DOCS_USER,
       updated_at: "2026-07-24T00:00:00Z",
       pr_state: "synced",
-      selected_repos: ["acme-corp/payments-service", "acme-corp/payments-worker"],
+      selected_repos: ["acme-corp/node-api", "acme-corp/node-worker"],
       workflows: [
         makeWorkflow({
           name: "build-and-test.yml",
@@ -1021,11 +1174,11 @@ test.describe("docs screenshots", () => {
     await installApiMocks(page, createMockState({ projects: [project] }));
     await seedDocsUserProfile(page);
     // Registered after installApiMocks - routes are LIFO - so the picker
-    // offers checkout-web as the repository to add.
+    // offers node-web as the repository to add.
     await seedDocsRepos(page);
     await mockDocsRepoBranchConfigs(page, DOCS_REPOS);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     const configGroup = page.getByRole("button", { name: "Project Configs" });
     await configGroup.waitFor({ timeout: 15000 });
     if ((await configGroup.getAttribute("aria-expanded")) !== "true") {
@@ -1034,13 +1187,14 @@ test.describe("docs screenshots", () => {
     await page.getByRole("button", { name: "Repositories & Branches" }).click();
 
     // Add the third repo, then save: the prompt fires on a successful save.
-    await page.getByTestId("available-checkbox-acme-corp/checkout-web").click();
+    await page.getByTestId("available-checkbox-acme-corp/node-web").click();
     await page.getByRole("button", { name: /Save/ }).first().click();
 
     const dialog = page.getByRole("dialog");
     await dialog.waitFor({ timeout: 15000 });
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({
       path: "../docs/src/content/docs/assets/screenshots/projects/new-repo-delivery-prompt.png",
     });
@@ -1048,18 +1202,18 @@ test.describe("docs screenshots", () => {
 
   test("projects — pending delivery reminder", async ({ page }) => {
     const project = makeProject({
-      project_name: "Payments Platform",
-      project_code: "PAY",
+      project_name: "NodeBuilds",
+      project_code: "NODE",
       github_user: DOCS_USER,
       last_modified_by: DOCS_USER,
       updated_at: "2026-07-24T00:00:00Z",
       pr_state: "synced",
       selected_repos: [
-        "acme-corp/payments-service",
-        "acme-corp/payments-worker",
-        "acme-corp/checkout-web",
+        "acme-corp/node-api",
+        "acme-corp/node-worker",
+        "acme-corp/node-web",
       ],
-      pending_delivery_repos: ["acme-corp/checkout-web"],
+      pending_delivery_repos: ["acme-corp/node-web"],
       workflows: [
         makeWorkflow({
           name: "build-and-test.yml",
@@ -1073,11 +1227,12 @@ test.describe("docs screenshots", () => {
     await seedDocsUserProfile(page);
     await seedDocsRepos(page);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     const notice = page.getByTestId("pending-delivery-notice");
     await notice.waitFor({ timeout: 15000 });
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({
       path: "../docs/src/content/docs/assets/screenshots/projects/pending-delivery-reminder.png",
     });
@@ -1085,13 +1240,13 @@ test.describe("docs screenshots", () => {
 
   test("notifications settings page", async ({ page }) => {
     const project = makeProject({
-      project_name: "Payments Platform",
-      project_code: "PAY",
+      project_name: "NodeBuilds",
+      project_code: "NODE",
       github_user: DOCS_USER,
       last_modified_by: DOCS_USER,
       updated_at: "2026-07-24T00:00:00Z",
       pr_state: "synced",
-      selected_repos: ["acme-corp/payments-service"],
+      selected_repos: ["acme-corp/node-api"],
     });
     await installApiMocks(page, createMockState({ projects: [project] }));
     await seedDocsUserProfile(page);
@@ -1123,7 +1278,7 @@ test.describe("docs screenshots", () => {
             delivery_id: 1,
             event_type: "drift.detected",
             project_id: 1,
-            project_name: "Payments Platform",
+            project_name: "NodeBuilds",
             recipient_email: "platform-team@acme-corp.example",
             status: "sent",
             attempt_count: 1,
@@ -1137,6 +1292,7 @@ test.describe("docs screenshots", () => {
 
     await page.goto(`/workspace/notifications`);
     await page.getByText("platform-team@acme-corp.example").first().waitFor({ timeout: 15000 });
+    await waitForAppHeader(page);
     await page.waitForTimeout(300);
 
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/notifications/notifications-settings.png" });
@@ -1155,11 +1311,12 @@ test.describe("docs screenshots", () => {
     await mockDriftResponse(page, { lastChecked: DOCS_LAST_CHECKED });
     await mockBuildMetricsResponse(page, DOCS_BUILD_METRICS);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     await page.getByRole("button", { name: "Build Metrics" }).click();
     await page.getByTestId("build-metrics-trend").waitFor({ timeout: 15000 });
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/build-metrics/build-metrics-overview.png" });
   });
 
@@ -1173,7 +1330,7 @@ test.describe("docs screenshots", () => {
     await mockDriftResponse(page, { lastChecked: DOCS_LAST_CHECKED });
     await mockBuildMetricsResponse(page, DOCS_BUILD_METRICS);
 
-    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("Payments Platform")}`);
+    await page.goto(`/project/${DOCS_USER}/${encodeURIComponent("NodeBuilds")}`);
     await page.getByRole("button", { name: "Build Metrics" }).click();
     await page.getByTestId("build-metrics-workflow-filter").waitFor({ timeout: 15000 });
     await page
@@ -1182,6 +1339,7 @@ test.describe("docs screenshots", () => {
     await page.getByText("Last 30 days · deploy-production").waitFor({ timeout: 15000 });
     await page.waitForTimeout(300);
 
+    await waitForAppHeader(page);
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/build-metrics/build-metrics-by-workflow.png" });
   });
 });

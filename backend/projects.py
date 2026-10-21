@@ -5,12 +5,12 @@ import random
 import re
 import string
 import traceback
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Literal, Optional
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session, aliased
-from sqlalchemy.sql import and_, func, or_, union_all
+from sqlalchemy.sql import and_, func, or_, true, union_all
 from pydantic import BaseModel, field_validator
 from github_api_tracker import github_get
 from auth import CurrentAccount, user_tokens
@@ -33,7 +33,7 @@ from models import (
     ProjectDisplayOrder,
     generate_project_key_from_name,
 )
-from database import get_db
+from database import get_db, serialize_writers
 import deliveries
 from drift_notifications import resolve_drift_for_local_edit
 from workflows import (
@@ -48,10 +48,17 @@ from workflows import (
     resolve_branch_config_for_repo,
     _normalize_reusable_workflow_name,
     _reusable_workflow_ids_locked_by_open_campaign,
+    _project_codeowners,
     _utc_iso,
     settle_project_and_linked,
 )
-from tier_service import check_new_project, check_repo_limit, check_private_visibility_scope
+from file_kinds import FILE_KINDS, MANAGED_FILES, refuse_unless_accepted
+from tier_service import (
+    check_new_managed_files_project,
+    check_new_project,
+    check_private_visibility_scope,
+    check_repo_limit,
+)
 from authorization import (
     PROJECT_ROLE_LEVEL,
     find_project_by_name,
@@ -151,6 +158,7 @@ def _enforce_project_color_type_restriction(
 
     - RWX (Reusable Workflow) projects may only use purple/green.
     - Standard (Caller Workflow) projects may only use the remaining six.
+    - Managed Files projects have no color at all.
 
     Standard projects that already had an RWX-only color before this
     restriction existed are grandfathered: re-submitting the unchanged
@@ -159,6 +167,8 @@ def _enforce_project_color_type_restriction(
     if requested_color is None:
         return
     effective_type = project_type or "standard"
+    if effective_type == MANAGED_FILES:
+        raise HTTPException(status_code=422, detail="Managed Files projects have no color; project_color must be null.")
     if effective_type == "rwx":
         if requested_color in RWX_ONLY_PROJECT_COLORS:
             return
@@ -263,6 +273,11 @@ class WorkflowSchema(BaseModel):
     # leaving the old one behind.
     original_name: str | None = None
 
+
+# A repository's full name as GitHub writes it: owner/repo.
+OWNER_REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
 # ✅ Define Schema for Project
 class ProjectSchema(BaseModel):
     project_name: str
@@ -275,7 +290,8 @@ class ProjectSchema(BaseModel):
     branch_max_age_days: int = 30  # Filter branches by recency (1-30 days)
     reusable_workflows_enabled: bool = False  # Include reusable workflows setting
     use_prefix: bool = True  # Whether to use AM_{PROJECT_CODE}_ prefix (default: True)
-    project_type: str = "standard"  # Project type: standard, rwx
+    project_type: str = "standard"  # Project type: standard, rwx, managed_files
+    file_kind: str | None = None  # managed_files only: a key of file_kinds.FILE_KINDS; create reads it, PUT ignores it
     repository_visibility_scope: str = "public"  # Repository visibility scope: public, private
     project_color: str | None = None  # Project identity color key (decorative accent only)
     validation_repo: str | None = None
@@ -313,7 +329,7 @@ class ProjectSchema(BaseModel):
         normalized = v.strip()
         if not normalized:
             return None
-        if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", normalized):
+        if not OWNER_REPO_NAME.fullmatch(normalized):
             raise ValueError("validation_repo must use owner/repo format")
         return normalized
 
@@ -483,21 +499,83 @@ def create_workflow_version_in_projects(db, workflow_id, content, metadata=None)
 # and left the old one behind. Fixes also had to be made twice and were not:
 # the pending_delete tombstone guard landed in one copy and not the other.
 
-def update_project_state_if_needed(project: Project, workflows: List, rxworkflows: List = None) -> None:
+def update_project_state_if_needed(project: Project, workflows: List, rxworkflows: List = None,
+                                   holds_file: bool = False) -> None:
     """
-    Update project state based on workflow changes.
-    Transitions: new → draft, synced → draft when workflows are saved.
-    
+    Update project state based on what a save carries.
+    Transitions: new → draft, synced → draft when workflows are saved, or when
+    a Managed Files project that holds its file is saved (holds_file): its
+    repositories or branches may have changed, and only a campaign reaches
+    new ones, as for a workflow project.
+
     Args:
         project: The project to update
         workflows: List of regular workflows being saved
         rxworkflows: List of reusable workflows being saved (optional)
+        holds_file: The project is a Managed Files project with its file
     """
     all_workflows = list(workflows) + list(rxworkflows or [])
     has_workflows = any(w.name and w.name.strip() and w.content and w.content.strip() for w in all_workflows)
-    if has_workflows and project.pr_state in ["new", "synced"]:
+    if (has_workflows or holds_file) and project.pr_state in ["new", "synced"]:
         project.pr_state = "draft"
-        print(f"✅ Updated project state to 'draft' (workflows saved)")
+        print("✅ Updated project state to 'draft' (project saved with files to deliver)")
+
+
+PROJECT_TYPES = ("standard", "rwx", MANAGED_FILES)
+
+
+def _validate_type_and_kind(project: ProjectSchema) -> None:
+    """A new project's type, and the file kind exactly a Managed Files project names."""
+    if project.project_type not in PROJECT_TYPES:
+        raise HTTPException(status_code=422, detail=f"project_type must be one of: {', '.join(PROJECT_TYPES)}")
+    if project.project_type == MANAGED_FILES:
+        if project.file_kind not in FILE_KINDS:
+            raise HTTPException(status_code=422, detail=f"file_kind must be one of: {', '.join(FILE_KINDS)}")
+    elif project.file_kind is not None:
+        raise HTTPException(status_code=422, detail="file_kind is only for Managed Files projects")
+
+
+def _refuse_held_contents(project, payload: ProjectSchema) -> None:
+    """Refuse what a create or update *payload* would put in a *project* that cannot hold it.
+
+    *project* is the payload itself on create.
+    """
+    if any(_is_workflow_non_empty(w) for w in [*payload.workflows, *payload.rxworkflows]):
+        refuse_unless_accepted(project, "workflows")
+    if payload.validation_repo or payload.preflight_required:
+        refuse_unless_accepted(project, "validation_repo")
+
+
+def owned_projects_by_type(db: Session, user_id: int) -> dict:
+    """{project_type: how many projects of it *user_id* owns}: what the project limits count."""
+    return dict(
+        db.query(Project.project_type, func.count(Project.project_id))
+        .filter(Project.user_id == user_id)
+        .group_by(Project.project_type)
+        .all()
+    )
+
+
+def _enforce_project_limit(db: Session, user: Account, project_type: str) -> None:
+    """The limit a new project of *project_type* counts against.
+
+    Managed Files projects have one limit for their section; the workflow
+    project limits, the total included, never count them.
+    """
+    counts = owned_projects_by_type(db, user.user_id)
+    if project_type == MANAGED_FILES:
+        allowed, error_msg = check_new_managed_files_project(user, counts.get(MANAGED_FILES, 0))
+    else:
+        allowed, error_msg = check_new_project(
+            user,
+            sum(count for kind, count in counts.items() if kind != MANAGED_FILES),
+            counts.get("standard", 0),
+            counts.get("rwx", 0),
+            project_type,
+        )
+    if not allowed:
+        print(f"❌ POST /api/projects/ - Project limit exceeded for user '{user.github_user}'")
+        raise HTTPException(status_code=403, detail=error_msg)
 
 
 def _validate_create_request(db: Session, project: ProjectSchema, github_user: str) -> Account:
@@ -516,23 +594,9 @@ def _validate_create_request(db: Session, project: ProjectSchema, github_user: s
     if _owner_has_project_named(db, user.user_id, name):
         raise HTTPException(status_code=409, detail=f"You already have a project named '{name}'. Choose another name.")
 
-    counts_by_type = dict(
-        db.query(Project.project_type, func.count(Project.project_id))
-        .filter(Project.user_id == user.user_id)
-        .group_by(Project.project_type)
-        .all()
-    )
-    project_type = project.project_type or "standard"
-    allowed, error_msg = check_new_project(
-        user,
-        sum(counts_by_type.values()),
-        counts_by_type.get("standard", 0),
-        counts_by_type.get("rwx", 0),
-        project_type,
-    )
-    if not allowed:
-        print(f"❌ POST /api/projects/ - Project limit exceeded for user '{github_user}'")
-        raise HTTPException(status_code=403, detail=error_msg)
+    _validate_type_and_kind(project)
+    _refuse_held_contents(project, project)
+    _enforce_project_limit(db, user, project.project_type)
 
     # Tier-gate the repository_visibility_scope: the active tier rules decide
     # whether this account may create a private-scope project.
@@ -600,6 +664,7 @@ def _create_project_row(db: Session, user_id: int, project: ProjectSchema) -> Pr
         project_code=project_key,
         reusable_workflows_enabled=project.reusable_workflows_enabled,
         project_type=project.project_type,
+        file_kind=project.file_kind,
         repository_visibility_scope=project.repository_visibility_scope,
     )
     if "project_color" in project.model_fields_set:
@@ -617,41 +682,116 @@ def _normalize_repo_names(selected_repos: list[str]) -> set[str]:
     return {name.strip() for name in selected_repos if name and name.strip()}
 
 
-def _process_project_repos(db: Session, project_id: int, selected_repos: list[str]) -> None:
+# serialize_writers id for the one-project-per-repository-per-kind check (#2367).
+MANAGED_FILES_REPOS_LOCK_ID = 2367
+
+
+def _get_or_create_repo(db: Session, repo_name: str) -> Repo:
+    repo = db.query(Repo).filter(Repo.repo_name == repo_name).first()
+    if not repo:
+        repo = Repo(repo_name=repo_name)
+        db.add(repo)
+        db.flush()
+        db.refresh(repo)
+    return repo
+
+
+def managed_files_holders(db: Session, kind: str, repo_names: list, exclude_project_id: Optional[int] = None) -> dict:
+    """{lower-cased name: the Managed Files project of *kind* holding it}, for those of *repo_names* one holds.
+
+    Instance-wide, whoever owns the project: the rule is about the one file
+    GitHub reads from each repository. Names compare case-insensitively, as
+    GitHub's do.
+    """
+    lowered = {name.lower() for name in repo_names}
+    if not lowered:
+        return {}
+    query = (
+        db.query(Repo.repo_name, Project)
+        .join(ProjectRepo, ProjectRepo.repo_id == Repo.repo_id)
+        .join(Project, Project.project_id == ProjectRepo.project_id)
+        .filter(
+            Project.project_type == MANAGED_FILES,
+            Project.file_kind == kind,
+            func.lower(Repo.repo_name).in_(lowered),
+        )
+    )
+    if exclude_project_id is not None:
+        query = query.filter(Project.project_id != exclude_project_id)
+    return {name.lower(): holder for name, holder in query}
+
+
+def shown_holders(db: Session, account: Account, holders) -> dict:
+    """{project_id: the holding project as *account* may see it}: its id and name, or nulls when they cannot see it.
+
+    One access check per project, however many repositories it holds.
+    """
+    shown = {}
+    for holder in holders:
+        if holder.project_id in shown:
+            continue
+        visible = project_role(db, account, holder) is not None
+        shown[holder.project_id] = {
+            "project_id": holder.project_id if visible else None,
+            "project_name": holder.project_name if visible else None,
+        }
+    return shown
+
+
+def _refuse_held_repos(db: Session, project: Project, repo_names: list, account: Account) -> None:
+    """409 when another project of *project*'s kind holds one of *repo_names*."""
+    holders = managed_files_holders(db, project.file_kind, repo_names, exclude_project_id=project.project_id)
+    if not holders:
+        return
+    label = FILE_KINDS[project.file_kind].label
+    shown = shown_holders(db, account, holders.values())
+    used = []
+    for name in repo_names:
+        holder = holders.get(name.lower())
+        if holder is not None:
+            holder_name = shown[holder.project_id]["project_name"]
+            used.append(f"{name} is used by '{holder_name}'" if holder_name else f"{name} is used by another {label} project")
+    raise HTTPException(
+        status_code=409,
+        detail=f"A repository can be in one {label} project. {'; '.join(used)}.",
+    )
+
+
+def _process_project_repos(db: Session, project: Project, selected_repos: list[str], account: Account) -> None:
     """Sync project repo associations from ``selected_repos``.
 
     Preserves any per-repository branch override columns on rows that
     remain in the project. Rows that are no longer selected are removed
     (the cascade also drops their override config); newly selected repos
     are added with the default ``"inherit"`` mode.
-    """
-    desired_names = _normalize_repo_names(selected_repos)
 
+    A Managed Files project is refused a repository another project of its
+    kind holds (#2367). The check and the insert run under serialize_writers
+    in one transaction, so two saves can never both pass it.
+    """
+    managed = project.project_type == MANAGED_FILES
+    if managed:
+        serialize_writers(db, MANAGED_FILES_REPOS_LOCK_ID)
     existing_assocs = (
-        db.query(ProjectRepo).filter(ProjectRepo.project_id == project_id).all()
+        db.query(ProjectRepo).filter(ProjectRepo.project_id == project.project_id).all()
     )
     existing_repo_ids = {a.repo_id for a in existing_assocs}
 
-    # Resolve repo objects for each desired name (creating Repo rows as needed)
-    desired_repo_ids = set()
-    for repo_name in desired_names:
-        repo = db.query(Repo).filter(Repo.repo_name == repo_name).first()
-        if not repo:
-            repo = Repo(repo_name=repo_name)
-            db.add(repo)
-            db.flush()
-            db.refresh(repo)
-        desired_repo_ids.add(repo.repo_id)
-        if repo.repo_id not in existing_repo_ids:
-            db.add(ProjectRepo(
-                project_id=project_id,
-                repo_id=repo.repo_id,
-                branch_config_mode="inherit",
-            ))
+    desired = [_get_or_create_repo(db, name) for name in sorted(_normalize_repo_names(selected_repos))]
+    added = [repo for repo in desired if repo.repo_id not in existing_repo_ids]
+    if managed:
+        _refuse_held_repos(db, project, [repo.repo_name for repo in added], account)
+    for repo in added:
+        db.add(ProjectRepo(
+            project_id=project.project_id,
+            repo_id=repo.repo_id,
+            branch_config_mode="inherit",
+        ))
 
     # Remove associations (and their override config) for repos no longer
     # selected; the FK cascade on project_repos itself isn't involved here —
     # we just delete the join row directly.
+    desired_repo_ids = {repo.repo_id for repo in desired}
     for assoc in existing_assocs:
         if assoc.repo_id not in desired_repo_ids:
             db.delete(assoc)
@@ -702,12 +842,7 @@ def _sync_validation_repo(db: Session, project_row: Project, project: ProjectSch
         if response.status_code >= 400:
             raise HTTPException(status_code=400, detail="Unable to validate repository access.")
 
-    repo_row = db.query(Repo).filter(Repo.repo_name == repo_name).first()
-    if not repo_row:
-        repo_row = Repo(repo_name=repo_name)
-        db.add(repo_row)
-        db.flush()
-        db.refresh(repo_row)
+    repo_row = _get_or_create_repo(db, repo_name)
 
     if project_row.validation_repo_id != repo_row.repo_id:
         project_row.last_preflight_status = "not_run"
@@ -797,8 +932,9 @@ def _process_project_workflows(db: Session, project: ProjectSchema, project_id: 
     responses={
         **_responses(400, 401, 403, 404, 500),
         409: {"description": "Name conflict: you already have a project with that name, "
-                             "or a workflow name is held by one queued for removal or shared by more than one project"},
-        422: {"description": "Invalid project_color for this project type"},
+                             "or a workflow name is held by one queued for removal or shared by more than one project; "
+                             "or a repository is already in another Managed Files project of the same kind"},
+        422: {"description": "Invalid project_type or file_kind, or a project_color this project type cannot have"},
     },
 )
 def create_project(
@@ -824,7 +960,7 @@ def create_project(
         new_project = _create_project_row(db, user.user_id, project)
         # Audit: record who created this project
         new_project.last_modified_by = github_user.strip()
-        _process_project_repos(db, new_project.project_id, project.selected_repos)
+        _process_project_repos(db, new_project, project.selected_repos, account)
         _sync_validation_repo(db, new_project, project, github_user=github_user)
         kind_changes = _process_project_workflows(db, project, new_project.project_id, last_modified_by=github_user.strip())
         update_project_state_if_needed(new_project, project.workflows, project.rxworkflows)
@@ -969,7 +1105,8 @@ def update_project_order(
         403: {"description": "Access denied"},
         404: {"description": _ERR_PROJECT_NOT_FOUND_PLAIN},
         409: {"description": "Name conflict: the project's owner already has a project with that name, "
-                             "or a workflow name is held by one queued for removal or shared by more than one project"},
+                             "or a workflow name is held by one queued for removal or shared by more than one project; "
+                             "or a repository is already in another Managed Files project of the same kind"},
         422: {"description": "Invalid project_color for this project type"},
     },
 )
@@ -992,6 +1129,7 @@ def update_project(
 
         _require_project_editor(db, account, existing_project)
         _assert_project_name_free(db, existing_project, project.project_name.strip())
+        _refuse_held_contents(existing_project, project)
 
         print(f"✅ PUT /projects/{project_id}/ - Updating project '{existing_project.project_name}' (caller='{account.github_user}')")
         
@@ -1061,7 +1199,7 @@ def update_project(
             [(w, False) for w in project.workflows] + [(w, True) for w in reusable_to_save],
         )
         # Preserve per-repo branch overrides on associations that survive.
-        _process_project_repos(db, existing_project.project_id, project.selected_repos)
+        _process_project_repos(db, existing_project, project.selected_repos, account)
         _sync_validation_repo(db, existing_project, project, github_user=account.github_user, preserve_unset=True)
 
         # Don't delete ProjectWorkflow associations - let create_or_update_workflow handle updates
@@ -1088,7 +1226,9 @@ def update_project(
                 print(f"⚠️ Skipping empty reusable workflow: name='{workflow.name}', content_length={len(workflow.content) if workflow.content else 0}")
 
         # Update project state based on workflow changes (considers both regular and reusable)
-        update_project_state_if_needed(existing_project, project.workflows, project.rxworkflows)
+        update_project_state_if_needed(
+            existing_project, project.workflows, project.rxworkflows, _holds_its_file(db, existing_project)
+        )
         
         db.commit()
 
@@ -1097,23 +1237,8 @@ def update_project(
         # added by this very save is the common case for it appearing. Computed
         # here rather than guessed client-side: a repo removed and re-added
         # keeps its delivery history, so "just added" does not imply "waiting".
-        saved_workflows = (
-            db.query(Workflow)
-            .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
-            .filter(ProjectWorkflow.project_id == existing_project.project_id)
-            .all()
-        )
-        # Distinguishes "nothing is waiting" from "cannot tell yet": an unchecked
-        # project returns [] either way, and a caller that reads that as the
-        # former would suppress the delivery prompt for every new project.
-        pending_delivery_known = (
-            (existing_project.project_type or "standard") != "rwx"
-            and existing_project.last_drift_check_at is not None
-        )
-        pending_delivery_repos = (
-            _pending_delivery_repo_names(db, existing_project.project_id, saved_workflows)
-            if pending_delivery_known
-            else []
+        pending_delivery_known, pending_delivery_repos = _pending_delivery(
+            db, existing_project, _project_workflow_refs(db, existing_project.project_id)
         )
 
         return {
@@ -1328,20 +1453,32 @@ def update_project_name(
         raise HTTPException(status_code=500, detail="Internal server error during project name update")
 
 
-def _accessible_project_ids(db: Session, caller_member) -> set:
-    """Project IDs the caller may see, mirroring get_projects' two branches exactly.
+# What GET /api/projects/ lists: the Projects page's workflow projects (the
+# default), the Managed Files section's projects, or both.
+ProjectListSection = Literal["workflows", "managed_files", "all"]
 
-    Admins see every project; non-admins only those with a ProjectMembership row.
-    One query either way — resolving per project id would be N queries.
+
+def _in_section(section: str):
+    """The filter on Project for one section of the project list."""
+    if section == "all":
+        return true()
+    managed = func.coalesce(Project.project_type, "standard") == MANAGED_FILES
+    return managed if section == MANAGED_FILES else ~managed
+
+
+def _accessible_project_ids(db: Session, caller_member) -> set:
+    """Project IDs the caller may arrange on the Projects page.
+
+    Admins every project; non-admins those with a ProjectMembership row.
+    One query either way — resolving per project id would be N queries. Managed
+    Files projects are not on that page, so they have no place in its order.
     """
-    if is_project_admin(caller_member):
-        return {pid for (pid,) in db.query(Project.project_id).all()}
-    return {
-        pid for (pid,) in
-        db.query(ProjectMembership.project_id)
-        .filter(ProjectMembership.user_id == caller_member.user_id)
-        .all()
-    }
+    query = db.query(Project.project_id)
+    if not is_project_admin(caller_member):
+        query = query.join(ProjectMembership, ProjectMembership.project_id == Project.project_id).filter(
+            ProjectMembership.user_id == caller_member.user_id
+        )
+    return {pid for (pid,) in query.filter(_in_section("workflows")).all()}
 
 
 def _apply_saved_display_order(db: Session, caller_member, rows: list) -> list:
@@ -1451,12 +1588,8 @@ def _effective_pr_state(
     return project.pr_state
 
 
-@router.get("/projects/")
-def get_projects(
-    db: Annotated[Session, Depends(get_db)],
-    account: CurrentAccount,
-):
-    """Fetches all projects, filtered by the session caller's access (#2241)."""
+def _project_list_query(db: Session, caller_member):
+    """Every project the caller may see, with its owner's account type and name and its workflow count."""
     # Build a combined workflow count per project that includes both:
     #   1. Own workflows (ProjectWorkflow rows)
     #   2. Linked reusable workflows (LinkedReusableWorkflow rows for standard projects)
@@ -1476,57 +1609,41 @@ def get_projects(
         .group_by(combined_ids.c.project_id)
         .subquery()
     )
-
-    _, caller_member = _resolve_caller(db, account.github_user)
-
+    query = (
+        db.query(
+            Project,
+            Account.account_type,
+            func.coalesce(workflow_count_subq.c.workflow_count, 0).label("workflow_count"),
+            Account.github_user,
+        )
+        .join(Account, Account.user_id == Project.user_id)
+        .outerjoin(workflow_count_subq, workflow_count_subq.c.project_id == Project.project_id)
+    )
     if caller_member and not is_project_admin(caller_member) and caller_member.workspace_role == "read_only":
         # read_only: the projects the caller is assigned to via ProjectMembership
         # (projects may belong to any account), plus their own - the rule
         # authorization.project_role applies. A full member sees the whole
-        # workspace instead, and falls through to the query below.
-        rows = (
-            db.query(
-                Project,
-                Account.account_type,
-                func.coalesce(workflow_count_subq.c.workflow_count, 0).label("workflow_count"),
-            )
-            .join(Account, Account.user_id == Project.user_id)
-            .outerjoin(workflow_count_subq, workflow_count_subq.c.project_id == Project.project_id)
-            .outerjoin(ProjectMembership, and_(
-                ProjectMembership.project_id == Project.project_id,
-                ProjectMembership.user_id == caller_member.user_id,
-            ))
-            .filter(or_(ProjectMembership.id.isnot(None), Project.user_id == caller_member.user_id))
-            .order_by(Project.updated_at.desc())
-            .all()
-        )
-    else:
-        # Admin, member, or no workspace membership: show all workspace projects.
-        # NOTE: This application uses a single-workspace model — all projects
-        # and members belong to the same workspace, so returning all projects
-        # is correct.  If multi-workspace support is added, this query should
-        # be scoped to the caller's workspace.
-        rows = (
-            db.query(
-                Project,
-                Account.account_type,
-                func.coalesce(workflow_count_subq.c.workflow_count, 0).label("workflow_count"),
-            )
-            .join(Account, Account.user_id == Project.user_id)
-            .outerjoin(workflow_count_subq, workflow_count_subq.c.project_id == Project.project_id)
-            .order_by(Project.updated_at.desc())
-            .all()
-        )
+        # workspace instead.
+        return query.outerjoin(ProjectMembership, and_(
+            ProjectMembership.project_id == Project.project_id,
+            ProjectMembership.user_id == caller_member.user_id,
+        )).filter(or_(ProjectMembership.id.isnot(None), Project.user_id == caller_member.user_id))
+    # Admin, member, or no workspace membership: show all workspace projects.
+    # NOTE: This application uses a single-workspace model — all projects
+    # and members belong to the same workspace, so returning all projects
+    # is correct.  If multi-workspace support is added, this query should
+    # be scoped to the caller's workspace.
+    return query
 
-    # updated_at only decides the *initial* arrangement now (issue #1804). Once a
-    # user has a saved order it wins, so opening or editing a project no longer
-    # moves its card.
-    _initialize_display_order(db, caller_member, rows)
-    rows = _apply_saved_display_order(db, caller_member, rows)
 
-    # For RWX projects, determine if any linked standard project has an open PR
-    # campaign so the project list can show "Under Review" instead of "Synced".
-    rwx_ids_with_open_linked_prs: set = set(
+def _rwx_list_states(db: Session) -> tuple:
+    """The Reusable Workflow Projects whose card state _effective_pr_state promotes.
+
+    Those with a linked Caller project's PR campaign open, so the list shows
+    "Under Review" instead of "Synced", and those with an owned workflow
+    holding local uncommitted changes, so it shows "Draft".
+    """
+    with_open_linked_prs = {
         rwx_id for (rwx_id,) in
         db.query(LinkedReusableWorkflow.rwx_project_id)
         .join(
@@ -1536,11 +1653,8 @@ def get_projects(
         .filter(ProjectPullRequest.pr_state == "open")
         .distinct()
         .all()
-    )
-
-    # For RWX projects, determine if any owned workflow has local uncommitted
-    # changes so the project list shows "Draft" instead of "Synced".
-    rwx_ids_with_draft_workflows: set = set(
+    }
+    with_draft_workflows = {
         pid for (pid,) in
         db.query(ProjectWorkflow.project_id)
         .join(Workflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
@@ -1551,7 +1665,73 @@ def get_projects(
         )
         .distinct()
         .all()
+    }
+    return with_open_linked_prs, with_draft_workflows
+
+
+def _managed_files_fields(db: Session, rows: list) -> dict:
+    """{project_id: what a Managed Files card shows on top of a list entry}, one query per field."""
+    projects = [row[0] for row in rows if row[0].project_type == MANAGED_FILES]
+    if not projects:
+        return {}
+    ids = [project.project_id for project in projects]
+    repo_counts = dict(
+        db.query(ProjectRepo.project_id, func.count(ProjectRepo.repo_id))
+        .filter(ProjectRepo.project_id.in_(ids))
+        .group_by(ProjectRepo.project_id)
+        .all()
     )
+    drifted_repos = deliveries.drifted_repo_names(db, ids)
+    file_paths = {}
+    for kind, definition in FILE_KINDS.items():
+        of_kind = [project.project_id for project in projects if project.file_kind == kind]
+        if of_kind:
+            file_paths.update(definition.file_paths(db, of_kind))
+    return {
+        project.project_id: {
+            "file_kind": project.file_kind,
+            "owner": owner,
+            "repo_count": repo_counts.get(project.project_id, 0),
+            "file_path": file_paths.get(project.project_id),
+            "drifted_repos": drifted_repos.get(project.project_id, []),
+        }
+        for project, _, _, owner in rows
+        if project.project_type == MANAGED_FILES
+    }
+
+
+@router.get("/projects/")
+def get_projects(
+    db: Annotated[Session, Depends(get_db)],
+    account: CurrentAccount,
+    section: Annotated[ProjectListSection, Query(
+        description="workflows: the Projects page (Caller and Reusable Workflow Projects). "
+                    "managed_files: the Managed Files section. all: both.",
+    )] = "workflows",
+):
+    """Fetches the projects of one section, filtered by the session caller's access (#2241).
+
+    Managed Files projects are listed only in their own section (#2367), so the
+    Projects page's list, counts and order never include them.
+    """
+    _, caller_member = _resolve_caller(db, account.github_user)
+    query = _project_list_query(db, caller_member).filter(_in_section(section))
+    if section == MANAGED_FILES:
+        # The section has no saved order. Creation order keeps a card where it
+        # is when its project is edited, as the Projects page's order does (#1804).
+        rows = query.order_by(Project.created_at, Project.project_id).all()
+    else:
+        rows = query.order_by(Project.updated_at.desc()).all()
+
+    if section == "workflows":
+        # updated_at only decides the *initial* arrangement now (issue #1804). Once a
+        # user has a saved order it wins, so opening or editing a project no longer
+        # moves its card.
+        _initialize_display_order(db, caller_member, rows)
+        rows = _apply_saved_display_order(db, caller_member, rows)
+
+    rwx_ids_with_open_linked_prs, rwx_ids_with_draft_workflows = _rwx_list_states(db)
+    managed_files_fields = _managed_files_fields(db, rows)
 
     return [
         {
@@ -1580,9 +1760,11 @@ def get_projects(
             "drift_check_interval_minutes": project.drift_check_interval_minutes,
             "last_modified_by": project.last_modified_by,
             "workflow_count": int(workflow_count or 0),
+            **managed_files_fields.get(project.project_id, {}),
         }
-        for project, owner_account_type, workflow_count in rows
+        for project, owner_account_type, workflow_count, _ in rows
     ]
+
 
 def _get_repo_names(db: Session, project_id: int) -> list:
     """Return the list of repo names associated with a project."""
@@ -1595,40 +1777,90 @@ def _get_repo_names(db: Session, project_id: int) -> list:
     ]
 
 
-def _pending_delivery_repo_names(db: Session, project_id: int, all_workflows: list) -> list:
-    """Project repos that have never received any of the project's workflows.
+def _deliverable_files(db: Session, project: Project, all_workflows: list) -> dict:
+    """The files a repo waits for, as {kind: ids}: the project's workflows, or for
+    a project with none (a CODEOWNERS project in Managed Files), its CODEOWNERS
+    once it has content.
 
-    Drives the "not delivered yet" reminder. A repo qualifies only when *nothing*
-    has landed there: partial delivery is a different situation, and drift already
-    speaks for it.
+    Drift is silent about workflows never delivered to a repo, so this
+    reminder is the only thing that says so. Custom files never count: drift reads one
+    only where the delivery record already has it, so the record cannot tell a
+    repo that holds one from a repo waiting for it. Not a workflow a campaign
+    is removing (pending_delete): the save response would otherwise disagree
+    with the page load, which drops those rows."""
+    workflow_ids = [wf.workflow_id for wf in all_workflows if not wf.pending_delete]
+    if workflow_ids:
+        return {deliveries.WORKFLOW: workflow_ids}
+    codeowners = _project_codeowners(db, project.project_id)
+    return {deliveries.CODEOWNERS: [codeowners.id]} if codeowners is not None and codeowners.content else {}
 
-    Delivery is judged per (workflow, repo) from the delivery record, on any
-    branch of the repo, never from ``workflow_status``, which is per-workflow
-    and would call a repo undelivered while the same workflow is live in every
-    other repo.
 
-    A repo an open PR carries one of the workflows to is excluded: the file is on
-    its way, so the user has already done the thing the reminder would ask for.
-    A CODEOWNERS-only or custom-file-only PR delivers no workflow, so it does
-    not count.
+def _holds_its_file(db: Session, project: Project) -> bool:
+    """Whether *project* is a Managed Files project whose file a campaign can deliver."""
+    return project.project_type == MANAGED_FILES and bool(_deliverable_files(db, project, []))
+
+
+def _project_workflow_refs(db: Session, project_id: int) -> list:
+    """The id and pending_delete of every workflow the project owns: all
+    _deliverable_files reads, so no workflow content is loaded for it."""
+    return (
+        db.query(Workflow.workflow_id, Workflow.pending_delete)
+        .join(ProjectWorkflow, Workflow.workflow_id == ProjectWorkflow.workflow_id)
+        .filter(ProjectWorkflow.project_id == project_id)
+        .all()
+    )
+
+
+def _pending_delivery(db: Session, project: Project, all_workflows: list) -> tuple[bool, list]:
+    """(whether the server can tell, the repos waiting for their first delivery).
+
+    Gated on the project having been drift-checked at least once: before that,
+    an absent delivery record can mean "never looked", not "never delivered",
+    and a project delivered before the record existed would have every repo
+    reported as waiting. Saying nothing until there is evidence matches how
+    drift itself refuses to report a state it could not verify (issue #1815).
+    "Cannot tell" is reported apart from "nothing is waiting": an unchecked
+    project answers [] either way, and a caller reading that as the latter
+    would suppress the delivery prompt for every new project. An RWX project
+    delivers only to its own repository, so it never has repos waiting.
+    """
+    known = (project.project_type or "standard") != "rwx" and project.last_drift_check_at is not None
+    return known, (_pending_delivery_repo_names(db, project, all_workflows) if known else [])
+
+
+def _pending_delivery_repo_names(db: Session, project: Project, all_workflows: list) -> list:
+    """Project repos that have never received any of the project's files.
+
+    Drives the "not delivered yet" reminder, and lets a synced project start a
+    campaign for those repos. A repo qualifies only when *nothing* has landed
+    there: partial delivery is a different situation, and drift already speaks
+    for it.
+
+    Delivery is judged per (file, repo) from the delivery record, on any branch
+    of the repo, never from ``workflow_status``, which is per-workflow and would
+    call a repo undelivered while the same workflow is live in every other repo.
+
+    What counts is the project's workflows, or for a project with none, its
+    CODEOWNERS (_deliverable_files), so a CODEOWNERS project in Managed Files
+    is reminded too. A repo an open PR carries one of them to is
+    excluded: the file is on its way, so the user has already done the thing
+    the reminder would ask for.
 
     Reusable workflows count too. Both callers skip RWX projects, and a standard
     project's own reusable workflows are delivered to, and drift-checked in, its
-    repositories like the regular ones (#2085, #2309). A pending_delete row does
-    not: a campaign is removing it, and the save response would otherwise
-    disagree with the page load, which drops those rows.
+    repositories like the regular ones (#2085, #2309).
     """
-    workflow_ids = [wf.workflow_id for wf in all_workflows if not wf.pending_delete]
-    if not workflow_ids:
+    files = _deliverable_files(db, project, all_workflows)
+    if not files:
         return []
 
-    reached = deliveries.reached_repo_ids(db, workflow_ids)
+    reached = deliveries.reached_repo_ids(db, files)
     return sorted(
         repo_name
         for (repo_id, repo_name) in
         db.query(Repo.repo_id, Repo.repo_name)
         .join(ProjectRepo, ProjectRepo.repo_id == Repo.repo_id)
-        .filter(ProjectRepo.project_id == project_id)
+        .filter(ProjectRepo.project_id == project.project_id)
         .all()
         if repo_id not in reached
     )
@@ -2047,6 +2279,7 @@ def _build_project_backup_payload(db: Session, project: Project, exported_by: st
             "project_name": project.project_name,
             "project_code": project.project_code,
             "project_type": project.project_type or "standard",
+            "file_kind": project.file_kind,
             "branch_regex": _normalize_optional_text(project.branch_regex),
             "branch_option": _migrate_branch_option(project.branch_option),
             "branch_max_age_days": project.branch_max_age_days or 30,
@@ -2168,17 +2401,7 @@ def get_project(
         row.custom_file_id for row in deliveries.drifted_rows(db, project.project_id, deliveries.CUSTOM_FILE)
     })
 
-    # Repos still waiting for their first delivery. Gated on the project having
-    # been drift-checked at least once: before that, an absent delivery record
-    # can mean "never looked", not "never delivered", and a project delivered
-    # before the record existed would have every repo reported as
-    # waiting. Saying nothing until there is evidence matches how drift itself
-    # refuses to report a state it could not verify (issue #1815).
-    pending_delivery_repos = (
-        _pending_delivery_repo_names(db, project.project_id, all_workflows)
-        if project_type != "rwx" and project.last_drift_check_at is not None
-        else []
-    )
+    _, pending_delivery_repos = _pending_delivery(db, project, all_workflows)
 
     return {
         "project_id": project.project_id,
@@ -2197,6 +2420,7 @@ def get_project(
         "use_prefix": project.use_prefix,
         "pr_state": project.pr_state,
         "project_type": project_type,
+        "file_kind": project.file_kind,
         "repository_visibility_scope": project.repository_visibility_scope or "public",
         "project_color": project.project_color,
         "validation_repo": _repo_name_for_id(db, project.validation_repo_id),
@@ -2361,7 +2585,7 @@ def get_rwx_workflows(
     return result
 
 
-@router.post("/projects/{project_name}/linked-reusable-workflows", responses=_responses(401, 403, 404, 409, 422, 500))
+@router.post("/projects/{project_name}/linked-reusable-workflows", responses=_responses(400, 401, 403, 404, 409, 422, 500))
 def link_reusable_workflow(
     project_name: str,
     payload: LinkWorkflowSchema,
@@ -2381,6 +2605,7 @@ def link_reusable_workflow(
         # changes what its campaigns deliver, so it needs write access to it —
         # the same gate its unlink counterpart carries.
         _require_project_editor(db, account, standard_project)
+        refuse_unless_accepted(standard_project, "linked_reusable_workflows")
 
         rwx_project = _find_project_by_id(db, payload.rwx_project_id, caller_member, owner_name)
         if not rwx_project or rwx_project.project_type != "rwx":
@@ -2760,6 +2985,23 @@ def _validate_repo_branch_config(payload: RepoBranchConfigSchema) -> None:
                 status_code=400,
                 detail="branch_max_age_days must be between 1 and 30",
             )
+
+
+@router.get("/projects/{project_id}/pending-delivery", responses=_responses(403, 404))
+def get_pending_delivery(
+    project_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    account: CurrentAccount,
+):
+    """The repos still waiting for their first delivery, as the project load reports them.
+
+    Re-read after a campaign, a push onto its pull request, a CODEOWNERS save
+    or a pull request settling: each can change which repos are waiting
+    without its own response saying so. Database only.
+    """
+    project = _require_project_access(db, project_id, account)
+    known, repos = _pending_delivery(db, project, _project_workflow_refs(db, project.project_id))
+    return {"pending_delivery_repos": repos, "pending_delivery_known": known}
 
 
 @router.get("/projects/{project_id}/repo-branch-configs", responses=_responses(400, 403, 404))

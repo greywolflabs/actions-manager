@@ -424,7 +424,9 @@ def test_removing_repo_from_project_drops_override(db_state):
         db.commit()
 
         # Remove repo1 from selection — only repo2 remains
-        _process_project_repos(db, pid, [db_state["repo2"].repo_name])
+        _process_project_repos(
+            db, db.get(Project, pid), [db_state["repo2"].repo_name], db.query(Account).filter_by(github_user="alice").one(),
+        )
         db.commit()
 
         rows = db.query(ProjectRepo).filter_by(project_id=pid).all()
@@ -452,8 +454,9 @@ def test_existing_overrides_preserved_when_repos_resaved(db_state):
 
         # Re-save the same selection
         _process_project_repos(
-            db, pid,
+            db, db.get(Project, pid),
             [db_state["repo1"].repo_name, db_state["repo2"].repo_name],
+            db.query(Account).filter_by(github_user="alice").one(),
         )
         db.commit()
 

@@ -24,10 +24,10 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Iterable, NamedTuple, Optional
 
-from sqlalchemy import false
+from sqlalchemy import false, or_
 from sqlalchemy.orm import Session
 
-from models import Codeowners, CustomFile, FileDelivery, ProjectPullRequest, ProjectWorkflow, Repo
+from models import Codeowners, CustomFile, FileDelivery, ProjectPullRequest, ProjectRepo, ProjectWorkflow, Repo
 
 WORKFLOW = "workflow"
 CUSTOM_FILE = "custom_file"
@@ -428,11 +428,12 @@ def workflow_ids_with_open_pending(db: Session, workflow_ids) -> set:
     return {wid for (wid,) in _pending(query).with_entities(FileDelivery.workflow_id).distinct()}
 
 
-def reached_repo_ids(db: Session, workflow_ids) -> set:
-    """Repos where any of *workflow_ids* is delivered, or carried by an open PR, on any branch."""
-    if not workflow_ids:
+def reached_repo_ids(db: Session, files: dict) -> set:
+    """Repos where any of *files* ({kind: file ids}) is delivered, or carried by an open PR, on any branch."""
+    matches = [getattr(FileDelivery, _FILE_COLUMN[kind]).in_(list(ids)) for kind, ids in files.items() if ids]
+    if not matches:
         return set()
-    query = db.query(FileDelivery).filter(FileDelivery.workflow_id.in_(list(workflow_ids)))
+    query = db.query(FileDelivery).filter(or_(*matches))
     delivered = {rid for (rid,) in _delivered(query).with_entities(FileDelivery.repo_id).distinct()}
     pending = {rid for (rid,) in _pending(query).with_entities(FileDelivery.repo_id).distinct()}
     return delivered | pending
@@ -501,6 +502,27 @@ def drifted_rows(db: Session, project_id: int, kind=None, file_id=None) -> list:
         column = getattr(FileDelivery, _FILE_COLUMN[kind])
         query = query.filter(column.isnot(None) if file_id is None else column == file_id)
     return query.join(Repo, Repo.repo_id == FileDelivery.repo_id).order_by(Repo.repo_name, FileDelivery.branch).all()
+
+
+def drifted_repo_names(db: Session, project_ids: list) -> dict:
+    """{project_id: the repositories, by name, where the last check found any of its files drifted}.
+
+    Only repositories still in the project: a removed one keeps its drift row,
+    which no later check of the project visits again.
+    """
+    rows = (
+        db.query(FileDelivery.project_id, Repo.repo_name)
+        .join(Repo, Repo.repo_id == FileDelivery.repo_id)
+        .join(ProjectRepo, (ProjectRepo.project_id == FileDelivery.project_id)
+              & (ProjectRepo.repo_id == FileDelivery.repo_id))
+        .filter(FileDelivery.project_id.in_(project_ids), FileDelivery.has_drift.is_(True))
+        .distinct()
+        .order_by(Repo.repo_name)
+    )
+    names = {}
+    for project_id, repo_name in rows:
+        names.setdefault(project_id, []).append(repo_name)
+    return names
 
 
 def drift_count(db: Session, project_id: int) -> int:

@@ -1,9 +1,9 @@
+/* Sits below the app header, beside the main content (see .app-body). */
 .sidebar {
-  position: fixed;
-  left: 0;
-  top: 0;
+  position: relative;
+  flex-shrink: 0;
   width: 280px;
-  height: 100vh;
+  height: 100%;
   background-color: var(--sidebar-color);
   border-right: 1px solid var(--border-color);
   display: flex;
@@ -17,84 +17,101 @@
   width: 80px;
 }
 
+/* No side padding: the toggle strip spans the sidebar, and the project boxes
+   below set their own inset. */
 .sidebar-header {
-  padding: var(--spacing-md) var(--spacing-md);
-  transition: padding 0.3s ease;
+  padding: 0 0 var(--spacing-md);
 }
 
-.sidebar.collapsed .sidebar-header {
-  padding: var(--spacing-md) var(--spacing-xs);
-}
-
-.sidebar-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--spacing-sm);
-  margin: 0 0 var(--spacing-md) 0;
-}
-
-.sidebar.collapsed .sidebar-title-row {
-  gap: var(--spacing-xs);
-  margin: 0 0 var(--spacing-sm) 0;
-}
-
-.sidebar-title {
-  color: var(--text-primary);
-  font-size: var(--font-size-xl);
-  font-weight: 700;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  transition: font-size 0.3s ease;
-}
-
-.sidebar.collapsed .sidebar-title {
-  font-size: var(--font-size-lg);
-}
-
-/* Main sidebar collapse/expand toggle — small ghost button in the header, next to the logo */
+/* Collapse/expand toggle: the sidebar's top strip, a soft glow fading in from
+   the sidebar's edge with one chevron. */
 .sidebar-collapse-button {
-  flex: 0 0 auto;
-  width: 1.75rem;
-  height: 1.75rem;
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
+  justify-content: flex-end;
+  width: 100%;
+  height: 2.5rem;
+  margin: 0 0 var(--spacing-sm);
+  padding: 0 0.875rem;
+  border: none;
+  border-radius: 0;
+  background:
+    linear-gradient(to left, var(--sidebar-toggle-line), transparent 80%) bottom / 100% 1px no-repeat,
+    linear-gradient(to left, var(--sidebar-toggle-glow), transparent 75%);
   color: var(--sidebar-item-color);
   cursor: pointer;
-  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  transition: color 0.2s ease;
 }
 
-.sidebar-collapse-button:hover {
-  background-color: var(--sidebar-item-hover-background-color, var(--sidebar-item-active-background-color));
-  color: var(--text-primary);
+/* The deeper glow on hover and focus. A gradient can't transition, so it fades
+   in as a layer of its own. */
+.sidebar-collapse-button::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to left, var(--sidebar-toggle-glow-hover), transparent 90%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+}
+
+.sidebar-collapse-button:hover,
+.sidebar-collapse-button:focus-visible {
+  color: var(--sidebar-toggle-hover-color);
+}
+
+.sidebar-collapse-button:hover::before,
+.sidebar-collapse-button:focus-visible::before {
+  opacity: 1;
 }
 
 .sidebar-collapse-button:focus-visible {
   outline: 2px solid var(--primary-color);
-  outline-offset: 1px;
+  outline-offset: -2px;
 }
 
 .sidebar-collapse-icon {
+  position: relative;
   width: 1rem;
   height: 1rem;
+  transition: transform 0.3s ease, translate 0.25s ease;
+}
+
+.sidebar-collapse-button:hover .sidebar-collapse-icon {
+  translate: -3px 0;
 }
 
 .sidebar.collapsed .sidebar-collapse-button {
-  width: 1.5rem;
-  height: 1.5rem;
+  justify-content: center;
+  padding: 0;
+  background:
+    linear-gradient(to right, transparent, var(--sidebar-toggle-line), transparent) bottom / 100% 1px no-repeat,
+    radial-gradient(70% 140% at 50% 50%, var(--sidebar-toggle-glow), transparent);
+}
+
+.sidebar.collapsed .sidebar-collapse-button::before {
+  background: radial-gradient(70% 140% at 50% 50%, var(--sidebar-toggle-glow-hover), transparent);
 }
 
 .sidebar.collapsed .sidebar-collapse-icon {
-  width: 0.875rem;
-  height: 0.875rem;
+  transform: scaleX(-1);
+}
+
+.sidebar.collapsed .sidebar-collapse-button:hover .sidebar-collapse-icon {
+  translate: 3px 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-collapse-button,
+  .sidebar-collapse-button::before,
+  .sidebar-collapse-icon {
+    transition: none;
+  }
 }
 
 .sidebar-project {
+  margin: 0 var(--spacing-md);
   background: var(--sidebar-project-background);
   padding: var(--spacing-sm) var(--spacing-md);
   border-radius: var(--radius-md);
@@ -103,6 +120,7 @@
 }
 
 .sidebar-project-collapsed {
+  margin: 0 var(--spacing-xs);
   background: var(--sidebar-project-background);
   padding: var(--spacing-xs);
   border-radius: var(--radius-sm);
@@ -426,7 +444,13 @@ body.dark-theme .sidebar-header {
 
 /* Mobile responsive */
 @media (max-width: 768px) {
+  /* A drawer over the content, still below the app header. */
   .sidebar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    height: auto;
     width: 260px;
     transform: translateX(-100%);
     transition: transform 0.3s ease, width 0.3s ease;
@@ -439,10 +463,10 @@ body.dark-theme .sidebar-header {
   .sidebar.mobile-open {
     transform: translateX(0);
   }
-  
+
+  /* A 44px touch target */
   .sidebar-collapse-button {
-    width: 1.5rem;
-    height: 1.5rem;
+    height: 2.75rem;
   }
 }
 
@@ -507,7 +531,7 @@ body.dark-theme .sidebar-header {
 
   .sidebar-mobile-backdrop {
     display: block;
-    position: fixed;
+    position: absolute;
     inset: 0;
     background: rgba(0, 0, 0, 0.4);
     z-index: 999;

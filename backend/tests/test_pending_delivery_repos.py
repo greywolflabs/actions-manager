@@ -2,11 +2,11 @@
 `pending_delivery_repos` on GET /api/projects/{name}.
 
 Drives the reminder that a repository added to a project hasn't received the
-project's workflows yet. The rule it has to get right is the same one issue
-#1981 turned on: delivery is per (workflow, repo), so it is answered from
-the delivery record and never from `workflow_status`, which is per-workflow
-and would call a brand-new repo delivered the moment any other repo had the
-file.
+project's files yet: its workflows, or for a project with none, its CODEOWNERS. The
+rule it has to get right is the same one issue #1981 turned on: delivery is
+per (file, repo), so it is answered from the delivery record and never from
+`workflow_status`, which is per-workflow and would call a brand-new repo
+delivered the moment any other repo had the file.
 """
 import sys
 import os
@@ -23,6 +23,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from models import (
     Base,
     Account,
+    Codeowners,
+    CustomFile,
     Project,
     Workflow,
     ProjectWorkflow,
@@ -81,8 +83,10 @@ def _build(
     confirm_delivered_repo=True,
     reusable_only=False,
     project_type="standard",
+    with_workflow=True,
 ):
-    """A project with two repos; only DELIVERED_REPO has confirmed delivery."""
+    """A project with two repos; only DELIVERED_REPO has confirmed delivery
+    (of its workflow, when it has one)."""
     db = TestingSessionLocal()
     try:
         account = Account(
@@ -109,6 +113,10 @@ def _build(
             db.flush()
             db.add(ProjectRepo(project_id=project.project_id, repo_id=repo.repo_id))
             repos[name] = repo
+
+        if not with_workflow:
+            db.commit()
+            return project.project_id, None, repos
 
         wf = Workflow(
             workflow_name="ci.yml",
@@ -300,11 +308,12 @@ def test_the_save_response_agrees_with_the_next_load(client):
     assert saved.json()["pending_delivery_repos"] == _pending(client)
 
 
-def test_an_open_pr_without_workflows_does_not_pause_the_reminder(client):
-    """A CODEOWNERS-only or custom-file-only campaign delivers no workflow.
+def test_an_open_pr_carrying_none_of_the_files_does_not_pause_the_reminder(client):
+    """Only what the delivery record says the PR carries counts.
 
-    It still opens a PR for the repo, so suppressing on the PR alone would hide
-    the reminder for the life of a PR that cannot satisfy it.
+    A PR row for the repo alone, with nothing recorded as on its way, cannot
+    satisfy the reminder, so suppressing on the PR alone would hide it for
+    the life of that PR.
     """
     project_id, _, _ = _build()
     db = TestingSessionLocal()
@@ -426,21 +435,133 @@ def test_an_open_pr_to_one_branch_of_a_repo_pauses_its_reminder(client):
     assert _pending(client) == []
 
 
-def test_a_repo_that_only_received_a_direct_push_is_delivered(client):
-    """No PR and no drift check ever saw it: the push itself is the record."""
-    project_id, workflow_id, _ = _build()
+def _add_codeowners(project_id, content="* @acme/owners\n"):
     db = TestingSessionLocal()
     try:
-        project = db.get(Project, project_id)
-        workflow = db.get(Workflow, workflow_id)
-        with mock.patch("workflows._direct_push_workflow_to_branch",
-                        return_value={"status_code": 201, "sha": "pushed"}):
-            entry = workflows._direct_sync_to_branch(
-                db, project, workflow, NEW_REPO, "main", ".github/workflows/ci.yml",
-                workflow.workflow_yaml, "sync", {}, TEST_GITHUB_USER,
-            )
-        assert entry["status"] == "synced"
+        record = Codeowners(project_id=project_id, content=content, status="committed_locally")
+        db.add(record)
+        db.commit()
+        return record.id
+    finally:
+        db.close()
+
+
+def _add_custom_file(project_id):
+    db = TestingSessionLocal()
+    try:
+        custom_file = CustomFile(project_id=project_id, file_path=".github/scripts/build.sh",
+                                 file_content="echo build\n", file_status="committed_locally")
+        db.add(custom_file)
+        db.commit()
+        return custom_file.id
+    finally:
+        db.close()
+
+
+def _deliver(model, file_id, repo_name):
+    db = TestingSessionLocal()
+    try:
+        record_delivered(db, db.get(model, file_id), repo_name, "main")
+    finally:
+        db.close()
+
+
+def test_a_project_without_workflows_waits_on_its_codeowners(client):
+    """A CODEOWNERS-only project has something to deliver, so a repo it never
+    reached is waiting just as it would be for a workflow."""
+    project_id, _, _ = _build(with_workflow=False)
+    _deliver(Codeowners, _add_codeowners(project_id), DELIVERED_REPO)
+
+    assert _pending(client) == [NEW_REPO]
+
+
+def test_custom_files_alone_leave_nothing_waiting(client):
+    """Drift reads a custom file only where the record has it, so the record
+    cannot tell a repo that already holds one from one waiting for it."""
+    project_id, _, _ = _build(with_workflow=False)
+    _deliver(CustomFile, _add_custom_file(project_id), DELIVERED_REPO)
+
+    assert _pending(client) == []
+
+
+def test_a_custom_file_does_not_stand_in_for_the_workflows(client):
+    """A project with workflows is for its workflows: a repo that got only a
+    custom file still waits for them, and drift says nothing about it."""
+    project_id, _, _ = _build()
+    _deliver(CustomFile, _add_custom_file(project_id), NEW_REPO)
+
+    assert _pending(client) == [NEW_REPO]
+
+
+def test_an_open_pr_carrying_codeowners_pauses_the_reminder(client):
+    project_id, _, _ = _build(with_workflow=False)
+    codeowners_id = _add_codeowners(project_id)
+    _deliver(Codeowners, codeowners_id, DELIVERED_REPO)
+    db = TestingSessionLocal()
+    try:
+        pr = ProjectPullRequest(
+            project_id=project_id, repo_name=NEW_REPO, pr_number=8,
+            pr_url=f"https://github.com/{NEW_REPO}/pull/8", pr_state="open",
+            branch_name="actions-manager/CALL/checkout-web/abc-main", target_branch="main",
+        )
+        db.add(pr)
+        db.flush()
+        record_pr_carries(db, pr, db.get(Codeowners, codeowners_id))
     finally:
         db.close()
 
     assert _pending(client) == []
+
+
+def test_an_empty_codeowners_is_nothing_to_deliver(client):
+    """A campaign skips a CODEOWNERS with no content, so it cannot leave a
+    repo waiting for it."""
+    project_id, _, _ = _build(with_workflow=False)
+    _add_codeowners(project_id, content="")
+
+    assert _pending(client) == []
+
+
+def _pending_from_endpoint(client, project_id):
+    response = client.get(f"/api/projects/{project_id}/pending-delivery")
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_the_pending_delivery_endpoint_agrees_with_the_load(client):
+    """The page re-reads it after a custom file or CODEOWNERS save, so it must
+    answer exactly what the next load would."""
+    project_id, _, _ = _build(with_workflow=False)
+    _deliver(Codeowners, _add_codeowners(project_id), DELIVERED_REPO)
+
+    body = _pending_from_endpoint(client, project_id)
+
+    assert body == {"pending_delivery_repos": _pending(client), "pending_delivery_known": True}
+
+
+def test_a_projects_first_codeowners_starts_the_reminder(client):
+    """Saving the first CODEOWNERS is what makes repos wait, and the save itself
+    returns nothing about it, hence the endpoint."""
+    project_id, _, _ = _build(with_workflow=False)
+    assert _pending_from_endpoint(client, project_id)["pending_delivery_repos"] == []
+
+    _add_codeowners(project_id)
+
+    assert _pending_from_endpoint(client, project_id)["pending_delivery_repos"] == sorted([DELIVERED_REPO, NEW_REPO])
+
+
+def test_the_pending_delivery_endpoint_says_when_it_cannot_tell(client):
+    project_id, _, _ = _build(checked=False, with_workflow=False)
+    _add_codeowners(project_id)
+
+    body = _pending_from_endpoint(client, project_id)
+
+    assert body == {"pending_delivery_repos": [], "pending_delivery_known": False}
+
+
+def test_the_pending_delivery_endpoint_hides_an_unknown_project(client):
+    project_id, _, _ = _build(with_workflow=False)
+
+    response = client.get(f"/api/projects/{project_id + 1}/pending-delivery")
+
+    assert response.status_code == 404

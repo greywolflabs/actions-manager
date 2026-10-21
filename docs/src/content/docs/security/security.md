@@ -53,7 +53,7 @@ Operators are responsible for securing their own deployment. At minimum:
 
 ### Operational Security
 - Review all generated or edited workflow changes before merging or applying them
-- Prefer a pull request when resolving drift or removing a file: **Restore Directly** and **Commit directly to the target branch** change the branch at once, with no review
+- Prefer a pull request when removing a file: **Commit directly to the target branch** changes the branch at once, with no review. Resolving drift always opens pull requests
 - Keep the container image updated and pin image tags for controlled upgrades
 - Back up the SQLite volume or PostgreSQL database before upgrades
 - Disable debug, mock, and stub settings for any shared or exposed deployment

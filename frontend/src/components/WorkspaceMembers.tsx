@@ -99,7 +99,7 @@ const WorkspaceMembers: React.FC<WorkspaceMembersProps> = ({
   }
 
   return (
-    <div className="w-full max-w-3xl mx-auto">
+    <div className="w-full max-w-3xl">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h2 className="text-xl font-semibold text-text-primary dark:text-text-primary-dark">

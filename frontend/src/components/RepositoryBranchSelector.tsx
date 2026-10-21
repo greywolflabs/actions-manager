@@ -1,4 +1,6 @@
 import React, { useMemo, useState } from "react";
+import { Lock, Search } from "lucide-react";
+import { cn } from "../lib/utils";
 
 /**
  * RepositoryBranchSelector — the unified, horizontal repository selection UI
@@ -84,9 +86,22 @@ export interface RepositoryBranchSelectorProps {
    * list doesn't make the new list look empty.
    */
   resetSearchKey?: string | number;
+  /**
+   * Repositories that can't be selected, with the reason shown on their row
+   * (a Managed Files repository another project of the kind holds). One
+   * already selected can still be removed.
+   */
+  unavailableRepos?: ReadonlyMap<string, string>;
+  /**
+   * Only the searchable checkbox list, with taller rows: no Selected panel and
+   * no branch configuration. For a dialog that shows its own selection count.
+   */
+  compact?: boolean;
   /** Test id forwarded to the root container. */
   "data-testid"?: string;
 }
+
+const NO_UNAVAILABLE_REPOS: ReadonlyMap<string, string> = new Map();
 
 const formatVisibilityHelper = (scope?: "public" | "private"): string => {
   if (scope === "private") return "Showing private repositories only.";
@@ -168,6 +183,193 @@ const PendingDeliveryBadge: React.FC = () => (
 const repoKey = (r: RepositoryBranchSelectorRepo): string =>
   r.full_name || r.name;
 
+/** Why a repository can't be picked, with a lock so it never reads as merely faint. */
+const UnavailableBadge: React.FC<Readonly<{ id: string; reason: string }>> = ({ id, reason }) => (
+  <span
+    id={id}
+    className="inline-flex shrink-0 items-center gap-1 rounded-full border border-slate-300 bg-slate-200/80 px-2 py-0.5 text-[11px] font-medium text-slate-700 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200"
+    data-testid="unavailable-repo-badge"
+  >
+    <Lock className="h-3 w-3" aria-hidden="true" />
+    {reason}
+  </span>
+);
+
+const rowStateClass = (locked: boolean, isSelected: boolean): string => {
+  if (locked) return "cursor-not-allowed border-transparent bg-slate-100 dark:bg-slate-800/70";
+  if (isSelected) return "cursor-pointer border-blue-500 bg-blue-500/10 dark:bg-blue-500/15";
+  return "cursor-pointer border-transparent hover:bg-slate-50 dark:hover:bg-slate-700/40";
+};
+
+interface AvailableRepoRowProps {
+  readonly repo: RepositoryBranchSelectorRepo;
+  readonly isSelected: boolean;
+  /** Set when the repository can't be picked. */
+  readonly unavailableReason?: string;
+  readonly readOnly: boolean;
+  readonly compact: boolean;
+  readonly onToggle: (repo: RepositoryBranchSelectorRepo) => void;
+}
+
+const AvailableRepoRow: React.FC<AvailableRepoRowProps> = ({
+  repo,
+  isSelected,
+  unavailableReason,
+  readOnly,
+  compact,
+  onToggle,
+}) => {
+  const key = repoKey(repo);
+  const locked = unavailableReason !== undefined && !isSelected;
+  return (
+    <li>
+      <label
+        data-testid={`available-repo-${key}`}
+        data-selected={isSelected ? "true" : "false"}
+        data-unavailable={locked ? "true" : "false"}
+        className={cn(
+          "flex min-w-0 items-center gap-3 border-l-2 px-3 text-sm text-slate-800 dark:text-slate-100",
+          compact ? "min-h-11 py-2.5" : "py-2",
+          rowStateClass(locked, isSelected),
+        )}
+      >
+        <input
+          type="checkbox"
+          checked={isSelected}
+          disabled={readOnly || locked}
+          onChange={() => onToggle(repo)}
+          aria-label={`Select ${repo.full_name || repo.name}`}
+          // The label replaces the row's text, so the reason a locked row can't be picked is read from the badge.
+          aria-describedby={unavailableReason === undefined ? undefined : `${key}-unavailable`}
+          data-testid={`available-checkbox-${key}`}
+          className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-900"
+        />
+        {!compact && <RepoAvatar label={repo.owner || repo.full_name || repo.name} />}
+        <span className={cn("min-w-0 flex-1 truncate font-medium", locked && "text-slate-500 dark:text-slate-400")}>
+          {repo.full_name || repo.name}
+        </span>
+        {unavailableReason !== undefined && <UnavailableBadge id={`${key}-unavailable`} reason={unavailableReason} />}
+        {!compact && <VisibilityBadge isPrivate={!!repo.private} />}
+        {!compact && <AccountTypeBadge ownerType={repo.owner_type} />}
+      </label>
+    </li>
+  );
+};
+
+interface AvailableRepositoryListProps {
+  readonly repositories: RepositoryBranchSelectorRepo[];
+  readonly searchTerm: string;
+  readonly onSearchTermChange: (term: string) => void;
+  readonly searchPlaceholder: string;
+  readonly selected: ReadonlySet<string>;
+  readonly unavailable: ReadonlyMap<string, string>;
+  readonly loading: boolean;
+  readonly error: string | null;
+  readonly readOnly: boolean;
+  readonly compact: boolean;
+  readonly onToggle: (repo: RepositoryBranchSelectorRepo) => void;
+}
+
+/** The search box and the checkbox list of repositories to pick from. */
+const AvailableRepositoryList: React.FC<AvailableRepositoryListProps> = ({
+  repositories,
+  searchTerm,
+  onSearchTermChange,
+  searchPlaceholder,
+  selected,
+  unavailable,
+  loading,
+  error,
+  readOnly,
+  compact,
+  onToggle,
+}) => {
+  const renderBody = (): React.ReactNode => {
+    if (loading) {
+      return (
+        <div
+          className="px-3 py-6 text-center text-xs text-slate-500 dark:text-slate-400"
+          data-testid="available-loading"
+        >
+          Loading repositories…
+        </div>
+      );
+    }
+    if (error) {
+      return (
+        <div
+          role="alert"
+          className="px-3 py-6 text-center text-xs text-red-600 dark:text-red-300"
+          data-testid="available-error"
+        >
+          {error}
+        </div>
+      );
+    }
+    if (repositories.length === 0) {
+      return (
+        <div
+          className="px-3 py-6 text-center text-xs text-slate-500 dark:text-slate-400"
+          data-testid="available-empty"
+        >
+          {searchTerm ? "No repositories match your search." : "No repositories available."}
+        </div>
+      );
+    }
+    return (
+      <ul className="divide-y divide-slate-200 dark:divide-slate-700">
+        {repositories.map((repo) => (
+          <AvailableRepoRow
+            key={repo.id ?? repoKey(repo)}
+            repo={repo}
+            isSelected={selected.has(repoKey(repo))}
+            unavailableReason={unavailable.get(repoKey(repo))}
+            readOnly={readOnly}
+            compact={compact}
+            onToggle={onToggle}
+          />
+        ))}
+      </ul>
+    );
+  };
+
+  return (
+    <>
+      <div className="relative mb-3">
+        <label htmlFor="repo-branch-selector-search" className="sr-only">
+          Search repositories
+        </label>
+        {compact && (
+          <Search
+            className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
+            aria-hidden="true"
+          />
+        )}
+        <input
+          id="repo-branch-selector-search"
+          type="text"
+          placeholder={searchPlaceholder}
+          value={searchTerm}
+          onChange={(e) => onSearchTermChange(e.target.value)}
+          disabled={readOnly}
+          data-testid="available-search-input"
+          className={cn(
+            "w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500",
+            compact && "pl-9",
+          )}
+        />
+      </div>
+
+      <div
+        className="max-h-96 overflow-x-hidden overflow-y-auto rounded-md border border-slate-200 dark:border-slate-700"
+        data-testid="available-repositories-list"
+      >
+        {renderBody()}
+      </div>
+    </>
+  );
+};
+
 const RepositoryBranchSelector: React.FC<RepositoryBranchSelectorProps> = ({
   availableRepositories,
   selectedRepositoryNames,
@@ -188,6 +390,8 @@ const RepositoryBranchSelector: React.FC<RepositoryBranchSelectorProps> = ({
   readOnly = false,
   singleSelect = false,
   resetSearchKey,
+  unavailableRepos = NO_UNAVAILABLE_REPOS,
+  compact = false,
   "data-testid": dataTestId = "repository-branch-selector",
 }) => {
   const [searchTerm, setSearchTerm] = useState("");
@@ -267,6 +471,30 @@ const RepositoryBranchSelector: React.FC<RepositoryBranchSelectorProps> = ({
   };
 
   const helperLine = availableHelperText ?? formatVisibilityHelper(visibilityScope);
+
+  const availableList = (
+    <AvailableRepositoryList
+      repositories={filteredAvailable}
+      searchTerm={searchTerm}
+      onSearchTermChange={setSearchTerm}
+      searchPlaceholder={searchPlaceholder}
+      selected={selectedSet}
+      unavailable={unavailableRepos}
+      loading={loading}
+      error={error}
+      readOnly={readOnly}
+      compact={compact}
+      onToggle={handleToggleAvailable}
+    />
+  );
+
+  if (compact) {
+    return (
+      <div data-testid={dataTestId} className="flex flex-col">
+        {availableList}
+      </div>
+    );
+  }
 
   const branchCount =
     typeof branchConfigCount === "number"
@@ -421,89 +649,7 @@ const RepositoryBranchSelector: React.FC<RepositoryBranchSelectorProps> = ({
             )}
           </header>
 
-          <div className="mb-3">
-            <label htmlFor="repo-branch-selector-search" className="sr-only">
-              Search repositories
-            </label>
-            <input
-              id="repo-branch-selector-search"
-              type="text"
-              placeholder={searchPlaceholder}
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              disabled={readOnly}
-              data-testid="available-search-input"
-              className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
-            />
-          </div>
-
-          <div
-            className="max-h-96 overflow-x-hidden overflow-y-auto rounded-md border border-slate-200 dark:border-slate-700"
-            data-testid="available-repositories-list"
-          >
-            {loading ? (
-              <div
-                className="px-3 py-6 text-center text-xs text-slate-500 dark:text-slate-400"
-                data-testid="available-loading"
-              >
-                Loading repositories…
-              </div>
-            ) : error ? (
-              <div
-                role="alert"
-                className="px-3 py-6 text-center text-xs text-red-600 dark:text-red-300"
-                data-testid="available-error"
-              >
-                {error}
-              </div>
-            ) : filteredAvailable.length === 0 ? (
-              <div
-                className="px-3 py-6 text-center text-xs text-slate-500 dark:text-slate-400"
-                data-testid="available-empty"
-              >
-                {searchTerm
-                  ? "No repositories match your search."
-                  : "No repositories available."}
-              </div>
-            ) : (
-              <ul className="divide-y divide-slate-200 dark:divide-slate-700">
-                {filteredAvailable.map((repo) => {
-                  const key = repoKey(repo);
-                  const isSelected = selectedSet.has(key);
-                  return (
-                    <li key={repo.id ?? key}>
-                      <label
-                        data-testid={`available-repo-${key}`}
-                        data-selected={isSelected ? "true" : "false"}
-                        className={
-                          (isSelected
-                            ? "border-l-2 border-blue-500 bg-blue-500/10 dark:bg-blue-500/15 "
-                            : "border-l-2 border-transparent hover:bg-slate-50 dark:hover:bg-slate-700/40 ") +
-                          "flex min-w-0 cursor-pointer items-center gap-3 px-3 py-2 text-sm text-slate-800 dark:text-slate-100"
-                        }
-                      >
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          disabled={readOnly}
-                          onChange={() => handleToggleAvailable(repo)}
-                          aria-label={`Select ${repo.full_name || repo.name}`}
-                          data-testid={`available-checkbox-${key}`}
-                          className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-900"
-                        />
-                        <RepoAvatar label={repo.owner || repo.full_name || repo.name} />
-                        <span className="min-w-0 flex-1 truncate font-medium">
-                          {repo.full_name || repo.name}
-                        </span>
-                        <VisibilityBadge isPrivate={!!repo.private} />
-                        <AccountTypeBadge ownerType={repo.owner_type} />
-                      </label>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </div>
+          {availableList}
         </section>
       </div>
 

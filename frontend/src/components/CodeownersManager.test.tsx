@@ -75,8 +75,10 @@ function Harness(props: Readonly<{
   drift?: CodeownersDriftDetail[];
   isReadOnly?: boolean;
   repos?: string[];
+  paths?: string[];
   onSaved?: (record: api.CodeownersRecord, prState?: string) => void;
   onReposDelivered?: (repos: string[]) => void;
+  onKeepActionsManagerVersion?: (repos: string[]) => void;
 }>) {
   const [codeowners, setCodeowners] = useState<api.CodeownersRecord | null>(props.initial ?? null);
   const [drift, setDrift] = useState<CodeownersDriftDetail[]>(props.drift ?? []);
@@ -96,6 +98,8 @@ function Harness(props: Readonly<{
           props.onSaved?.(saved, prState);
         }}
         onReposDelivered={props.onReposDelivered}
+        onKeepActionsManagerVersion={props.onKeepActionsManagerVersion}
+        paths={props.paths ?? PATHS}
       />
       <button type="button" onClick={() => setCodeowners(record({ status: "under_review", content: "* @in-review\n" }))}>
         server: under review
@@ -106,6 +110,9 @@ function Harness(props: Readonly<{
     </>
   );
 }
+
+// The kind's paths, as GET /api/managed-files lists them.
+const PATHS = [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"];
 
 const editor = () => screen.getByTestId("codeowners-editor") as HTMLTextAreaElement;
 const commit = () => screen.getByRole("button", { name: /Commit Locally/ });
@@ -130,6 +137,20 @@ describe("CodeownersManager", () => {
     expect(screen.getByText(/delivered to all 2 repositories/)).toBeInTheDocument();
     expect(screen.queryByText(/Target Repositories/)).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+  });
+
+  it("offers the paths it is given, the first as the default (#2367)", async () => {
+    render(<Harness paths={[".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]} />);
+    const select = screen.getByLabelText("File path:") as HTMLSelectElement;
+
+    expect([...select.options].map((option) => option.value)).toEqual([".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]);
+    expect(select.value).toBe(".github/CODEOWNERS");
+    expect(screen.getByRole("option", { name: "docs/CODEOWNERS (docs folder)" })).toBeInTheDocument();
+
+    fireEvent.change(editor(), { target: { value: "* @octo/docs\n" } });
+    fireEvent.change(select, { target: { value: "docs/CODEOWNERS" } });
+    fireEvent.click(commit());
+    await waitFor(() => expect(mocked.saveProjectCodeowners).toHaveBeenCalledWith(PROJECT_ID, "* @octo/docs\n", "docs/CODEOWNERS"));
   });
 
   it("Commit Locally saves the project's file once and shows the saved copy", async () => {
@@ -188,6 +209,28 @@ describe("CodeownersManager", () => {
     expect(screen.getByTestId("codeowners-drift-banner")).toHaveTextContent("has changed or was removed on octo/a @ main, octo/b @ dev");
     expect(screen.getByRole("button", { name: "Load from octo/a @ main" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /octo\/b/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps the ActionsManager version through a campaign for each drifted repository, once each", () => {
+    const keep = vi.fn();
+    render(
+      <Harness
+        initial={record()}
+        drift={[drifted("octo/a"), drifted("octo/a", "release/1.0"), drifted("octo/b")]}
+        onKeepActionsManagerVersion={keep}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Keep ActionsManager version" }));
+
+    expect(keep).toHaveBeenCalledWith(["octo/a", "octo/b"]);
+    expect(screen.getByTestId("codeowners-drift-banner")).toHaveTextContent("a PR campaign carrying only this file");
+  });
+
+  it("offers no campaign to a read-only member", () => {
+    render(<Harness initial={record()} drift={[drifted("octo/a")]} isReadOnly onKeepActionsManagerVersion={vi.fn()} />);
+
+    expect(screen.queryByRole("button", { name: "Keep ActionsManager version" })).not.toBeInTheDocument();
   });
 
   it("locks the file while a PR carries it, with a greyed-out Commit Locally", () => {

@@ -137,11 +137,8 @@ vi.mock("./components/PlanUsagePill", () => ({
   },
 }));
 
-vi.mock("./components/BrandLogo", () => ({
-  default: function BrandLogo() {
-    return <div data-testid="brand-logo">BrandLogo</div>;
-  },
-}));
+// The app header's tabs need a real router, and this file mocks react-router.
+vi.mock("./components/AppHeader", () => import("./test/appHeaderStub"));
 
 vi.mock("./components/SaveResultsModal", () => ({
   default: function SaveResultsModal() {
@@ -350,7 +347,8 @@ describe("ProjectMgmt deploy environments header", () => {
 
     await user.click(screen.getByText("Go Environments"));
 
-    expect(screen.getByText("Back to Projects")).toBeInTheDocument();
+    // The app header's Projects tab is the way back; the page has no button of its own.
+    expect(screen.queryByText(/Back to Projects/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Save to GitHub/i)).not.toBeInTheDocument();
     expect(screen.queryByText("🔙 Cancel")).not.toBeInTheDocument();
   });

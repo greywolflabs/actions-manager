@@ -55,8 +55,10 @@ export function getPrefixModeConfig(usePrefix: boolean) {
  * key at all except the pull-request branch name, so the two modes need
  * different sentences to stay accurate.
  */
-export function projectKeyFixedNote(usePrefix: boolean, projectCode?: string): string {
+export function projectKeyFixedNote(usePrefix: boolean, projectCode?: string, holdsWorkflows = true): string {
   const base = "Renaming the project does not change the project key.";
+  // A Managed Files project names no secret, variable or workflow file after it.
+  if (!holdsWorkflows) return `${base} The key is used in ActionsManager pull request branch names.`;
   if (usePrefix) {
     const prefix = projectCode ? `AM_${projectCode.toUpperCase()}_` : "AM_PROJECT_CODE_";
     return `${base} Existing secrets, variables and delivered workflow files keep their ${prefix} names.`;

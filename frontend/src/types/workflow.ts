@@ -152,16 +152,10 @@ export interface UnifiedWorkflowsProps {
   customFileDrift?: import('../api/drift').CustomFileDriftDetail[];
   /** Ids of the drifted custom files; seeded by the project load until the drift check has loaded. */
   driftedCustomFileIds?: Set<number>;
-  /** The project's CODEOWNERS file, null when it has none, undefined until loaded. */
-  codeowners?: import('../api/codeowners').CodeownersRecord | null;
-  /** Each (repo, branch) where the last drift check found CODEOWNERS changed on GitHub. */
-  codeownersDrift?: import('../api/drift').CodeownersDriftDetail[];
-  /** Called with what a Commit Locally saved and the project's resulting pr_state. */
-  onCodeownersSaved?: (record: import('../api/codeowners').CodeownersRecord, prState?: string) => void;
-  /** Asks the Project Files view to open the CODEOWNERS editor, e.g. from the drift panel. */
-  codeownersOpenRequested?: boolean;
-  /** Called once the CODEOWNERS editor has been opened for that request. */
-  onCodeownersOpened?: () => void;
+  /** "Keep the ActionsManager version" of a drifted custom file: a PR campaign carrying only it. */
+  onKeepCustomFile?: (fileId: number, repos: string[]) => void;
+  /** Opens the Managed Files section, where CODEOWNERS is managed now (#2367). */
+  onOpenManagedFiles?: () => void;
 
   /** Shared, workspace-wide catalog of imported Actions Projects, surfaced in the GUI step editor. */
   importedActions?: import('../api/actionsProjects').ActionsProject[];

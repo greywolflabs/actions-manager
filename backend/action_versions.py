@@ -9,7 +9,7 @@ _V7 = "v7.0.0"
 
 ACTION_VERSIONS = {
     "actions/checkout": "v7.0.1",
-    "actions/setup-java": "v6.0.1",
+    "actions/setup-java": "v6.1.0",
     "actions/setup-node": "v7.1.0",
     "actions/setup-python": _V7,
     "actions/setup-go": _V7,

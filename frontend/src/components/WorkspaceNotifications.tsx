@@ -51,7 +51,8 @@ const WorkspaceNotifications: React.FC<WorkspaceNotificationsProps> = ({ current
   const loadData = useCallback(async () => {
     const [subs, projectList, deliveryList] = await Promise.all([
       fetchSubscriptions(),
-      fetchProjects(currentUser),
+      // Every project can notify, Managed Files ones included.
+      fetchProjects(currentUser, "all"),
       fetchDeliveries(),
     ]);
     setSubscriptions(subs);
@@ -116,7 +117,7 @@ const WorkspaceNotifications: React.FC<WorkspaceNotificationsProps> = ({ current
   }
 
   return (
-    <div className="w-full max-w-3xl mx-auto space-y-6">
+    <div className="w-full max-w-3xl space-y-6">
       <h2 className="text-lg font-semibold text-text-primary dark:text-text-primary-dark">Notifications</h2>
 
       <div className="flex gap-6 border-b border-border dark:border-border-dark">

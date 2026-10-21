@@ -23,14 +23,26 @@ interface CodeownersManagerProps {
   readonly onSaved?: (record: CodeownersRecord, prState?: string) => void;
   /** The repositories whose pull request Commit and Update PR reached. */
   readonly onReposDelivered?: (repos: string[]) => void;
+  /** "Keep the ActionsManager version": a PR campaign carrying only this file to the repositories it drifted in. */
+  readonly onKeepActionsManagerVersion?: (repos: string[]) => void;
+  /**
+   * Where the file can live, in the order GitHub looks; the first is the
+   * default. The kind's paths, from its definition.
+   */
+  readonly paths: readonly string[];
 }
 
-const DEFAULT_PATH = '.github/CODEOWNERS';
+// What each location is, beside its path in the selector.
+const PATH_NOTES: Record<string, string> = {
+  '.github/CODEOWNERS': '(recommended)',
+  CODEOWNERS: '(repository root)',
+  'docs/CODEOWNERS': '(docs folder)',
+};
 
-const FILE_PATH_OPTIONS = [
-  { value: '.github/CODEOWNERS', label: '.github/CODEOWNERS (recommended)' },
-  { value: 'CODEOWNERS', label: 'CODEOWNERS (repository root)' },
-];
+const pathOption = (path: string): { value: string; label: string } => ({
+  value: path,
+  label: PATH_NOTES[path] ? `${path} ${PATH_NOTES[path]}` : path,
+});
 
 const STATUS_LABELS: Record<string, string> = {
   new: 'New',
@@ -85,9 +97,12 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
   drift = [],
   onSaved,
   onReposDelivered,
+  onKeepActionsManagerVersion,
+  paths,
 }) => {
+  const defaultPath = paths[0];
   const [content, setContent] = useState<string>(codeowners?.content ?? '');
-  const [filePath, setFilePath] = useState<string>(codeowners?.file_path ?? DEFAULT_PATH);
+  const [filePath, setFilePath] = useState<string>(codeowners?.file_path ?? defaultPath);
   const [isDirty, setIsDirty] = useState<boolean>(false);
   const [saving, setSaving] = useState<boolean>(false);
   // Which GitHub copy is loading into the editor, if any.
@@ -114,9 +129,9 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
   useEffect(() => {
     if (isDirtyRef.current && codeowners?.status !== 'under_review') return;
     setContent(codeowners?.content ?? '');
-    setFilePath(codeowners?.file_path ?? DEFAULT_PATH);
+    setFilePath(codeowners?.file_path ?? defaultPath);
     setIsDirty(false);
-  }, [codeowners]);
+  }, [codeowners, defaultPath]);
 
   useEffect(() => {
     return () => {
@@ -205,7 +220,7 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
 
   const handleRevert = () => {
     setContent(codeowners?.content ?? '');
-    setFilePath(codeowners?.file_path ?? DEFAULT_PATH);
+    setFilePath(codeowners?.file_path ?? defaultPath);
     setIsDirty(false);
     setWarnings([]);
   };
@@ -277,7 +292,7 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
           disabled={!canEdit}
           className="rounded border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 disabled:opacity-60"
         >
-          {FILE_PATH_OPTIONS.map(o => (
+          {paths.map(pathOption).map(o => (
             <option key={o.value} value={o.value}>{o.label}</option>
           ))}
         </select>
@@ -316,6 +331,7 @@ const CodeownersManager: React.FC<CodeownersManagerProps> = ({
           canLoad={canEdit}
           loadingFrom={loadingFrom}
           onLoad={(d) => loadFromGitHub(d.repo, driftTargetLabel(d), { branch: d.branch, path: d.file_path })}
+          onKeep={onKeepActionsManagerVersion && (() => onKeepActionsManagerVersion([...new Set(drift.map(d => d.repo))]))}
           testId="codeowners-drift-banner"
         />
       )}

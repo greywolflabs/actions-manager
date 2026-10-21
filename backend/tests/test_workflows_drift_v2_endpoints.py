@@ -420,54 +420,6 @@ def test_resolve_drift_use_github_missing_on_github_returns_404(_g, db_state):
     assert resp.status_code == 404
 
 
-@patch('workflows._check_existing_workflow_content', return_value=("existing-sha", False))
-@patch('workflows.github_put')
-def test_resolve_drift_restore_actionsmanager_direct_pushes_yaml(mock_put, _check, db_state):
-    """``restore_actionsmanager`` + ``direct`` should PUT contents API and persist new SHA."""
-    # Start from the realistic pre-fix state, same reasoning as the
-    # use_github test above.
-    db = TestingSessionLocal()
-    try:
-        wf = db.query(Workflow).filter_by(workflow_id=db_state["workflow_id"]).first()
-        wf.workflow_status = "committed_locally"
-        db.commit()
-    finally:
-        db.close()
-
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"content": {"sha": "fresh-sha"}}
-    mock_put.return_value = mock_resp
-
-    resp = client.post(
-        f"/api/workflows/{db_state['workflow_id']}/resolve-drift",
-        json={
-            "github_user": "alice",
-            "repo": "alice/repo1",
-            "branch": "main",
-            "resolution": "restore_actionsmanager",
-            "delivery_mode": "direct",
-        },
-    )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["delivery_mode"] == "direct"
-    assert body["github_sha"] == "fresh-sha"
-    assert mock_put.called
-
-    db = TestingSessionLocal()
-    try:
-        wf = db.query(Workflow).filter_by(workflow_id=db_state["workflow_id"]).first()
-        assert wf.workflow_git_hash == "fresh-sha"
-        # Regression: a direct push means the repo now matches our managed
-        # version - workflow_status and project.pr_state must reflect that.
-        assert wf.workflow_status == "synced_with_github"
-        project = db.query(Project).filter_by(project_id=db_state["project_id"]).first()
-        assert project.pr_state == "synced"
-    finally:
-        db.close()
-
-
 def test_resolve_drift_invalid_resolution_returns_400(db_state):
     resp = client.post(
         f"/api/workflows/{db_state['workflow_id']}/resolve-drift",

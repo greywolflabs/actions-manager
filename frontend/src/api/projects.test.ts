@@ -2,6 +2,7 @@ import apiClient from "./apiClient";
 import {
   fetchProjectRepoBranchConfigs,
   fetchProjects,
+  listProjects,
   getAvailableRwxWorkflows,
   resetProjectRepoBranchConfig,
   saveProject,
@@ -192,6 +193,38 @@ describe("projects API", () => {
     mockedApiClient.patch.mockRejectedValueOnce(err);
 
     await expect(updateProjectName("user", 1, "Name")).rejects.toThrow("Network error");
+  });
+
+  it("lists the Projects page by default, and another section when asked (#2367)", async () => {
+    mockedApiClient.get.mockResolvedValue({ data: [] });
+
+    await fetchProjects("alice");
+    await fetchProjects("alice", "managed_files");
+    await fetchProjects("alice", "all");
+
+    expect(mockedApiClient.get).toHaveBeenNthCalledWith(1, "/api/projects/");
+    expect(mockedApiClient.get).toHaveBeenNthCalledWith(2, "/api/projects/", { params: { section: "managed_files" } });
+    expect(mockedApiClient.get).toHaveBeenNthCalledWith(3, "/api/projects/", { params: { section: "all" } });
+  });
+
+  it("listProjects throws a failed load; fetchProjects answers it with no projects", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mockedApiClient.get.mockRejectedValue(new Error("boom"));
+
+    await expect(listProjects("managed_files")).rejects.toThrow("boom");
+    await expect(fetchProjects("alice", "managed_files")).resolves.toEqual([]);
+  });
+
+  it("sends a Managed Files project's kind, and no kind for any other", async () => {
+    mockedApiClient.post.mockResolvedValue({ data: { project_id: 1, project_code: "OWN" } });
+
+    await saveProject({ ...baseProjectData, project_type: "managed_files", file_kind: "codeowners" });
+    await saveProject(baseProjectData);
+
+    expect(mockedApiClient.post.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ project_type: "managed_files", file_kind: "codeowners" }),
+    );
+    expect(mockedApiClient.post.mock.calls[1][1]).not.toHaveProperty("file_kind");
   });
 
   it("sends no github_user to routes that take the caller from the session (#2241)", async () => {

@@ -159,11 +159,8 @@ vi.mock("./components/PlanUsagePill", () => ({
   },
 }));
 
-vi.mock("./components/BrandLogo", () => ({
-  default: function BrandLogo() {
-    return null;
-  },
-}));
+// The app header's tabs need a real router, and this file mocks react-router.
+vi.mock("./components/AppHeader", () => import("./test/appHeaderStub"));
 
 vi.mock("./components/SaveResultsModal", () => ({
   default: function SaveResultsModal() {

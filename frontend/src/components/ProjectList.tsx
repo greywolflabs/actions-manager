@@ -3,17 +3,21 @@ import React, { useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
-  ChevronRight,
   Folder,
   FolderKanban,
   GitPullRequest,
+  Globe,
   GripVertical,
+  Lock,
   type LucideIcon,
-  MoreHorizontal,
   PencilLine,
   Plus,
+  RefreshCw,
   SlidersHorizontal,
+  Tag,
+  Workflow,
 } from "lucide-react";
 import {
   DndContext,
@@ -32,7 +36,8 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Project, WorkflowData } from "../api/projects";
+import { Project } from "../api/projects";
+import { getProjectTypeConfig } from "../utils/projectTypeConfig";
 import { PROJECT_COLOR_STYLES, normalizeProjectColorKey } from "../utils/projectColors";
 import { cn } from "../lib/utils";
 import { Card, CardContent } from "./ui/card";
@@ -42,27 +47,23 @@ import { Label } from "./ui/label";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
-import ProjectTypeBadge from "./ProjectTypeBadge";
-
-// Constants for project state values
-const PROJECT_STATE = {
-  NEW: "new" as const,
-  DRAFT: "draft" as const,
-  OPEN: "open" as const,
-  SYNCED: "synced" as const,
-  DELETING: "deleting" as const,
-};
-
-const STATE_DISPLAY = {
-  NEW: "New" as const,
-  DRAFT: "Draft" as const,
-  OPEN: "Under Review" as const,
-  SYNCED: "Synced" as const,
-  DELETING: "Deleting" as const,
-};
+import ProjectCardMenu from "./ProjectCardMenu";
+import {
+  PROJECT_STATE,
+  STATE_DISPLAY,
+  type ProjectStateTone,
+  formatUpdatedAt,
+  getDriftCheckedAtShortLabel,
+  getDriftIndicator,
+  getProjectState,
+  getProjectWorkflows,
+  getStateBadgeClasses,
+  normalizeProjectName,
+  projectHasNeedsAttention,
+  projectHasWorkflowStatus,
+} from "../utils/projectCardState";
 
 // Props interface for the ProjectList component
 interface ProjectListProps {
@@ -78,6 +79,10 @@ interface ProjectListProps {
   onReorder?: (orderedIds: number[]) => void;
   /** Message shown when a reorder failed to save and the order was rolled back. */
   reorderError?: string | null;
+  /** The plan usage meter, shown beside New Project; the parent owns the counts. */
+  planUsage?: React.ReactNode;
+  /** The "2 of 3 remaining" line under the New project box; omitted when the plan has no limit. */
+  newProjectRemaining?: string | null;
 }
 
 /**
@@ -123,8 +128,10 @@ const SortableProjectCard: React.FC<{
       data-testid={`project-drag-handle-${testId}`}
       className={cn(
         "flex h-8 w-8 items-center justify-center rounded border border-transparent text-slate-400",
+        // Out of the way until the card is hovered or the handle focused; always there on touch screens.
+        "opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100 pointer-coarse:opacity-100",
         disabled
-          ? "cursor-not-allowed opacity-40"
+          ? "cursor-not-allowed group-hover:opacity-40 pointer-coarse:opacity-40"
           : "cursor-grab hover:border-slate-300 hover:bg-slate-100 hover:text-slate-700 active:cursor-grabbing dark:hover:border-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-100",
       )}
     >
@@ -137,7 +144,7 @@ const SortableProjectCard: React.FC<{
       ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition }}
       data-testid={`project-row-${testId}`}
-      className={cn("relative", isDragging && "z-10 opacity-80 ring-2 ring-slate-400 rounded-lg")}
+      className={cn("group relative", isDragging && "z-10 opacity-80 ring-2 ring-slate-400 rounded-lg")}
     >
       {children(dragHandle)}
     </div>
@@ -145,16 +152,6 @@ const SortableProjectCard: React.FC<{
 };
 
 const REORDER_DISABLED_REASON = "Clear filters to reorder projects";
-
-const WARNING_STATUS_VALUES = new Set([
-  "blocked",
-  "drift",
-  "drifted",
-  "error",
-  "failed",
-  "failed_sync",
-  "needs_attention",
-]);
 
 const LOCAL_CHANGE_STATUS_VALUES = new Set([
   "committed_locally",
@@ -174,168 +171,10 @@ const SYNCED_STATUS_VALUES = new Set([
   "synced_with_github",
 ]);
 
-const normalizeStatusValue = (value: unknown): string => (
-  typeof value === "string" ? value.trim().toLowerCase() : ""
-);
-
-const normalizeProjectName = (project: Project): string => (
-  project.project_name?.trim()
-  || project.name?.trim()
-  || ""
-);
-
-const getProjectWorkflows = (project: Project): WorkflowData[] => [
-  ...(project.workflows ?? []),
-  ...(project.rxworkflows ?? []),
-];
-
 const getProjectWorkflowCount = (project: Project): number => {
   const count = project.workflow_count;
   if (typeof count === "number" && Number.isFinite(count) && count >= 0) return count;
   return getProjectWorkflows(project).length;
-};
-
-const projectHasWorkflowStatus = (project: Project, statusValues: Set<string>): boolean => (
-  getProjectWorkflows(project).some((workflow) => statusValues.has(normalizeStatusValue(workflow.workflowStatus)))
-);
-
-const getCachedDriftStatus = (project: Project): string => {
-  const projectFields = project as Project & Record<string, unknown>;
-  const status = normalizeStatusValue(projectFields.drift_status);
-  return status || "unknown";
-};
-
-const hasCachedDriftSummary = (project: Project): boolean => {
-  const projectFields = project as Project & Record<string, unknown>;
-  return (
-    projectFields.drift_status !== undefined
-    || projectFields.last_drift_check_at !== undefined
-  );
-};
-
-const projectHasNeedsAttention = (project: Project): boolean => {
-  const cachedStatus = getCachedDriftStatus(project);
-  const cachedNeedsAttention = hasCachedDriftSummary(project)
-    && (cachedStatus === "drifted" || cachedStatus === "check_failed");
-
-  const projectFields = project as Project & Record<string, unknown>;
-  const warningFields = [
-    projectFields.drift_status,
-    projectFields.sync_status,
-    projectFields.workflow_status,
-    projectFields.workflowStatus,
-    projectFields.status,
-  ];
-
-  return cachedNeedsAttention
-    || projectFields.has_drift === true
-    || projectFields.blocked === true
-    || warningFields.some((value) => WARNING_STATUS_VALUES.has(normalizeStatusValue(value)))
-    || projectHasWorkflowStatus(project, WARNING_STATUS_VALUES);
-};
-
-const projectHasDrift = (project: Project): boolean => {
-  if (hasCachedDriftSummary(project)) {
-    return getCachedDriftStatus(project) === "drifted";
-  }
-
-  const projectFields = project as Project & Record<string, unknown>;
-  const driftValues = new Set(["drift", "drifted", "drift_detected"]);
-  const driftFields = [
-    projectFields.drift_status,
-    projectFields.workflow_status,
-    projectFields.workflowStatus,
-    projectFields.status,
-  ];
-
-  return projectFields.has_drift === true
-    || driftFields.some((value) => driftValues.has(normalizeStatusValue(value)))
-    || projectHasWorkflowStatus(project, driftValues);
-};
-
-type ProjectStateTone = "neutral" | "info" | "success" | "warning" | "danger";
-
-const getProjectState = (project: Project): { label: string; tone: ProjectStateTone } => {
-  // Ahead of drift: nothing checks a project being deleted, and it is going.
-  if (project.pr_state === PROJECT_STATE.DELETING) {
-    return { label: STATE_DISPLAY.DELETING, tone: "danger" };
-  }
-  const cachedDriftStatus = getCachedDriftStatus(project);
-  if (projectHasDrift(project)) {
-    return { label: "Drift Detected", tone: "danger" };
-  }
-
-  if (cachedDriftStatus === "check_failed") {
-    return { label: "Needs Attention", tone: "warning" };
-  }
-
-  if (projectHasNeedsAttention(project)) {
-    return { label: "Needs Sync", tone: "warning" };
-  }
-
-  const prState = project.pr_state ?? PROJECT_STATE.NEW;
-  switch (prState) {
-    case PROJECT_STATE.DRAFT:
-      return { label: STATE_DISPLAY.DRAFT, tone: "warning" };
-    case PROJECT_STATE.OPEN:
-      return { label: STATE_DISPLAY.OPEN, tone: "info" };
-    case PROJECT_STATE.SYNCED:
-      return { label: STATE_DISPLAY.SYNCED, tone: "success" };
-    case PROJECT_STATE.NEW:
-    default:
-      return { label: STATE_DISPLAY.NEW, tone: "neutral" };
-  }
-};
-
-const getDriftIndicator = (project: Project): { label: string; tone: ProjectStateTone } | null => {
-  if (!hasCachedDriftSummary(project)) return null;
-
-  const driftStatus = getCachedDriftStatus(project);
-  if (driftStatus === "drifted") return { label: "Drift detected", tone: "danger" };
-  if (driftStatus === "check_failed") return { label: "Needs attention", tone: "warning" };
-  if (driftStatus === "unknown") return { label: "Not checked", tone: "neutral" };
-  return null;
-};
-
-const getDriftCheckedAtLabel = (project: Project): string | null => {
-  const projectFields = project as Project & Record<string, unknown>;
-  const raw = projectFields.last_drift_check_at;
-  if (typeof raw !== "string" || !raw) return null;
-
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return null;
-
-  return `Drift checked ${date.toLocaleString()}`;
-};
-
-const getStateBadgeClasses = (tone: ProjectStateTone): string => {
-  switch (tone) {
-    case "danger":
-      return "border-rose-500/30 bg-rose-500/10 text-rose-700 dark:border-rose-400/30 dark:bg-rose-400/10 dark:text-rose-200";
-    case "warning":
-      return "border-amber-500/30 bg-amber-500/10 text-amber-800 dark:border-amber-400/30 dark:bg-amber-400/10 dark:text-amber-200";
-    case "success":
-      return "border-emerald-500/30 bg-emerald-500/10 text-emerald-800 dark:border-emerald-400/30 dark:bg-emerald-400/10 dark:text-emerald-200";
-    case "info":
-      return "border-sky-500/30 bg-sky-500/10 text-sky-800 dark:border-sky-400/30 dark:bg-sky-400/10 dark:text-sky-200";
-    case "neutral":
-    default:
-      return "border-slate-500/20 bg-slate-500/5 text-slate-700 dark:border-slate-400/20 dark:bg-slate-400/10 dark:text-slate-200";
-  }
-};
-
-const formatUpdatedAt = (project: Project): string => {
-  const raw = project.updated_at || project.created_at;
-  const date = raw ? new Date(raw) : null;
-
-  if (!date || Number.isNaN(date.getTime())) return "—";
-
-  const now = new Date();
-  const includeYear = date.getFullYear() !== now.getFullYear();
-  return new Intl.DateTimeFormat(undefined, includeYear
-    ? { month: "short", day: "numeric", year: "numeric" }
-    : { month: "short", day: "numeric" },
-  ).format(date);
 };
 
 const formatProjectMeta = (project: Project): string | null => {
@@ -394,6 +233,8 @@ const ProjectList: React.FC<ProjectListProps> = ({
     isCreateProjectDisabled = false,
     onReorder,
     reorderError = null,
+    planUsage,
+    newProjectRemaining = null,
 }) => {
   const navigate = useNavigate(); // ✅ React Router Navigation
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -505,66 +346,72 @@ const ProjectList: React.FC<ProjectListProps> = ({
     onReorder?.(arrayMove(allIds, fromIndex, toIndex));
   };
 
+  const newProjectCard = onCreateProject && !isCreateProjectDisabled && (
+    <button
+      type="button"
+      onClick={onCreateProject}
+      data-testid="projects-new-card"
+      className="flex min-h-40 flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed border-slate-300 text-slate-600 transition-colors hover:border-slate-400 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:border-slate-500 dark:hover:bg-slate-900/40"
+    >
+      <Plus className="h-5 w-5" aria-hidden="true" />
+      <span className="font-semibold">New project</span>
+      {newProjectRemaining && <span className="text-xs text-slate-500 dark:text-slate-400">{newProjectRemaining}</span>}
+    </button>
+  );
+
   return (
-    <div className="w-full max-w-[1400px] mx-auto px-6 lg:px-8 space-y-6">
+    <div className="w-full space-y-6">
 
-      <div>
-        <h2 className="text-3xl font-bold text-gray-900 dark:text-white">Projects</h2>
-        <p className="mt-2 max-w-2xl text-sm text-gray-600 dark:text-slate-300">
-          Manage GitHub Actions across repository groups.
-        </p>
-      </div>
-
-      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
-        <section aria-label="Project status summary" className="flex flex-wrap gap-2">
-          {STATUS_FILTER_OPTIONS.map(({ value, label, tone, icon: Icon }) => {
-            const isActive = statusFilter === value;
-            return (
-              <button
-                key={value}
-                type="button"
-                data-testid={`project-status-pill-${value}`}
-                aria-pressed={isActive}
-                onClick={() => setStatusFilter(isActive ? "all" : value)}
-                className={cn(
-                  "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors",
-                  isActive
-                    ? getStateBadgeClasses(tone)
-                    : "border-slate-200 bg-white/70 text-slate-600 hover:bg-slate-100 dark:border-slate-700/80 dark:bg-slate-900/40 dark:text-slate-300 dark:hover:bg-slate-800",
-                )}
-              >
-                <Icon className="h-3.5 w-3.5" aria-hidden="true" />
-                {label}
-                <span className="tabular-nums opacity-80">{statusCounts[value]}</span>
-              </button>
-            );
-          })}
-        </section>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => navigate(`/project/${user}/actions-projects`)}
-            data-testid="actions-projects-nav-button"
-            className="inline-flex items-center gap-1.5"
-          >
-            Managed Actions
-          </Button>
-          {onCreateProject && (
-            <Button
-              type="button"
-              onClick={onCreateProject}
-              disabled={isCreateProjectDisabled}
-              data-testid="new-project-button"
-              className="inline-flex items-center gap-1.5"
-            >
-              <Plus className="h-4 w-4" aria-hidden="true" />
-              New Project
-            </Button>
-          )}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" data-testid="projects-heading-row">
+        <div>
+          <h2 className="text-3xl font-bold text-gray-900 dark:text-white">Projects</h2>
+          <p className="mt-2 max-w-2xl text-sm text-gray-600 dark:text-slate-300">
+            Manage GitHub Actions across repository groups.
+          </p>
         </div>
+        {(planUsage || onCreateProject) && (
+          <div className="flex flex-wrap items-center gap-4">
+            {planUsage}
+            {onCreateProject && (
+              <Button
+                type="button"
+                onClick={onCreateProject}
+                disabled={isCreateProjectDisabled}
+                data-testid="new-project-button"
+                className="inline-flex items-center gap-1.5"
+              >
+                <Plus className="h-4 w-4" aria-hidden="true" />
+                New Project
+              </Button>
+            )}
+          </div>
+        )}
       </div>
+
+      <section aria-label="Project status summary" className="flex flex-wrap gap-2">
+        {STATUS_FILTER_OPTIONS.map(({ value, label, tone, icon: Icon }) => {
+          const isActive = statusFilter === value;
+          return (
+            <button
+              key={value}
+              type="button"
+              data-testid={`project-status-pill-${value}`}
+              aria-pressed={isActive}
+              onClick={() => setStatusFilter(isActive ? "all" : value)}
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors",
+                isActive
+                  ? getStateBadgeClasses(tone)
+                  : "border-slate-200 bg-white/70 text-slate-600 hover:bg-slate-100 dark:border-slate-700/80 dark:bg-slate-900/40 dark:text-slate-300 dark:hover:bg-slate-800",
+              )}
+            >
+              <Icon className="h-3.5 w-3.5" aria-hidden="true" />
+              {label}
+              <span className="tabular-nums opacity-80">{statusCounts[value]}</span>
+            </button>
+          );
+        })}
+      </section>
 
       <div
         className="rounded-lg border border-slate-200 bg-slate-50/60 p-4 shadow-sm dark:border-slate-700/80 dark:bg-slate-900/40"
@@ -712,6 +559,9 @@ const ProjectList: React.FC<ProjectListProps> = ({
           </p>
         </div>
       )}
+      {projects.length === 0 && newProjectCard && (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">{newProjectCard}</div>
+      )}
       {projects.length > 0 && filteredProjects.length === 0 && (
         <div className="py-10 px-6 text-center">
           <p className="text-sm text-muted-foreground">
@@ -743,21 +593,13 @@ const ProjectList: React.FC<ProjectListProps> = ({
           onDragEnd={handleDragEnd}
         >
           <SortableContext items={sortableIds} strategy={rectSortingStrategy}>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {filteredProjects
             .map((project) => {
               const projectName = normalizeProjectName(project);
-              const projectState = project.pr_state ?? PROJECT_STATE.NEW;
-              const showContinueEditing = projectState === PROJECT_STATE.DRAFT;
-              const showConfigure = projectState === PROJECT_STATE.NEW;
-              const showView = projectState === PROJECT_STATE.SYNCED || projectState === PROJECT_STATE.OPEN
-                || projectState === PROJECT_STATE.DELETING;
-              const showOpenPrPlaceholder = projectState === PROJECT_STATE.OPEN;
-              const scopeVisibility = (project.repository_visibility_scope ?? "public").toString().toLowerCase() === "private"
-                ? "Private"
-                : "Public";
               const usePrefix = project.use_prefix !== false;
-              const namingModeLabel = usePrefix ? "Prefix" : "No Prefix";
+              const isPrivateScope = (project.repository_visibility_scope ?? "public").toString().toLowerCase() === "private";
+              const projectTypeLabel = getProjectTypeConfig(project.project_type).label;
               const derivedState = getProjectState(project);
               const projectMeta = formatProjectMeta(project);
               const workflowCount = getProjectWorkflowCount(project);
@@ -768,16 +610,10 @@ const ProjectList: React.FC<ProjectListProps> = ({
                 ? "text-slate-500 dark:text-slate-400"
                 : "text-text-secondary dark:text-secondary-dark";
               const driftIndicator = getDriftIndicator(project);
-              const driftCheckedAtLabel = getDriftCheckedAtLabel(project);
+              const driftCheckedAtLabel = getDriftCheckedAtShortLabel(project);
               const driftStatusNote = project.drift_error_summary || null;
-              const projectFields = project as Project & Record<string, unknown>;
               const projectColorKey = normalizeProjectColorKey(project.project_color);
               const projectColorStyles = PROJECT_COLOR_STYLES[projectColorKey];
-              const prUrl = typeof projectFields.pr_url === "string"
-                ? projectFields.pr_url
-                : typeof projectFields.prUrl === "string"
-                  ? projectFields.prUrl
-                  : null;
               const rowId = project.project_id ?? project.id ?? project.project_code;
 
               return (
@@ -797,8 +633,8 @@ const ProjectList: React.FC<ProjectListProps> = ({
                     aria-label={`Open project ${projectName || project.project_code || "project"}`}
                   />
                   <Card className="pointer-events-none relative h-full border-slate-200 bg-white/85 shadow-sm transition-shadow hover:border-slate-300 hover:shadow-md dark:border-slate-700/80 dark:bg-slate-900/70 dark:hover:border-slate-600">
-                    <CardContent className="flex items-start justify-between gap-3 p-4">
-                      <div className="flex min-w-0 flex-1 items-start gap-3">
+                    <CardContent className="p-0">
+                      <div className="flex items-start gap-3 p-4">
                         <div
                           data-testid={`project-icon-${rowId}`}
                           className={cn("flex h-10 w-10 shrink-0 items-center justify-center rounded-md", projectColorStyles.iconBg)}
@@ -806,120 +642,80 @@ const ProjectList: React.FC<ProjectListProps> = ({
                           <Folder className={cn("h-5 w-5", projectColorStyles.icon)} aria-hidden="true" />
                         </div>
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="block min-w-0 flex-1 truncate font-semibold text-text-primary dark:text-text-primary-dark">
-                              {projectName || "—"}
-                            </span>
+                          <span className="block min-w-0 truncate font-semibold text-text-primary dark:text-text-primary-dark">
+                            {projectName || "—"}
+                          </span>
+                          <span
+                            aria-label={`Project type: ${projectTypeLabel}`}
+                            className="mt-0.5 block truncate text-xs text-text-secondary dark:text-secondary-dark"
+                          >
+                            {projectTypeLabel}
+                          </span>
+                        </div>
+                        <div className="pointer-events-auto flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+                          <span
+                            data-testid={`project-status-${rowId}`}
+                            className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${getStateBadgeClasses(derivedState.tone)}`}
+                            title={derivedState.label}
+                          >
+                            {derivedState.tone === "success" && <Check className="h-3 w-3" aria-hidden="true" />}
+                            {derivedState.label}
+                          </span>
+                          {driftIndicator && (
                             <span
-                              data-testid={`project-status-${rowId}`}
-                              className={`inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${getStateBadgeClasses(derivedState.tone)}`}
-                              title={derivedState.label}
+                              data-testid={`project-drift-indicator-${rowId}`}
+                              className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-semibold tracking-wide ${getStateBadgeClasses(driftIndicator.tone)}`}
                             >
-                              {derivedState.label}
+                              {driftIndicator.label}
                             </span>
-                          </div>
-                          <div className="mt-1">
-                            <ProjectTypeBadge projectType={project.project_type} size="sm" />
-                          </div>
-                          <div className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs">
-                            <span data-testid={`project-workflows-${rowId}`}>
-                              <span className={`font-medium ${workflowLabelClasses}`}>{workflowLabel}</span>
-                            </span>
-                            <span className="text-text-secondary/50 dark:text-secondary-dark/50">·</span>
-                            <span
-                              data-testid={`project-scope-${rowId}`}
-                              className="inline-flex items-center gap-1 text-text-secondary dark:text-secondary-dark"
-                            >
-                              {scopeVisibility}
-                              <span className="text-text-secondary/50 dark:text-secondary-dark/50">·</span>
-                              <span className={usePrefix ? "text-emerald-700 dark:text-emerald-200" : "text-amber-700 dark:text-amber-200"}>
-                                {namingModeLabel}
-                              </span>
-                            </span>
-                            {driftIndicator && (
-                              <span
-                                data-testid={`project-drift-indicator-${rowId}`}
-                                className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-semibold tracking-wide ${getStateBadgeClasses(driftIndicator.tone)}`}
-                              >
-                                {driftIndicator.label}
-                              </span>
-                            )}
-                          </div>
-                          <p className="mt-1 text-xs text-text-secondary dark:text-secondary-dark">
-                            Updated {formatUpdatedAt(project)}
-                            {project.last_modified_by ? ` by ${project.last_modified_by}` : ""}
-                            {projectMeta ? ` · ${projectMeta}` : ""}
-                          </p>
-                          {driftCheckedAtLabel && (
-                            <p
-                              data-testid={`project-drift-checked-${rowId}`}
-                              className="mt-0.5 text-[11px] text-text-secondary/70 dark:text-secondary-dark/70"
-                            >
-                              {driftCheckedAtLabel}
-                            </p>
                           )}
-                          {driftStatusNote && (
-                            <p
-                              data-testid={`project-drift-reason-${rowId}`}
-                              title={driftStatusNote}
-                              className="mt-0.5 line-clamp-2 text-[11px] text-amber-700 dark:text-amber-300"
-                            >
-                              {driftStatusNote}
-                            </p>
-                          )}
+                          {dragHandle}
+                          <ProjectCardMenu
+                            project={project}
+                            onOpen={() => handleLoadProject(projectName, project.project_id ?? project.id)}
+                          />
                         </div>
                       </div>
-                      <div className="pointer-events-auto flex shrink-0 items-center gap-1 self-center">
-                        {dragHandle}
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              size="icon"
-                              variant="ghost"
-                              onClick={(e) => e.stopPropagation()}
-                              aria-label="More actions"
-                              data-testid={`project-more-${projectName || project.project_code}`}
-                              className="h-8 w-8 border border-transparent text-slate-500 hover:border-slate-300 hover:bg-slate-100 hover:text-slate-700 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-100"
-                            >
-                              <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
-                            {showContinueEditing && (
-                              <DropdownMenuItem
-                                onSelect={() => handleLoadProject(projectName, project.project_id ?? project.id)}
-                                data-testid="project-action-continue-editing"
-                              >
-                                Continue Editing
-                              </DropdownMenuItem>
-                            )}
-                            {showConfigure && (
-                              <DropdownMenuItem
-                                onSelect={() => handleLoadProject(projectName, project.project_id ?? project.id)}
-                                data-testid="project-action-configure"
-                              >
-                                Configure
-                              </DropdownMenuItem>
-                            )}
-                            {showView && (
-                              <DropdownMenuItem
-                                onSelect={() => handleLoadProject(projectName, project.project_id ?? project.id)}
-                                data-testid="project-action-view"
-                              >
-                                View
-                              </DropdownMenuItem>
-                            )}
-                            {showOpenPrPlaceholder && prUrl && (
-                              <DropdownMenuItem
-                                onSelect={() => window.open(prUrl, "_blank", "noopener,noreferrer")}
-                                data-testid="project-action-open-pr"
-                              >
-                                Open PR
-                              </DropdownMenuItem>
-                            )}
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                        <ChevronRight className="h-4 w-4 text-slate-400 dark:text-slate-500" aria-hidden="true" />
+                      <div className="space-y-2 border-t border-slate-200 px-4 py-3 text-xs text-text-secondary dark:border-slate-700/80 dark:text-secondary-dark">
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                          <span data-testid={`project-workflows-${rowId}`} className={`inline-flex items-center gap-1.5 ${workflowLabelClasses}`}>
+                            <Workflow className="h-3.5 w-3.5" aria-hidden="true" />
+                            {workflowLabel}
+                          </span>
+                          <span data-testid={`project-scope-${rowId}`} className="inline-flex flex-wrap items-center gap-x-4 gap-y-1">
+                            <span className="inline-flex items-center gap-1.5">
+                              {isPrivateScope ? <Lock className="h-3.5 w-3.5" aria-hidden="true" /> : <Globe className="h-3.5 w-3.5" aria-hidden="true" />}
+                              {isPrivateScope ? "Private repos" : "Public repos"}
+                            </span>
+                            <span className="inline-flex items-center gap-1.5">
+                              <Tag className="h-3.5 w-3.5" aria-hidden="true" />
+                              {usePrefix ? "Prefix" : "No prefix"}
+                            </span>
+                          </span>
+                        </div>
+                        <p>
+                          Updated {formatUpdatedAt(project)}
+                          {project.last_modified_by ? ` by ${project.last_modified_by}` : ""}
+                          {projectMeta ? ` · ${projectMeta}` : ""}
+                        </p>
+                        {driftCheckedAtLabel && (
+                          <p
+                            data-testid={`project-drift-checked-${rowId}`}
+                            className="inline-flex items-center gap-1.5 text-text-secondary/80 dark:text-secondary-dark/80"
+                          >
+                            <RefreshCw className="h-3 w-3" aria-hidden="true" />
+                            {driftCheckedAtLabel}
+                          </p>
+                        )}
+                        {driftStatusNote && (
+                          <p
+                            data-testid={`project-drift-reason-${rowId}`}
+                            title={driftStatusNote}
+                            className="line-clamp-2 text-[11px] text-amber-700 dark:text-amber-300"
+                          >
+                            {driftStatusNote}
+                          </p>
+                        )}
                       </div>
                     </CardContent>
                   </Card>
@@ -928,6 +724,7 @@ const ProjectList: React.FC<ProjectListProps> = ({
                 </SortableProjectCard>
               );
             })}
+          {newProjectCard}
         </div>
           </SortableContext>
         </DndContext>

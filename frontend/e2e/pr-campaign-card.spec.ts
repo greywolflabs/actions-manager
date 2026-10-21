@@ -185,6 +185,7 @@ test.describe("PR campaign rollback", () => {
         pr_url: `https://github.com/${PHASE2_REPOS.SERVICE_B}/pull/202`,
         workflow_names: PHASE2_WORKFLOWS.CI,
         invertible: true,
+        left_alone: [],
         reason: null,
         files: [
           {
@@ -202,6 +203,7 @@ test.describe("PR campaign rollback", () => {
         pr_url: `https://github.com/${PHASE2_REPOS.SERVICE_A}/pull/201`,
         workflow_names: PHASE2_WORKFLOWS.CI,
         invertible: false,
+        left_alone: [],
         reason: "The workflow changed on main after this campaign merged.",
         files: [],
       },

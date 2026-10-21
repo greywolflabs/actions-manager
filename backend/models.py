@@ -226,7 +226,10 @@ class Project(Base):
     reusable_workflows_enabled = Column(Boolean, default=False, nullable=False)  # Per-project reusable workflow setting
     use_prefix = Column(Boolean, default=True, nullable=False)  # Whether to use AM_{PROJECT_CODE}_ prefix for resources
     pr_state = Column(String(20), nullable=False, default="new")  # Project state: new, draft, open, synced
-    project_type = Column(String(20), nullable=False, default="standard")  # Project type: standard, rwx
+    project_type = Column(String(20), nullable=False, default="standard")  # Project type: standard, rwx, managed_files
+    # The file a managed_files project manages, a key of file_kinds.FILE_KINDS; NULL for every other type.
+    # Fixed at creation.
+    file_kind = Column(String(32), nullable=True)
     repository_visibility_scope = Column(String(10), nullable=False, default="public")  # Project repository visibility scope: public, private
     project_color = Column(String(20), nullable=True)  # Project identity color key (blue, purple, etc.)
     validation_repo_id = Column(Integer, ForeignKey(_FK_REPOS_REPO_ID, ondelete=_ON_DELETE_SET_NULL), nullable=True)

@@ -13,9 +13,9 @@ export const DOCS_USER = "acme-corp";
 /** Repositories shown in docs screenshots. The shared e2e fixtures use
  *  octocat/hello-world, which must never appear in published documentation. */
 export const DOCS_REPOS = [
-  { id: 1, name: "payments-service", full_name: `${DOCS_USER}/payments-service`, private: false, default_branch: "main" },
-  { id: 2, name: "payments-worker", full_name: `${DOCS_USER}/payments-worker`, private: false, default_branch: "main" },
-  { id: 3, name: "checkout-web", full_name: `${DOCS_USER}/checkout-web`, private: false, default_branch: "main" },
+  { id: 1, name: "node-api", full_name: `${DOCS_USER}/node-api`, private: false, default_branch: "main" },
+  { id: 2, name: "node-worker", full_name: `${DOCS_USER}/node-worker`, private: false, default_branch: "main" },
+  { id: 3, name: "node-web", full_name: `${DOCS_USER}/node-web`, private: false, default_branch: "main" },
 ];
 
 /** Replaces the shared fixtures' repository list with doc-friendly names.
@@ -43,7 +43,7 @@ export interface DocsOnboarding {
 }
 
 /** Defaults to BETA_PLAN: the public docs document the self-hosted beta, so
- *  the header pill and limit wording must match what that build renders. */
+ *  the plan usage pill and limit wording must match what that build renders. */
 export async function seedDocsUserProfile(
   page: Page,
   onboarding?: DocsOnboarding,
@@ -81,4 +81,11 @@ export async function seedDocsUserProfile(
         }),
       })
   );
+}
+
+/** The account menu renders once the user's details load; a capture taken
+ *  before then shows the app header without it. CSS, not a role, so it still
+ *  finds the menu behind a modal that hides the page from assistive tech. */
+export async function waitForAppHeader(page: Page) {
+  await page.locator('[data-testid="app-header"] button[aria-label^="User menu"]').waitFor({ timeout: 15000 });
 }

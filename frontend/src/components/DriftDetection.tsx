@@ -1,19 +1,17 @@
 /* eslint-disable no-restricted-syntax -- Diff view uses inline pre/grid styling */
 /**
- * Drift detection panel: surfaces GitHub-side workflow changes per the
- * "Detect GitHub-side workflow changes" issue and the scope-aware drift
- * resolution flow ("Fix design-level drift issue").
+ * Drift detection panel: surfaces files changed on GitHub outside ActionsManager
+ * (workflows, custom files, CODEOWNERS) and puts each right the same way.
  *
  * Renders:
- *  • A compact alert at the top of the workflow panel when drift exists
+ *  • A compact alert at the top of the project when drift exists
  *    ("3 workflows changed in GitHub" + Review Drift button).
- *  • A modal listing all drifted (workflow, repo, branch) tuples with a
- *    side-by-side YAML diff view.
- *  • Adopt GitHub Version (scope-aware modal) / Restore ActionsManager
- *    (PR or direct) actions.
+ *  • A modal listing every drifted (file, repo, branch) with a side-by-side
+ *    diff and the same two actions for each: keep the ActionsManager version
+ *    (a PR campaign carrying only that file) or use the GitHub version.
  *
  * Drift state is also reported up via the optional onDriftLoaded callback
- * so callers can render per-workflow badges and gate destructive actions.
+ * so callers can render per-file badges and gate destructive actions.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -29,20 +27,17 @@ import { DiffColumns, diffGridStyle } from "./DiffColumns";
 import {
   getProjectDrift,
   getWorkflowDrift,
-  resolveWorkflowDrift,
   adoptGithubVersion,
   bulkResolveWorkflowDrift,
   type WorkflowDriftDetail,
-  type DriftDeliveryMode,
   type AdoptResolutionMode,
-  type DriftResolution,
-  type BulkResolveDriftItem,
   type ProjectDriftSummary,
   type CodeownersDriftDetail,
   type CustomFileDriftDetail,
 } from "../api/drift";
 import ConfirmDialog from "./ConfirmDialog";
-import { deleteWorkflowFromGitHub, deleteWorkflowFromDatabase } from "../api/workflows";
+import { deleteWorkflowFromGitHub } from "../api/workflows";
+import { driftRows, fileGithubCopy, githubVersionConflict, type DriftRow } from "../utils/driftRows";
 import { getDocsUrl } from "../help/helpLinks";
 
 /**
@@ -96,7 +91,7 @@ interface DriftDetectionProps {
   selectedRepos: string[];
   /**
    * Called whenever drift state is (re)loaded so the parent can render
-   * per-workflow drift badges and decide whether destructive actions need
+   * per-file drift badges and decide whether destructive actions need
    * confirmation.
    */
   onDriftLoaded?: (
@@ -111,12 +106,10 @@ interface DriftDetectionProps {
   refreshSignal?: number;
   /**
    * Called whenever a resolve action changes a workflow's status server-side
-   * (synced_with_github via use_github/direct, under_review via a fix PR).
-   * loadDrift() only refreshes this component's own drift list - the parent
-   * owns the workflows/rxworkflows state that status badges elsewhere on the
-   * page render from, so it needs this callback to patch that sibling state
-   * itself. Mirrors the pattern CreatePRModal's PR-campaign flow already
-   * uses (ProjectMgmt.tsx's handlePRCreationSuccess).
+   * (synced_with_github after using GitHub's version). loadDrift() only
+   * refreshes this component's own drift list - the parent owns the
+   * workflows/rxworkflows state that status badges elsewhere on the page
+   * render from, so it needs this callback to patch that sibling state itself.
    */
   onWorkflowStatusesChanged?: (workflowNames: string[], status: string) => void;
   /**
@@ -130,8 +123,18 @@ interface DriftDetectionProps {
   seededCodeownersDrift?: boolean;
   /** How many custom files the last check found drifted, from the project fetch, for the same reason. */
   seededCustomFileDriftCount?: number;
-  /** Opens the CODEOWNERS editor, where a drifted CODEOWNERS is resolved. */
-  onOpenCodeowners?: () => void;
+  /** "Keep the ActionsManager version": opens a PR campaign carrying exactly these rows' files to their repositories. */
+  onKeepActionsManagerVersion?: (rows: DriftRow[]) => void;
+  /**
+   * "Use the GitHub version" of custom files and CODEOWNERS: the parent saves
+   * each row's GitHub copy as the project's file, as Commit Locally would, and
+   * says what it did. Workflows are adopted here, through their own modal.
+   */
+  onUseGithubVersionOfFiles?: (rows: DriftRow[]) => Promise<string>;
+  /** The project's own content for a custom-file or CODEOWNERS row, the left side of its diff. */
+  contentOf?: (row: DriftRow) => string | null;
+  /** Called after an action here changed the project itself, e.g. a workflow marked for removal. */
+  onProjectChanged?: () => void;
 }
 
 const countOf = (count: number, noun: string) => (count === 1 ? `1 ${noun}` : `${count} ${noun}s`);
@@ -148,232 +151,272 @@ export const driftSummaryText = (workflowCount: number, codeownersDrifted: boole
   return `${named} changed in GitHub`;
 };
 
-interface FileDriftSectionProps {
-  readonly title: string;
-  readonly hint: string;
-  readonly drift: CodeownersDriftDetail[];
-  readonly testId: string;
-  readonly onOpen?: () => void;
-  readonly openLabel?: string;
-  readonly openTestId?: string;
-}
-
-/**
- * Files the project delivers whole — its CODEOWNERS, its custom files — where
- * they drifted. Each has one copy for every repository, so it is resolved in
- * its editor rather than per row: load a GitHub version there and Commit
- * Locally, or deliver it in a PR campaign.
- */
-const FileDriftSection: React.FC<FileDriftSectionProps> = ({ title, hint, drift, testId, onOpen, openLabel, openTestId }) => (
-  <section className="space-y-2" aria-label={`${title} drift`} data-testid={testId}>
-    <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">{title}</h3>
-    <p className="text-xs text-slate-600 dark:text-slate-400">{hint}</p>
-    <ul className="divide-y divide-slate-200 text-sm dark:divide-slate-700">
-      {drift.map((d) => (
-        <li key={`${d.file_path}::${d.repo}::${d.branch}`} className="flex flex-wrap items-center gap-x-4 gap-y-1 py-2">
-          <span className="font-mono">{d.file_path}</span>
-          <span>{d.repo}</span>
-          <span className="text-slate-500 dark:text-slate-400">{d.branch}</span>
-          <span className="text-amber-700 dark:text-amber-400">
-            {d.deleted_in_github ? "Deleted in GitHub" : "Changed in GitHub"}
-          </span>
-        </li>
-      ))}
-    </ul>
-    {onOpen && (
-      <Button variant="outline" size="sm" onClick={onOpen} data-testid={openTestId}>
-        {openLabel}
-      </Button>
-    )}
-  </section>
-);
-
-const CODEOWNERS_HINT =
-  "Load the GitHub version in the CODEOWNERS editor and Commit Locally to keep it, or include " +
-  "CODEOWNERS in a PR campaign to put the project's version back.";
-const CUSTOM_FILE_HINT =
-  "Open the file under Project Files, load the GitHub version and Commit Locally to keep it, or " +
-  "include it in a PR campaign to put the project's version back.";
-
 /** How many custom files drifted: from the live check once it has loaded, else the project fetch's seed. */
 const driftedCustomFileCount = (liveLoaded: boolean, drift: CustomFileDriftDetail[], seeded: number) =>
   liveLoaded ? new Set(drift.map((d) => d.custom_file_id)).size : seeded;
 
+const KIND_LABEL: Record<DriftRow["kind"], string> = {
+  workflow: "Workflow",
+  custom_file: "Custom file",
+  codeowners: "CODEOWNERS",
+};
+
+/** What "Use GitHub version" does for this row's kind of file. */
+const githubVersionHint = (row: DriftRow): string => (row.kind === "workflow"
+  ? `Import the GitHub version from ${row.repo}: for this repository only, for the project, or for the project and its other repositories.`
+  : `Make the GitHub version from ${row.repo} the project's ${row.name}, as a local change. Deliver it to the other repositories with a campaign afterwards.`);
+
+interface RowActionsProps {
+  readonly row: DriftRow;
+  readonly busy: boolean;
+  readonly onKeep: () => void;
+  readonly onUseGithub: () => void;
+}
+
+/** The two ways to put a drifted file right, the same for every kind. */
+const RowActions: React.FC<RowActionsProps> = ({ row, busy, onKeep, onUseGithub }) => (
+  <>
+    <div className="border-t border-r border-slate-200 dark:border-slate-700 px-2 py-3 bg-slate-50/50 dark:bg-slate-800/50 flex flex-col gap-1">
+      <Button size="sm" variant="default" disabled={busy} onClick={onKeep} className="w-full justify-start"
+        data-testid="keep-actionsmanager-button">
+        Keep ActionsManager Version
+      </Button>
+      <p className="text-xs text-slate-600 dark:text-slate-400 mt-1 whitespace-normal">
+        Opens a PR campaign for <strong>{row.repo}</strong> carrying only this file, to review before
+        the pull requests open.{" "}
+        <span className="px-1.5 py-0.5 text-[0.65rem] rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200 align-middle">
+          Recommended
+        </span>
+      </p>
+    </div>
+    <div className="border-t border-slate-200 dark:border-slate-700 px-2 py-3 bg-slate-50/50 dark:bg-slate-800/50 flex flex-col gap-1">
+      <Button size="sm" variant="secondary" disabled={busy} onClick={onUseGithub} className="w-full justify-start"
+        data-testid="adopt-github-version-button">
+        Use GitHub Version
+      </Button>
+      <p className="text-xs text-slate-600 dark:text-slate-400 mt-1 whitespace-normal">{githubVersionHint(row)}</p>
+    </div>
+  </>
+);
+
+interface DeletedInGithubPanelProps {
+  readonly row: DriftRow;
+  readonly busy: boolean;
+  readonly onKeep: () => void;
+  /** Workflows only: accept the deletion everywhere. */
+  readonly onDeleteEverywhere?: () => void;
+}
+
 /**
- * Render two `<pre>` blocks side-by-side highlighting changed lines.
- * Lightweight (no extra deps) inline diff suitable for short workflow files.
- */
-/**
- * Shown instead of a diff when the workflow file no longer exists in GitHub.
+ * Shown instead of a diff when the file no longer exists in GitHub.
  *
  * A side-by-side diff renders the missing side as a single blank line, which
- * reads as "the file is empty" rather than "the file is gone". Adopting
- * GitHub's version is also impossible here — the server re-fetches and 404s —
- * so that action is replaced with the two that make sense: put the file back,
- * or accept the deletion and remove the workflow everywhere.
+ * reads as "the file is empty" rather than "the file is gone". Using GitHub's
+ * version is impossible here — there is none — so the actions are putting the
+ * file back, or (for a workflow) accepting the deletion everywhere.
  */
-const DeletedInGithubPanel: React.FC<{
-  detail: WorkflowDriftDetail;
-  busyAction: DriftDeliveryMode | null;
-  onRestorePR: () => void;
-  onRestoreDirect: () => void;
-  onDeleteEverywhere: () => void;
-}> = ({ detail, busyAction, onRestorePR, onRestoreDirect, onDeleteEverywhere }) => {
-  const disabled = busyAction !== null;
-  return (
-    <div
-      className="rounded-md border border-red-200 bg-red-50 p-4 dark:border-red-800 dark:bg-red-900/20"
-      data-testid="deleted-in-github-panel"
-    >
-      <p className="text-sm font-medium text-red-900 dark:text-red-200">
-        This workflow no longer exists in {detail.repo}
-      </p>
-      <p className="mt-1 text-xs text-red-800 dark:text-red-300">
-        The file was removed from GitHub outside ActionsManager. ActionsManager still manages
-        it, so it will keep being reported as drifted until you either put it back or remove it
-        here too.
-      </p>
-
-      <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+const DeletedInGithubPanel: React.FC<DeletedInGithubPanelProps> = ({ row, busy, onKeep, onDeleteEverywhere }) => (
+  <div className="rounded-md border border-red-200 bg-red-50 p-4 dark:border-red-800 dark:bg-red-900/20"
+    data-testid="deleted-in-github-panel">
+    <p className="text-sm font-medium text-red-900 dark:text-red-200">
+      This file no longer exists in {row.repo}
+    </p>
+    <p className="mt-1 text-xs text-red-800 dark:text-red-300">
+      It was removed from GitHub outside ActionsManager. ActionsManager still manages it, so it
+      keeps being reported as drifted until you put it back{onDeleteEverywhere ? " or remove it here too" : ""}.
+    </p>
+    <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+      <div className="flex-1">
+        <Button size="sm" variant="default" disabled={busy} onClick={onKeep} className="w-full justify-start"
+          data-testid="keep-actionsmanager-button">
+          Keep ActionsManager Version
+        </Button>
+        <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+          Opens a PR campaign for <strong>{row.repo}</strong> that adds the file back.
+        </p>
+      </div>
+      {onDeleteEverywhere && (
         <div className="flex-1">
-          <Button
-            size="sm"
-            variant="default"
-            disabled={disabled}
-            onClick={onRestorePR}
-            className="w-full justify-start"
-            data-testid="deleted-restore-pr-button"
-          >
-            {busyAction === "pr" ? "Creating pull request…" : "Recreate via Pull Request"}
-          </Button>
-          <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
-            Opens a pull request in <strong>{detail.repo}</strong> that adds the workflow back.
-          </p>
-        </div>
-        <div className="flex-1">
-          <Button
-            size="sm"
-            variant="destructive"
-            disabled={disabled}
-            onClick={onDeleteEverywhere}
-            className="w-full justify-start"
-            data-testid="delete-everywhere-button"
-          >
+          <Button size="sm" variant="destructive" disabled={busy} onClick={onDeleteEverywhere}
+            className="w-full justify-start" data-testid="delete-everywhere-button">
             Delete Everywhere
           </Button>
           <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
-            Accepts the deletion: removes this workflow from the other repositories and from
-            ActionsManager.
+            Accepts the deletion: opens pull requests removing this workflow from the other
+            repositories. It leaves ActionsManager when they merge.
           </p>
         </div>
-      </div>
-
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={onRestoreDirect}
-        className="mt-3 text-xs text-slate-600 underline hover:text-slate-900 disabled:opacity-50 dark:text-slate-400 dark:hover:text-slate-100"
-        data-testid="deleted-restore-direct-button"
-      >
-        {busyAction === "direct" ? "Restoring directly…" : "Or recreate it directly, without review"}
-      </button>
+      )}
     </div>
+  </div>
+);
+
+interface DriftRowDetailProps {
+  readonly row: DriftRow;
+  readonly managed: string;
+  readonly github: string;
+  readonly busy: boolean;
+  readonly onKeep: () => void;
+  readonly onUseGithub: () => void;
+  readonly onDeleteEverywhere: () => void;
+}
+
+/** An opened row: where it drifted, and the diff with its two actions, or the deleted panel. */
+const DriftRowDetail: React.FC<DriftRowDetailProps> = ({
+  row, managed, github, busy, onKeep, onUseGithub, onDeleteEverywhere,
+}) => (
+  <div className="space-y-2">
+    <p className="text-sm text-slate-700 dark:text-slate-300">
+      Repository: <strong>{row.repo}</strong>
+      {" · "}Target branch: <strong>{row.branch}</strong>
+    </p>
+    {row.message && <p className="text-xs text-slate-500 dark:text-slate-400">{row.message}</p>}
+    {row.deleted ? (
+      <DeletedInGithubPanel row={row} busy={busy} onKeep={onKeep}
+        onDeleteEverywhere={row.kind === "workflow" ? onDeleteEverywhere : undefined} />
+    ) : (
+      <div className="border border-slate-200 dark:border-slate-700 rounded-md overflow-hidden" style={diffGridStyle}>
+        <DiffColumns left={managed} right={github}
+          leftLabel="ActionsManager managed version" rightLabel="Current GitHub version" />
+        <RowActions row={row} busy={busy} onKeep={onKeep} onUseGithub={onUseGithub} />
+      </div>
+    )}
+  </div>
+);
+
+const StatusBadge: React.FC<{ readonly deleted: boolean }> = ({ deleted }) => (deleted ? (
+  <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200"
+    data-testid="drift-status-deleted">
+    Deleted in GitHub
+  </span>
+) : (
+  <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">
+    Drift detected
+  </span>
+));
+
+/** The badges beside a row's name: its kind for a file, sharing and override for a workflow. */
+const RowBadges: React.FC<{ readonly row: DriftRow }> = ({ row }) => (
+  <>
+    {row.kind !== "workflow" && (
+      <span className="px-2 py-0.5 text-xs rounded-full bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300"
+        data-testid="drift-kind-badge">
+        {KIND_LABEL[row.kind]}
+      </span>
+    )}
+    {row.workflow?.is_shared_workflow && (
+      <span className="px-2 py-0.5 text-xs rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
+        data-testid="shared-workflow-badge">
+        Shared Workflow
+      </span>
+    )}
+    {row.workflow?.has_repo_override && (
+      <span className="px-2 py-0.5 text-xs rounded-full bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200"
+        data-testid="repo-override-badge"
+        title="This repository uses a workflow override and is no longer following the shared project workflow for this file.">
+        Repo Override
+      </span>
+    )}
+  </>
+);
+
+interface DriftTableRowProps {
+  readonly row: DriftRow;
+  readonly selected: boolean;
+  readonly groupSize: number;
+  readonly open: boolean;
+  readonly loading: boolean;
+  readonly onToggleSelected: () => void;
+  readonly onSelectGroup: () => void;
+  readonly onToggleDiff: () => void;
+}
+
+const DriftTableRow: React.FC<DriftTableRowProps> = ({
+  row, selected, groupSize, open, loading, onToggleSelected, onSelectGroup, onToggleDiff,
+}) => {
+  const diffLabel = open ? "Hide Diff" : "View Diff";
+  return (
+    <tr className="border-b border-slate-100 dark:border-slate-800">
+      <td className="py-2 pr-2">
+        <input type="checkbox" data-testid={`select-drift-${row.key}`} checked={selected} onChange={onToggleSelected}
+          aria-label={`Select ${row.name} in ${row.repo} on ${row.branch}`} />
+      </td>
+      <td className="py-2 pr-4 font-medium">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={row.kind === "workflow" ? undefined : "font-mono"}>{row.name}</span>
+          {groupSize > 1 && (
+            <button type="button" className="text-xs text-blue-600 hover:underline dark:text-blue-400"
+              data-testid={`select-group-${row.key}`} onClick={onSelectGroup}>
+              {groupSize} identical — select all
+            </button>
+          )}
+          <RowBadges row={row} />
+        </div>
+      </td>
+      <td className="py-2 pr-4">{row.repo}</td>
+      <td className="py-2 pr-4">{row.branch}</td>
+      <td className="py-2 pr-4"><StatusBadge deleted={row.deleted} /></td>
+      <td className="py-2 pr-4 text-xs text-slate-500 dark:text-slate-400">
+        {row.lastChecked ? new Date(row.lastChecked).toLocaleString() : "—"}
+      </td>
+      <td className="py-2">
+        <Button variant="outline" size="sm" onClick={onToggleDiff} disabled={loading}>
+          {loading ? "Loading…" : diffLabel}
+        </Button>
+      </td>
+    </tr>
   );
 };
 
-const SideBySideDiff: React.FC<{
-  left: string;
-  right: string;
-  repo: string;
-  branch: string;
-  onAdoptGithub: () => void;
-  onRestorePR: () => void;
-  onRestoreDirect: () => void;
-  /** Which restore action is currently running for this row, if any. */
-  busyAction: DriftDeliveryMode | null;
-}> = ({ left, right, repo, branch, onAdoptGithub, onRestorePR, onRestoreDirect, busyAction }) => {
-  const disabled = busyAction !== null;
-  return (
-    <div
-      className="border border-slate-200 dark:border-slate-700 rounded-md overflow-hidden"
-      style={diffGridStyle}
-    >
-      <DiffColumns
-        left={left}
-        right={right}
-        leftLabel="ActionsManager managed version"
-        rightLabel="Current GitHub version"
-      />
+interface SelectionBarProps {
+  readonly total: number;
+  readonly selected: DriftRow[];
+  readonly busy: boolean;
+  readonly onSelectAll: () => void;
+  readonly onDeselectAll: () => void;
+  readonly onKeep: () => void;
+  readonly onUseGithub: () => void;
+}
 
-      {/* Action Buttons aligned with columns */}
-      <div className="border-t border-r border-slate-200 dark:border-slate-700 px-2 py-3 bg-slate-50/50 dark:bg-slate-800/50 flex flex-col gap-4">
-        <div>
-          <Button
-            size="sm"
-            variant="default"
-            disabled={disabled}
-            onClick={onRestorePR}
-            className="w-full justify-start"
-            data-testid="restore-pr-button"
-          >
-            {busyAction === "pr" ? "Creating pull request…" : "Create Fix Pull Request"}
+/** Selecting rows and putting them right together, the same two actions as one row's. */
+const SelectionBar: React.FC<SelectionBarProps> = ({ total, selected, busy, onSelectAll, onDeselectAll, onKeep, onUseGithub }) => {
+  const conflict = githubVersionConflict(selected);
+  return (
+    <div className="flex flex-wrap items-center gap-3 px-1" data-testid="drift-selection-bar">
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          data-testid="select-all-drifts"
+          checked={selected.length > 0 && selected.length === total}
+          ref={(el) => {
+            if (el) el.indeterminate = selected.length > 0 && selected.length < total;
+          }}
+          onChange={(e) => (e.target.checked ? onSelectAll() : onDeselectAll())}
+        />
+        <span className="text-slate-600 dark:text-slate-400">{selected.length} of {total} selected</span>
+      </label>
+      <Button variant="outline" size="sm" onClick={onSelectAll}>Select All</Button>
+      <Button variant="outline" size="sm" onClick={onDeselectAll}>Deselect All</Button>
+      {selected.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 ml-auto" data-testid="bulk-action-toolbar">
+          <Button variant="outline" size="sm" disabled={busy} onClick={onKeep} data-testid="bulk-keep-button">
+            {`Keep ActionsManager Version (${selected.length})`}
           </Button>
-          <p className="text-xs text-slate-600 dark:text-slate-400 mt-1 whitespace-normal">
-            Opens a pull request only in <strong>{repo}</strong> that restores this
-            workflow to the ActionsManager-managed version. No other repositories are
-            changed.{" "}
-            <span className="px-1.5 py-0.5 text-[0.65rem] rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200 align-middle">
-              Recommended
-            </span>
-          </p>
-        </div>
-        <div>
-          <Button
-            size="sm"
-            variant="destructive"
-            disabled={disabled}
-            onClick={onRestoreDirect}
-            className="w-full justify-start"
-            data-testid="restore-direct-button"
-          >
-            {busyAction === "direct" ? "Restoring directly…" : "Restore Directly"}
+          <Button variant="outline" size="sm" disabled={busy || conflict !== null} title={conflict ?? undefined}
+            onClick={onUseGithub} data-testid="bulk-use-github-button">
+            {busy ? "Working…" : `Use GitHub Version (${selected.length})`}
           </Button>
-          <p className="text-xs text-slate-600 dark:text-slate-400 mt-1 whitespace-normal">
-            Immediately overwrites the workflow on <strong>{branch}</strong> in{" "}
-            <strong>{repo}</strong> with the ActionsManager-managed version. No pull
-            request is created.{" "}
-            <span className="px-1.5 py-0.5 text-[0.65rem] rounded-full bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200 align-middle">
-              Immediate GitHub change
-            </span>
-          </p>
         </div>
-      </div>
-      <div className="border-t border-slate-200 dark:border-slate-700 px-2 py-3 bg-slate-50/50 dark:bg-slate-800/50 flex flex-col gap-1">
-        <Button
-          size="sm"
-          variant="secondary"
-          disabled={disabled}
-          onClick={onAdoptGithub}
-          className="w-full justify-start"
-          data-testid="adopt-github-version-button"
-        >
-          Adopt GitHub Version
-        </Button>
-        <p className="text-xs text-slate-600 dark:text-slate-400 mt-1 whitespace-normal">
-          Import the GitHub version of <strong>{repo}</strong> into ActionsManager —
-          choose to keep it local-only (no GitHub change), sync it to the other
-          repositories, or set a per-repo override.
-        </p>
-      </div>
+      )}
     </div>
   );
 };
 
 /**
- * Scope-aware drift resolution modal: lets the user choose between adopting
- * the GitHub version for the whole project (and syncing the other repos),
- * adopting locally only (current behaviour, with explicit warning), or
- * creating a per-repo override so this repo can intentionally diverge.
+ * Scope-aware drift resolution modal for a workflow: lets the user choose
+ * between adopting the GitHub version for the whole project (and opening pull
+ * requests to the other repos), adopting locally only, or creating a per-repo
+ * override so this repo can intentionally diverge.
  */
 const AdoptGithubVersionModal: React.FC<{
   open: boolean;
@@ -383,14 +426,12 @@ const AdoptGithubVersionModal: React.FC<{
   onResolved: (message: string) => void;
 }> = ({ open, onClose, detail, user, onResolved }) => {
   const [mode, setMode] = useState<AdoptResolutionMode>("adopt_project_and_sync");
-  const [delivery, setDelivery] = useState<DriftDeliveryMode>("pr");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
       setMode("adopt_project_and_sync");
-      setDelivery("pr");
       setSubmitting(false);
       setError(null);
     }
@@ -418,11 +459,9 @@ const AdoptGithubVersionModal: React.FC<{
         repo_name: detail.repo,
         branch: detail.branch,
         resolution_mode: mode,
-        delivery_mode: mode === "adopt_project_and_sync" ? delivery : undefined,
       });
       // Branch on the structured response: keep modal open on partial-failure
-      // (e.g. some direct pushes failed) so the user sees what happened and
-      // can retry or pick a different mode.
+      // so the user sees what happened and can retry or pick a different mode.
       if (response.success === false) {
         setError(response.message || "Adoption did not fully succeed.");
         return;
@@ -440,7 +479,7 @@ const AdoptGithubVersionModal: React.FC<{
     <Dialog open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
       <DialogContent className="max-w-2xl" data-testid="adopt-github-version-modal">
         <DialogHeader>
-          <DialogTitle>Adopt GitHub Version</DialogTitle>
+          <DialogTitle>Use GitHub Version</DialogTitle>
           <DialogDescription>
             {isShared ? (
               <>
@@ -488,33 +527,9 @@ const AdoptGithubVersionModal: React.FC<{
                 </div>
                 <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
                   Use the GitHub version from {detail.repo} as the new project workflow,
-                  then sync that version to {affected.length} other
-                  {" "}repository{affected.length === 1 ? "" : "ies"} in this project.
-                  {" "}<strong>Writes to GitHub</strong> in those repositories (via pull
-                  request or direct commit, below).
+                  then open pull requests delivering it to {affected.length} other
+                  {" "}repositor{affected.length === 1 ? "y" : "ies"} in this project.
                 </p>
-                {mode === "adopt_project_and_sync" && (
-                  <div className="mt-2 flex items-center gap-3 text-sm">
-                    <label className="flex items-center gap-1">
-                      <input
-                        type="radio"
-                        name="adopt-delivery"
-                        checked={delivery === "pr"}
-                        onChange={() => setDelivery("pr")}
-                      />{' '}
-                      Pull request
-                    </label>
-                    <label className="flex items-center gap-1">
-                      <input
-                        type="radio"
-                        name="adopt-delivery"
-                        checked={delivery === "direct"}
-                        onChange={() => setDelivery("direct")}
-                      />{' '}
-                      Direct commit
-                    </label>
-                  </div>
-                )}
               </div>
             </div>
           </label>
@@ -547,7 +562,7 @@ const AdoptGithubVersionModal: React.FC<{
                 </p>
                 {mode === "adopt_local_only" && affected.length > 0 && (
                   <div className="mt-2 px-2 py-1 text-xs rounded bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-200">
-                    ⚠️ This may cause other repositories to show drift.
+                    ⚠️ The other repositories keep the previous version until it is delivered to them.
                   </div>
                 )}
               </div>
@@ -613,6 +628,130 @@ const AdoptGithubVersionModal: React.FC<{
   );
 };
 
+interface DriftSummaryBarProps {
+  readonly hasDrift: boolean;
+  readonly statusRow: { icon: string; message: string };
+  readonly uncheckedCount: number;
+  readonly staleReason: string | null;
+  readonly summaryText: string;
+  readonly checking: boolean;
+  readonly canReviewDrift: boolean;
+  readonly onCheckNow: () => void;
+  readonly onReview: () => void;
+}
+
+/**
+ * The banner naming what drifted, or, with nothing to review, the status row.
+ * The status row is always there for a clean or never-checked project, so it
+ * always has a way to trigger a live check: Review Drift only exists once
+ * drift is already known.
+ */
+const DriftSummaryBar: React.FC<DriftSummaryBarProps> = ({
+  hasDrift, statusRow, uncheckedCount, staleReason, summaryText, checking, canReviewDrift, onCheckNow, onReview,
+}) => (hasDrift ? (
+  <div
+    className="max-w-full px-3 py-1.5 rounded-lg inline-flex items-center gap-3 text-sm bg-amber-50 border border-amber-200 text-amber-900 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"
+    role="alert"
+    aria-live="polite"
+    data-testid="drift-banner"
+  >
+    <span aria-hidden="true">⚠️</span>
+    <span className="font-medium">{summaryText}</span>
+    <Button variant="outline" size="sm" onClick={onReview} disabled={!canReviewDrift} data-testid="review-drift-button">
+      {canReviewDrift ? "Review Drift" : "Checking…"}
+    </Button>
+  </div>
+) : (
+  <output
+    className="max-w-full px-3 py-1.5 rounded-lg inline-flex items-center gap-3 text-sm bg-slate-100 border border-slate-300 text-slate-800 dark:bg-slate-800/60 dark:border-slate-600 dark:text-slate-200"
+    data-testid="drift-status-row"
+  >
+    <span aria-hidden="true">{statusRow.icon}</span>
+    <span className="font-medium">{statusRow.message}</span>
+    {uncheckedCount === 0 && staleReason && (
+      <span className="text-xs text-slate-500 dark:text-slate-400">{staleReason}</span>
+    )}
+    <Button variant="outline" size="sm" onClick={onCheckNow} disabled={checking} data-testid="drift-inline-check-now-button">
+      {checking ? "Checking…" : "Check Now"}
+    </Button>
+  </output>
+));
+
+interface DriftModalHeaderProps {
+  readonly lastChecked: string | null;
+  readonly staleReason: string | null;
+  readonly checking: boolean;
+  readonly onCheckNow: () => void;
+}
+
+const DriftModalHeader: React.FC<DriftModalHeaderProps> = ({ lastChecked, staleReason, checking, onCheckNow }) => (
+  <DialogHeader>
+    <DialogTitle className="text-amber-700 dark:text-amber-400">⚠️ Drift Detected</DialogTitle>
+    <DialogDescription>
+      The following files were changed directly in GitHub. Review each diff, then keep the
+      ActionsManager version through a pull request, or use the GitHub version.
+    </DialogDescription>
+    <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+      <span data-testid="drift-last-checked">
+        {lastChecked ? `Last checked ${new Date(lastChecked).toLocaleString()}` : "Never checked"}
+      </span>
+      <Button variant="outline" size="sm" onClick={onCheckNow} disabled={checking} data-testid="drift-check-now-button">
+        {checking ? "Checking…" : "Check Now"}
+      </Button>
+    </div>
+    {staleReason && (
+      // Without this the timestamp simply stops advancing and the
+      // feature reads as broken rather than blocked on a token.
+      <p
+        className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:bg-amber-900/20 dark:text-amber-200"
+        data-testid="drift-stale-reason"
+      >
+        {staleReason}
+      </p>
+    )}
+    <a
+      className="text-xs font-medium text-blue-600 hover:underline dark:text-blue-400 self-start"
+      href={getDocsUrl("driftDetection")}
+      rel="noreferrer"
+      target="_blank"
+    >
+      Learn about drift detection →
+    </a>
+  </DialogHeader>
+);
+
+/** What the last action did: done, or why it failed. */
+const ResultNotices: React.FC<{ readonly success: string | null; readonly error: string | null }> = ({ success, error }) => (
+  <>
+    {success && (
+      <div className="px-3 py-2 text-sm rounded bg-green-50 text-green-800 border border-green-200 dark:bg-green-900/20 dark:text-green-200 dark:border-green-800">
+        ✓ {success}
+      </div>
+    )}
+    {error && (
+      <div className="px-3 py-2 text-sm rounded bg-red-50 text-red-800 border border-red-200 dark:bg-red-900/20 dark:text-red-200 dark:border-red-800">
+        {error}
+      </div>
+    )}
+  </>
+);
+
+/** "Use the GitHub version" of the selected custom files and CODEOWNERS, worded for one or several. */
+const githubVersionConfirmText = (rows: DriftRow[]): string => {
+  if (rows.length === 1) {
+    const [row] = rows;
+    return `${row.name} from ${row.repo} @ ${row.branch} becomes the project's version, saved as a local change. `
+      + "Drift clears wherever GitHub holds this copy; open a PR campaign to deliver it to the other repositories.";
+  }
+  return `The GitHub versions of ${rows.length} files become the project's versions, saved as local changes. `
+    + "Drift clears wherever GitHub holds those copies; open a PR campaign to deliver them to the other repositories.";
+};
+
+/** The outcome of a bulk "Use GitHub version" across workflows and files. */
+const bulkOutcome = (okCount: number, failures: string[]): { ok: boolean; message: string } => (failures.length === 0
+  ? { ok: true, message: `${okCount} of ${okCount} resolved successfully.` }
+  : { ok: false, message: `${okCount} resolved, ${failures.length} failed: ${failures.join("; ")}` });
+
 const DriftDetection: React.FC<DriftDetectionProps> = ({
   user,
   projectId,
@@ -624,7 +763,10 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
   seededDriftNames,
   seededCodeownersDrift = false,
   seededCustomFileDriftCount = 0,
-  onOpenCodeowners,
+  onKeepActionsManagerVersion,
+  onUseGithubVersionOfFiles,
+  contentOf,
+  onProjectChanged,
 }) => {
   const [drifts, setDrifts] = useState<WorkflowDriftDetail[]>([]);
   const [codeownersDrifts, setCodeownersDrifts] = useState<CodeownersDriftDetail[]>([]);
@@ -645,55 +787,42 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
   const [checking, setChecking] = useState(false);
   // GitHub's side of a diff, fetched when a row is expanded. The cached list
   // omits it deliberately: a stored snapshot may no longer match GitHub.
-  const [liveDiffs, setLiveDiffs] = useState<Record<string, WorkflowDriftDetail>>({});
+  const [githubCopies, setGithubCopies] = useState<Record<string, string>>({});
   const [diffLoadingKey, setDiffLoadingKey] = useState<string | null>(null);
-  const [resolving, setResolving] = useState<string | null>(null);
-  const [resolvingMode, setResolvingMode] = useState<DriftDeliveryMode | null>(null);
   const [adoptDetail, setAdoptDetail] = useState<WorkflowDriftDetail | null>(null);
-  // Direct restore overwrites GitHub with no PR review, so it is gated behind
-  // an explicit confirmation naming the repo + target branch.
-  const [confirmDirect, setConfirmDirect] = useState<WorkflowDriftDetail | null>(null);
-  // "Delete Everywhere" for a workflow already removed from GitHub: drops the
-  // file from the project's other repos and the workflow from ActionsManager.
-  const [confirmDeleteEverywhere, setConfirmDeleteEverywhere] = useState<WorkflowDriftDetail | null>(null);
-  const [deletingEverywhere, setDeletingEverywhere] = useState(false);
+  // "Use GitHub version" for custom files and CODEOWNERS replaces the project's copy, so it is confirmed first.
+  const [confirmUseGithub, setConfirmUseGithub] = useState<DriftRow[] | null>(null);
+  // "Delete Everywhere" for a workflow already removed from GitHub: opens
+  // pull requests dropping the file from the project's other repos.
+  const [confirmDeleteEverywhere, setConfirmDeleteEverywhere] = useState<DriftRow | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  // Bulk-fix: select multiple drifted workflows and resolve them together.
+  // Bulk-fix: select multiple drifted files and put them right together.
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
-  const [bulkResolving, setBulkResolving] = useState<DriftDeliveryMode | "use_github" | null>(null);
-  // Direct restore overwrites GitHub with no PR review - same confirmation
-  // gate as the single-item direct restore above, just naming the batch.
-  const [confirmBulkDirect, setConfirmBulkDirect] = useState(false);
 
-  const driftKey = useCallback(
-    (d: WorkflowDriftDetail) => `${d.workflow_id}::${d.repo}::${d.branch}`,
+  const rows = useMemo(
+    () => driftRows(drifts, codeownersDrifts, customFileDrifts),
+    [drifts, codeownersDrifts, customFileDrifts],
+  );
+  const selectedRows = useMemo(() => rows.filter((row) => selectedKeys.has(row.key)), [rows, selectedKeys]);
+
+  // Groups rows of the same file that hold the identical GitHub-side change,
+  // so the user can select a whole group in one click instead of eyeballing
+  // diffs one at a time. github_sha is a content hash of that file's GitHub
+  // blob, so it's a cheap and reliable equality key. __solo__-prefixed keys
+  // guarantee rows without one never falsely group together.
+  const groupKeyFor = useCallback(
+    (row: DriftRow) => row.githubSha ?? `__solo__${row.key}`,
     [],
   );
-
-  const driftByKey = useMemo(() => {
-    const m = new Map<string, WorkflowDriftDetail>();
-    drifts.forEach((d) => m.set(driftKey(d), d));
-    return m;
-  }, [drifts, driftKey]);
-
-  // Groups drifted workflows that have the identical GitHub-side change, so
-  // the user can select a whole group in one click instead of eyeballing
-  // diffs one at a time. github_sha is a content hash of that file's GitHub
-  // blob, so it's a cheap and reliable equality key; github_yaml is a
-  // fallback for the rare case a sha wasn't available. __solo__-prefixed
-  // keys guarantee items with neither never falsely group together.
-  const groupKeyFor = useCallback(
-    (d: WorkflowDriftDetail) => d.github_sha ?? d.github_yaml ?? `__solo__${driftKey(d)}`,
-    [driftKey],
-  );
   const driftGroups = useMemo(() => {
-    const groups = new Map<string, WorkflowDriftDetail[]>();
-    drifts.forEach((d) => {
-      const gk = groupKeyFor(d);
-      groups.set(gk, [...(groups.get(gk) ?? []), d]);
+    const groups = new Map<string, DriftRow[]>();
+    rows.forEach((row) => {
+      const gk = groupKeyFor(row);
+      groups.set(gk, [...(groups.get(gk) ?? []), row]);
     });
     return groups;
-  }, [drifts, groupKeyFor]);
+  }, [rows, groupKeyFor]);
 
   const toggleSelected = useCallback((k: string) => {
     setSelectedKeys((prev) => {
@@ -704,38 +833,28 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
     });
   }, []);
 
-  const selectAll = useCallback(() => {
-    setSelectedKeys(new Set(drifts.map(driftKey)));
-  }, [drifts, driftKey]);
+  const selectAll = useCallback(() => setSelectedKeys(new Set(rows.map((row) => row.key))), [rows]);
+  const deselectAll = useCallback(() => setSelectedKeys(new Set()), []);
 
-  const deselectAll = useCallback(() => {
-    setSelectedKeys(new Set());
-  }, []);
+  const selectGroup = useCallback((row: DriftRow) => {
+    const group = driftGroups.get(groupKeyFor(row)) ?? [row];
+    setSelectedKeys((prev) => new Set([...prev, ...group.map((g) => g.key)]));
+  }, [driftGroups, groupKeyFor]);
 
-  const selectGroup = useCallback((d: WorkflowDriftDetail) => {
-    const group = driftGroups.get(groupKeyFor(d)) ?? [d];
-    setSelectedKeys((prev) => {
-      const next = new Set(prev);
-      group.forEach((g) => next.add(driftKey(g)));
-      return next;
-    });
-  }, [driftGroups, groupKeyFor, driftKey]);
-
-  // Mirrors `drifts` so a failed background check can fall back to the last
-  // known state without adding `drifts` as a loadDrift dependency (which would
-  // re-trigger the load-on-mount effect on every successful load).
-  const driftsRef = useRef<WorkflowDriftDetail[]>([]);
+  // Mirrors the row count so a failed background check can fall back to the
+  // last known state without adding the lists as loadDrift dependencies (which
+  // would re-trigger the load-on-mount effect on every successful load).
+  const rowCountRef = useRef(0);
   // Discards out-of-order responses, e.g. the user navigates to a different
   // project before an in-flight request resolves. Same idiom as
   // ProjectMgmt.tsx's loadRequestCounterRef.
   const requestIdRef = useRef(0);
 
-  const loadDrift = useCallback(async (
-    opts?: { refresh?: boolean },
-  ): Promise<WorkflowDriftDetail[]> => {
+  /** Reads the drift lists; resolves to how many drifted rows there are now. */
+  const loadDrift = useCallback(async (opts?: { refresh?: boolean }): Promise<number> => {
     const requestId = ++requestIdRef.current;
     if (!user || !projectId || !projectName || selectedRepos.length === 0) {
-      driftsRef.current = [];
+      rowCountRef.current = 0;
       setDrifts([]);
       setCodeownersDrifts([]);
       setCustomFileDrifts([]);
@@ -751,16 +870,18 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
       // loads there is no projectId yet — stay pending so the seed still shows.
       if (projectId) setLiveLoaded(true);
       onDriftLoaded?.([], [], []);
-      return [];
+      return 0;
     }
     setError(null);
     try {
       const summary = await getProjectDrift(projectId, user, { refresh: opts?.refresh });
-      if (requestId !== requestIdRef.current) return driftsRef.current;
-      driftsRef.current = summary.drifted_workflows;
+      if (requestId !== requestIdRef.current) return rowCountRef.current;
+      const codeowners = summary.drifted_codeowners ?? [];
+      const customFiles = summary.drifted_custom_files ?? [];
+      rowCountRef.current = summary.drifted_workflows.length + codeowners.length + customFiles.length;
       setDrifts(summary.drifted_workflows);
-      setCodeownersDrifts(summary.drifted_codeowners ?? []);
-      setCustomFileDrifts(summary.drifted_custom_files ?? []);
+      setCodeownersDrifts(codeowners);
+      setCustomFileDrifts(customFiles);
       setLastChecked(summary.last_checked ?? null);
       setStaleReason(summary.stale_reason ?? null);
       setDriftStatus(summary.drift_status ?? null);
@@ -768,15 +889,15 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
       // list is not evidence that everything is in sync.
       setUncheckedCount(summary.unchecked_count ?? 0);
       setLiveLoaded(true);
-      onDriftLoaded?.(summary.drifted_workflows, summary.drifted_codeowners ?? [], summary.drifted_custom_files ?? []);
-      return summary.drifted_workflows;
+      onDriftLoaded?.(summary.drifted_workflows, codeowners, customFiles);
+      return rowCountRef.current;
     } catch (err: unknown) {
-      if (requestId !== requestIdRef.current) return driftsRef.current;
+      if (requestId !== requestIdRef.current) return rowCountRef.current;
       setError(driftErrorMessage(err, "Failed to check drift"));
       // A failed background check must not erase a previously known drift
       // state, so liveLoaded stays as-is: on a first-load failure the seeded
       // banner keeps rendering rather than blanking out.
-      return driftsRef.current;
+      return rowCountRef.current;
     }
   }, [user, projectId, projectName, selectedRepos, onDriftLoaded]);
 
@@ -795,230 +916,162 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
     loadDrift();
   }, [loadDrift, refreshSignal]);
 
+  // A row that no longer exists cannot stay selected out of sight.
+  useEffect(() => {
+    setSelectedKeys((prev) => {
+      const kept = new Set([...prev].filter((k) => rows.some((row) => row.key === k)));
+      return kept.size === prev.size ? prev : kept;
+    });
+  }, [rows]);
+
   /** Run a live check on demand. */
   const handleCheckNow = useCallback(async () => {
     setChecking(true);
     try {
       await loadDrift({ refresh: true });
       // Anything fetched for a diff describes the previous check.
-      setLiveDiffs({});
+      setGithubCopies({});
     } finally {
       setChecking(false);
     }
   }, [loadDrift]);
 
-  /**
-   * Expand a row, fetching GitHub's current content if the cached row lacks it.
-   *
-   * The list is served from stored state and omits github_yaml on purpose, so
-   * this is where the one API call per opened diff happens.
-   */
-  const handleToggleDiff = useCallback(async (detail: WorkflowDriftDetail, key: string) => {
-    if (openDiffKey === key) {
+  /** GitHub's content on the row's (repo, branch): one read per opened diff. */
+  const readGithubCopy = useCallback(async (row: DriftRow): Promise<string> => {
+    if (row.kind !== "workflow") return fileGithubCopy(row, user, projectId ?? 0, projectName);
+    const live = await getWorkflowDrift(row.fileId, user);
+    const match = live.drift_details.find((d) => d.repo === row.repo && d.branch === row.branch);
+    return match?.github_yaml ?? "";
+  }, [user, projectId, projectName]);
+
+  /** Expand a row, fetching GitHub's current content the stored list leaves out. */
+  const handleToggleDiff = useCallback(async (row: DriftRow) => {
+    if (openDiffKey === row.key) {
       setOpenDiffKey(null);
       return;
     }
-    setOpenDiffKey(key);
-    if (detail.github_yaml !== null || liveDiffs[key] || !user) return;
+    setOpenDiffKey(row.key);
+    const known = row.workflow?.github_yaml ?? githubCopies[row.key];
+    if (known != null || row.deleted || !user) return;
 
-    setDiffLoadingKey(key);
+    setDiffLoadingKey(row.key);
     try {
-      const live = await getWorkflowDrift(detail.workflow_id, user);
-      const match = live.drift_details.find(
-        (d) => d.repo === detail.repo && d.branch === detail.branch,
-      );
-      if (match) setLiveDiffs((prev) => ({ ...prev, [key]: match }));
+      const content = await readGithubCopy(row);
+      setGithubCopies((prev) => ({ ...prev, [row.key]: content }));
     } catch (err: unknown) {
       setError(driftErrorMessage(err, "Failed to load the GitHub version"));
     } finally {
       setDiffLoadingKey(null);
     }
-  }, [openDiffKey, liveDiffs, user]);
+  }, [openDiffKey, githubCopies, user, readGithubCopy]);
 
-  const handleResolve = useCallback(
-    async (
-      detail: WorkflowDriftDetail,
-      resolution: "use_github" | "restore_actionsmanager",
-      deliveryMode?: DriftDeliveryMode,
-    ) => {
-      const key = driftKey(detail);
-      setResolving(key);
-      setResolvingMode(deliveryMode ?? null);
-      setError(null);
-      setSuccess(null);
-      try {
-        const response = await resolveWorkflowDrift(detail.workflow_id, {
-          github_user: user,
-          repo: detail.repo,
-          branch: detail.branch,
-          resolution,
-          delivery_mode: deliveryMode,
-          // What this decision was based on. If GitHub has moved on, the
-          // backend 409s rather than overwriting the newer content.
-          expected_github_sha: detail.github_sha,
-        });
+  /** "Keep the ActionsManager version": the campaign modal with exactly these files, to their repositories. */
+  const handleKeep = useCallback((picked: DriftRow[]) => {
+    setShowModal(false);
+    setSelectedKeys(new Set());
+    onKeepActionsManagerVersion?.(picked);
+  }, [onKeepActionsManagerVersion]);
 
-        // Check the resolution result state
-        if (response.state === "synced") {
-          // Success - drift resolved
-          setSuccess(response.message || "Drift resolved successfully");
-          onWorkflowStatusesChanged?.([detail.workflow_name], "synced_with_github");
+  /** After an action: re-read the list, and close the review once nothing is left. */
+  const settle = useCallback(async (message: string, ok = true) => {
+    const remaining = await loadDrift();
+    if (ok && remaining === 0) {
+      setSuccess("All drift resolved.");
+      setTimeout(() => setShowModal(false), 2000);
+      return;
+    }
+    // loadDrift() clears the error as soon as it starts, so the outcome is set after it.
+    if (ok) setSuccess(message);
+    else setError(message);
+  }, [loadDrift]);
 
-          // Refresh drift data to update badges and capture fresh list
-          const refreshed = await loadDrift();
+  /** Workflows' rows through the bulk resolve; resolves to the failures it reports. */
+  const adoptGithubForWorkflows = useCallback(async (picked: DriftRow[]): Promise<string[]> => {
+    if (picked.length === 0 || !projectId) return [];
+    const response = await bulkResolveWorkflowDrift(projectId, {
+      github_user: user,
+      items: picked.map((row) => ({
+        workflow_id: row.fileId,
+        repo: row.repo,
+        branch: row.branch,
+        // Lets the backend reject an item whose file moved on since the check.
+        expected_github_sha: row.githubSha,
+      })),
+      resolution: "use_github",
+    });
+    const succeeded = response.results.filter((r) => r.success);
+    const names = succeeded
+      .map((r) => picked.find((row) => row.fileId === r.workflow_id && row.repo === r.repo)?.workflow?.workflow_name)
+      .filter((name): name is string => Boolean(name));
+    // This component refreshes its own list; the parent's workflow state, and
+    // the status badges it drives, need the same explicit patch.
+    if (names.length > 0) onWorkflowStatusesChanged?.(names, "synced_with_github");
+    return response.results.filter((r) => !r.success).map((r) => `${r.repo} (${r.message})`);
+  }, [projectId, user, onWorkflowStatusesChanged]);
 
-          // Close the diff for this workflow
-          if (openDiffKey === key) setOpenDiffKey(null);
-
-          // If no drifts remain (per refreshed data), show completion message
-          if (refreshed.length === 0) {
-            setSuccess("All workflow drift resolved.");
-            // Close modal after a delay
-            setTimeout(() => setShowModal(false), 2000);
-          }
-        } else if (response.state === "drifted") {
-          // Drift was not resolved - show warning
-          setError(response.message || "Drift was not resolved. Local and GitHub versions still differ.");
-          // Keep the diff open
-        } else if (response.state === "pr_pending") {
-          // PR created — the drift clears once the PR is merged, not now.
-          setSuccess(
-            response.message
-              || `Pull request opened in ${detail.repo}. Review and merge it to complete the restore.`,
-          );
-          onWorkflowStatusesChanged?.([detail.workflow_name], "under_review");
-          await loadDrift();
-          if (openDiffKey === key) setOpenDiffKey(null);
-        } else {
-          // Unknown state or no state - refresh and show message
-          setSuccess(response.message);
-          await loadDrift();
-          if (openDiffKey === key) setOpenDiffKey(null);
-        }
-      } catch (err: unknown) {
-        const message = driftErrorMessage(err, "Resolution failed");
-        // A 409 means the file moved on, and the row still holds the SHA that
-        // was just rejected — refresh so retrying compares against what is
-        // actually on GitHub instead of failing identically forever. loadDrift
-        // clears the error itself, so set the message after it, not before.
-        if ((err as { response?: { status?: number } })?.response?.status === 409) {
-          await loadDrift();
-        }
-        // Keep diff open on error so the user can see what they were resolving.
-        setError(message);
-      } finally {
-        setResolving(null);
-        setResolvingMode(null);
-      }
-    },
-    [driftKey, loadDrift, openDiffKey, user, onWorkflowStatusesChanged],
-  );
-
-  const handleBulkResolve = useCallback(
-    async (resolution: DriftResolution, deliveryMode?: DriftDeliveryMode) => {
-      if (!projectId || selectedKeys.size === 0) return;
-      const items: BulkResolveDriftItem[] = [];
-      selectedKeys.forEach((k) => {
-        const d = driftByKey.get(k);
-        // expected_github_sha lets the backend reject any item whose file moved
-        // on since the check, without failing the rest of the batch.
-        if (d) items.push({
-          workflow_id: d.workflow_id,
-          repo: d.repo,
-          branch: d.branch,
-          expected_github_sha: d.github_sha,
-        });
-      });
-      if (items.length === 0) return;
-
-      setBulkResolving(deliveryMode ?? "use_github");
-      setError(null);
-      setSuccess(null);
-      try {
-        const response = await bulkResolveWorkflowDrift(projectId, {
-          github_user: user,
-          items,
-          resolution,
-          delivery_mode: deliveryMode,
-        });
-        const okCount = response.results.filter((r) => r.success).length;
-        const failCount = response.results.length - okCount;
-        const failures = response.results.filter((r) => !r.success);
-        const summary = failCount === 0
-          ? `${okCount} of ${okCount} resolved successfully.`
-          : `${okCount} resolved, ${failCount} failed: `
-            + failures.map((f) => `${f.repo} (${f.message})`).join("; ");
-
-        // Same gap as the single-item flow above: the bulk-resolve response
-        // only tells this component's own drift list to refresh - the
-        // parent's workflows/rxworkflows state (and the status badges it
-        // drives) needs the same explicit patch for every item that succeeded.
-        const newStatus = resolution === "use_github" || deliveryMode === "direct"
-          ? "synced_with_github"
-          : "under_review";
-        const successNames = response.results
-          .filter((r) => r.success)
-          .map((r) => driftByKey.get(`${r.workflow_id}::${r.repo}::${r.branch}`)?.workflow_name)
-          .filter((name): name is string => Boolean(name));
-        if (successNames.length > 0) {
-          onWorkflowStatusesChanged?.(successNames, newStatus);
-        }
-
-        setSelectedKeys(new Set());
-        // loadDrift() clears any error state as soon as it starts (see its
-        // own setError(null)), so the outcome must be set AFTER it resolves,
-        // not before — otherwise the refresh wipes the message we just set.
-        const refreshed = await loadDrift();
-        if (failCount === 0 && refreshed.length === 0) {
-          setSuccess("All workflow drift resolved.");
-          setTimeout(() => setShowModal(false), 2000);
-        } else if (failCount === 0) {
-          setSuccess(summary);
-        } else {
-          setError(summary);
-        }
-      } catch (err: unknown) {
-        setError(driftErrorMessage(err, "Bulk resolution failed"));
-      } finally {
-        setBulkResolving(null);
-      }
-    },
-    [projectId, selectedKeys, driftByKey, user, loadDrift, onWorkflowStatusesChanged],
-  );
-
-  const handleDeleteEverywhere = useCallback(async (detail: WorkflowDriftDetail) => {
-    setDeletingEverywhere(true);
+  /** "Use the GitHub version" of several rows: workflows here, files through the parent. */
+  const handleBulkUseGithub = useCallback(async () => {
+    const files = selectedRows.filter((row) => row.kind !== "workflow");
+    const workflows = selectedRows.filter((row) => row.kind === "workflow");
+    setBusy(true);
     setError(null);
     setSuccess(null);
     try {
-      // The file is already gone from detail.repo; affected_repos is the rest
-      // of the project's repos that still share this workflow. Repos where the
-      // file is already absent are skipped server-side.
-      const repos = Array.from(new Set([detail.repo, ...(detail.affected_repos ?? [])]));
-      // Direct, not a campaign: the row is deleted immediately below, and a
-      // campaign needs it to survive until the removal PR merges.
-      await deleteWorkflowFromGitHub(user, repos, detail.workflow_name, "", projectName, "direct");
-      await deleteWorkflowFromDatabase(user, projectName, detail.workflow_name);
-
-      setConfirmDeleteEverywhere(null);
-      setOpenDiffKey(null);
-      setSuccess(`'${detail.workflow_filename}' removed from ActionsManager and ${repos.length} repositor${repos.length === 1 ? "y" : "ies"}.`);
-      await loadDrift();
+      const failures = await adoptGithubForWorkflows(workflows);
+      if (files.length > 0) await onUseGithubVersionOfFiles?.(files);
+      setSelectedKeys(new Set());
+      const outcome = bulkOutcome(selectedRows.length - failures.length, failures);
+      await settle(outcome.message, outcome.ok);
     } catch (err: unknown) {
-      setError(driftErrorMessage(err, "Failed to delete the workflow"));
+      setError(driftErrorMessage(err, "Using the GitHub version failed"));
     } finally {
-      setDeletingEverywhere(false);
+      setBusy(false);
     }
-  }, [user, projectName, loadDrift]);
+  }, [selectedRows, adoptGithubForWorkflows, onUseGithubVersionOfFiles, settle]);
 
-  const handleAdoptResolved = useCallback(async (message: string) => {
-    setSuccess(message);
-    const refreshed = await loadDrift();
-    if (refreshed.length === 0) {
-      setSuccess("All workflow drift resolved.");
-      setTimeout(() => setShowModal(false), 2000);
+  /** One row's "Use GitHub version": a workflow's scope modal, or a file's confirmation. */
+  const handleUseGithub = useCallback((row: DriftRow) => {
+    if (row.workflow) setAdoptDetail(row.workflow);
+    else setConfirmUseGithub([row]);
+  }, []);
+
+  const handleUseGithubOfFiles = useCallback(async (picked: DriftRow[]) => {
+    setConfirmUseGithub(null);
+    setBusy(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const message = await onUseGithubVersionOfFiles?.(picked);
+      setOpenDiffKey(null);
+      await settle(message ?? "GitHub version used.");
+    } catch (err: unknown) {
+      setError(driftErrorMessage(err, "Using the GitHub version failed"));
+    } finally {
+      setBusy(false);
     }
-  }, [loadDrift]);
+  }, [onUseGithubVersionOfFiles, settle]);
+
+  const handleDeleteEverywhere = useCallback(async (row: DriftRow) => {
+    setConfirmDeleteEverywhere(null);
+    setBusy(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      // The file is already gone from row.repo; affected_repos is the rest of
+      // the project's repos that still share this workflow. A pull request
+      // removes it from each, and the workflow leaves ActionsManager when they
+      // merge: drift is put right through pull requests only.
+      const repos = Array.from(new Set([row.repo, ...(row.workflow?.affected_repos ?? [])]));
+      await deleteWorkflowFromGitHub(user, repos, row.workflow?.workflow_name ?? row.name, "", projectName, "campaign");
+      setOpenDiffKey(null);
+      onProjectChanged?.();
+      await settle(`Pull requests opened to remove '${row.name}'. It leaves ActionsManager when they merge.`);
+    } catch (err: unknown) {
+      setError(driftErrorMessage(err, "Failed to remove the workflow"));
+    } finally {
+      setBusy(false);
+    }
+  }, [user, projectName, onProjectChanged, settle]);
 
   const driftCount = drifts.length;
   // Until the live check has succeeded once, drive the banner from the drift
@@ -1028,8 +1081,6 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
   const codeownersDrifted = liveLoaded ? codeownersDrifts.length > 0 : seededCodeownersDrift;
   const customFileCount = driftedCustomFileCount(liveLoaded, customFileDrifts, seededCustomFileDriftCount);
   const hasDrift = bannerCount > 0 || codeownersDrifted || customFileCount > 0;
-  // Files other than workflows, which the modal lists in their own sections.
-  const hasFileDrift = codeownersDrifts.length > 0 || customFileDrifts.length > 0;
   // The seed carries names only, so the modal's rows/resolve actions aren't
   // usable yet. An error still enables it — that's how the user reaches the
   // failure message inside the modal.
@@ -1039,343 +1090,92 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
 
   return (
     <>
-      {!hasDrift && (
-        // Persistent, muted status row so a clean or never-checked project
-        // always has a way to trigger a live check — the "Review Drift"
-        // button below only exists once drift is already known, so without
-        // this there was no manual-check path at all until something first
-        // went wrong. handleCheckNow runs directly; there's nothing to
-        // review yet, so opening the modal first would add a step for
-        // nothing.
-        <output
-          className="mx-4 mb-2 px-4 py-2 rounded-lg flex items-center gap-3 bg-slate-100 border border-slate-300 text-slate-800 dark:bg-slate-800/60 dark:border-slate-600 dark:text-slate-200"
-          data-testid="drift-status-row"
-        >
-          <span aria-hidden="true">{statusRow.icon}</span>
-          <span className="font-medium flex-1">{statusRow.message}</span>
-          {uncheckedCount === 0 && staleReason && (
-            <span className="text-xs text-slate-500 dark:text-slate-400">{staleReason}</span>
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleCheckNow}
-            disabled={checking}
-            data-testid="drift-inline-check-now-button"
-          >
-            {checking ? "Checking…" : "Check Now"}
-          </Button>
-        </output>
-      )}
-
-      {hasDrift && (
-        <div
-          className="mx-4 mb-2 px-4 py-2 rounded-lg flex items-center gap-3 bg-amber-50 border border-amber-200 text-amber-900 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"
-          role="alert"
-          aria-live="polite"
-          data-testid="drift-banner"
-        >
-          <span aria-hidden="true">⚠️</span>
-          <span className="font-medium flex-1">{summaryText}</span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setShowModal(true)}
-            disabled={!canReviewDrift}
-            data-testid="review-drift-button"
-          >
-            {canReviewDrift ? "Review Drift" : "Checking…"}
-          </Button>
-        </div>
-      )}
+      <DriftSummaryBar
+        hasDrift={hasDrift}
+        statusRow={statusRow}
+        uncheckedCount={uncheckedCount}
+        staleReason={staleReason}
+        summaryText={summaryText}
+        checking={checking}
+        canReviewDrift={canReviewDrift}
+        onCheckNow={handleCheckNow}
+        onReview={() => setShowModal(true)}
+      />
 
       <Dialog open={showModal} onOpenChange={setShowModal}>
         <DialogContent
           className="max-w-5xl max-h-[85vh] overflow-y-auto"
           data-testid="drift-modal"
         >
-          <DialogHeader>
-            <DialogTitle className="text-amber-700 dark:text-amber-400">
-              {hasFileDrift ? "⚠️ Drift Detected" : "⚠️ Workflow Drift Detected"}
-            </DialogTitle>
-            <DialogDescription>
-              The following {hasFileDrift ? "files" : "workflows"} were changed directly in
-              GitHub. Review the diff and choose how to resolve each drift safely.
-            </DialogDescription>
-            <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-              <span data-testid="drift-last-checked">
-                {lastChecked
-                  ? `Last checked ${new Date(lastChecked).toLocaleString()}`
-                  : "Never checked"}
-              </span>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleCheckNow}
-                disabled={checking}
-                data-testid="drift-check-now-button"
-              >
-                {checking ? "Checking…" : "Check Now"}
-              </Button>
-            </div>
-            {staleReason && (
-              // Without this the timestamp simply stops advancing and the
-              // feature reads as broken rather than blocked on a token.
-              <p
-                className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:bg-amber-900/20 dark:text-amber-200"
-                data-testid="drift-stale-reason"
-              >
-                {staleReason}
-              </p>
-            )}
-            <a
-              className="text-xs font-medium text-blue-600 hover:underline dark:text-blue-400 self-start"
-              href={getDocsUrl("driftDetection")}
-              rel="noreferrer"
-              target="_blank"
-            >
-              Learn about drift detection →
-            </a>
-          </DialogHeader>
+          <DriftModalHeader
+            lastChecked={lastChecked}
+            staleReason={staleReason}
+            checking={checking}
+            onCheckNow={handleCheckNow}
+          />
 
-          {success && (
-            <div className="px-3 py-2 text-sm rounded bg-green-50 text-green-800 border border-green-200 dark:bg-green-900/20 dark:text-green-200 dark:border-green-800">
-              ✓ {success}
-            </div>
-          )}
+          <ResultNotices success={success} error={error} />
 
-          {error && (
-            <div className="px-3 py-2 text-sm rounded bg-red-50 text-red-800 border border-red-200 dark:bg-red-900/20 dark:text-red-200 dark:border-red-800">
-              {error}
-            </div>
-          )}
-
-          {/* Bulk-fix selection bar */}
-          {driftCount > 0 && (
-            <div className="flex flex-wrap items-center gap-3 px-1" data-testid="drift-selection-bar">
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  data-testid="select-all-drifts"
-                  checked={selectedKeys.size > 0 && selectedKeys.size === drifts.length}
-                  ref={(el) => {
-                    if (el) el.indeterminate = selectedKeys.size > 0 && selectedKeys.size < drifts.length;
-                  }}
-                  onChange={(e) => (e.target.checked ? selectAll() : deselectAll())}
-                />
-                <span className="text-slate-600 dark:text-slate-400">
-                  {selectedKeys.size} of {drifts.length} selected
-                </span>
-              </label>
-              <Button variant="outline" size="sm" onClick={selectAll}>Select All</Button>
-              <Button variant="outline" size="sm" onClick={deselectAll}>Deselect All</Button>
-
-              {selectedKeys.size > 0 && (
-                <div className="flex flex-wrap items-center gap-2 ml-auto" data-testid="bulk-action-toolbar">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={bulkResolving !== null}
-                    onClick={() => handleBulkResolve("use_github")}
-                  >
-                    {bulkResolving === "use_github"
-                      ? "Adopting…"
-                      : `Adopt GitHub Version (${selectedKeys.size})`}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={bulkResolving !== null}
-                    onClick={() => handleBulkResolve("restore_actionsmanager", "pr")}
-                  >
-                    {bulkResolving === "pr"
-                      ? "Creating PRs…"
-                      : `Create Fix PR (${selectedKeys.size})`}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={bulkResolving !== null}
-                    onClick={() => setConfirmBulkDirect(true)}
-                  >
-                    {bulkResolving === "direct"
-                      ? "Restoring…"
-                      : `Restore Directly (${selectedKeys.size})`}
-                  </Button>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Drift table */}
-          {(driftCount > 0 || !hasFileDrift) && (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm border-collapse">
-                <thead>
-                  <tr className="text-left border-b border-slate-200 dark:border-slate-700">
-                    <th className="py-2 pr-2" />
-                    <th className="py-2 pr-4">Workflow</th>
-                    <th className="py-2 pr-4">Repo</th>
-                    <th className="py-2 pr-4">Branch</th>
-                    <th className="py-2 pr-4">Status</th>
-                    <th className="py-2 pr-4">Last Checked</th>
-                    <th className="py-2">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {drifts.map((d) => {
-                    const k = driftKey(d);
-                    const isOpen = openDiffKey === k;
-                    const diffButtonLabel = isOpen ? "Hide Diff" : "View Diff";
-                    const busy = resolving === k;
-                    const group = driftGroups.get(groupKeyFor(d)) ?? [d];
-                    return (
-                      <React.Fragment key={k}>
-                        <tr className="border-b border-slate-100 dark:border-slate-800">
-                          <td className="py-2 pr-2">
-                            <input
-                              type="checkbox"
-                              data-testid={`select-drift-${k}`}
-                              checked={selectedKeys.has(k)}
-                              onChange={() => toggleSelected(k)}
-                            />
-                          </td>
-                          <td className="py-2 pr-4 font-medium">
-                            <div className="flex items-center gap-2">
-                              <span>{d.workflow_filename}</span>
-                              {group.length > 1 && (
-                                <button
-                                  type="button"
-                                  className="text-xs text-blue-600 hover:underline dark:text-blue-400"
-                                  data-testid={`select-group-${k}`}
-                                  onClick={() => selectGroup(d)}
-                                >
-                                  {group.length} identical — select all
-                                </button>
-                              )}
-                              {d.is_shared_workflow && (
-                                <span
-                                  className="px-2 py-0.5 text-xs rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
-                                  data-testid="shared-workflow-badge"
-                                >
-                                  Shared Workflow
-                                </span>
-                              )}
-                              {d.has_repo_override && (
-                                <span
-                                  className="px-2 py-0.5 text-xs rounded-full bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200"
-                                  data-testid="repo-override-badge"
-                                  title="This repository uses a workflow override and is no longer following the shared project workflow for this file."
-                                >
-                                  Repo Override
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                          <td className="py-2 pr-4">{d.repo}</td>
-                          <td className="py-2 pr-4">{d.branch}</td>
-                          <td className="py-2 pr-4">
-                            {d.deleted_in_github ? (
-                              <span
-                                className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200"
-                                data-testid="drift-status-deleted"
-                              >
-                                Deleted in GitHub
-                              </span>
-                            ) : (
-                              <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">
-                                Drift detected
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-2 pr-4 text-xs text-slate-500 dark:text-slate-400">
-                            {d.last_checked
-                              ? new Date(d.last_checked).toLocaleString()
-                              : "—"}
-                          </td>
-                          <td className="py-2">
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => handleToggleDiff(d, k)}
-                              disabled={diffLoadingKey === k}
-                            >
-                              {diffLoadingKey === k ? "Loading…" : diffButtonLabel}
-                            </Button>
-                          </td>
-                        </tr>
-                        {isOpen && (
-                          <tr>
-                            <td colSpan={7} className="py-2">
-                              <div className="space-y-2">
-                                <p className="text-sm text-slate-700 dark:text-slate-300">
-                                  Repository: <strong>{d.repo}</strong>
-                                  {" · "}Target branch: <strong>{d.branch}</strong>
-                                </p>
-                                {d.message && (
-                                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                                    {d.message}
-                                  </p>
-                                )}
-                                {d.deleted_in_github ? (
-                                  <DeletedInGithubPanel
-                                    detail={d}
-                                    busyAction={busy ? resolvingMode : null}
-                                    onRestorePR={() =>
-                                      handleResolve(d, "restore_actionsmanager", "pr")
-                                    }
-                                    onRestoreDirect={() => setConfirmDirect(d)}
-                                    onDeleteEverywhere={() => setConfirmDeleteEverywhere(d)}
-                                  />
-                                ) : (
-                                  <SideBySideDiff
-                                    left={d.actionsmanager_yaml ?? ""}
-                                    right={liveDiffs[k]?.github_yaml ?? d.github_yaml ?? ""}
-                                    repo={d.repo}
-                                    branch={d.branch}
-                                    onAdoptGithub={() => setAdoptDetail(d)}
-                                    onRestorePR={() =>
-                                      handleResolve(d, "restore_actionsmanager", "pr")
-                                    }
-                                    onRestoreDirect={() => setConfirmDirect(d)}
-                                    busyAction={busy ? resolvingMode : null}
-                                  />
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {codeownersDrifts.length > 0 && (
-            <FileDriftSection
-              title="CODEOWNERS"
-              hint={CODEOWNERS_HINT}
-              drift={codeownersDrifts}
-              testId="codeowners-drift-section"
-              onOpen={onOpenCodeowners && (() => {
-                setShowModal(false);
-                onOpenCodeowners();
-              })}
-              openLabel="Open CODEOWNERS"
-              openTestId="open-codeowners-button"
+          {rows.length > 0 && (
+            <SelectionBar
+              total={rows.length}
+              selected={selectedRows}
+              busy={busy}
+              onSelectAll={selectAll}
+              onDeselectAll={deselectAll}
+              onKeep={() => handleKeep(selectedRows)}
+              onUseGithub={() => (selectedRows.some((row) => row.kind !== "workflow")
+                ? setConfirmUseGithub(selectedRows)
+                : handleBulkUseGithub())}
             />
           )}
 
-          {customFileDrifts.length > 0 && (
-            <FileDriftSection
-              title="Custom files"
-              hint={CUSTOM_FILE_HINT}
-              drift={customFileDrifts}
-              testId="custom-file-drift-section"
-            />
-          )}
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr className="text-left border-b border-slate-200 dark:border-slate-700">
+                  <th className="py-2 pr-2" />
+                  <th className="py-2 pr-4">File</th>
+                  <th className="py-2 pr-4">Repo</th>
+                  <th className="py-2 pr-4">Branch</th>
+                  <th className="py-2 pr-4">Status</th>
+                  <th className="py-2 pr-4">Last Checked</th>
+                  <th className="py-2">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <React.Fragment key={row.key}>
+                    <DriftTableRow
+                      row={row}
+                      selected={selectedKeys.has(row.key)}
+                      groupSize={(driftGroups.get(groupKeyFor(row)) ?? [row]).length}
+                      open={openDiffKey === row.key}
+                      loading={diffLoadingKey === row.key}
+                      onToggleSelected={() => toggleSelected(row.key)}
+                      onSelectGroup={() => selectGroup(row)}
+                      onToggleDiff={() => handleToggleDiff(row)}
+                    />
+                    {openDiffKey === row.key && (
+                      <tr>
+                        <td colSpan={7} className="py-2">
+                          <DriftRowDetail
+                            row={row}
+                            managed={row.workflow ? (row.workflow.actionsmanager_yaml ?? "") : (contentOf?.(row) ?? "")}
+                            github={row.workflow?.github_yaml ?? githubCopies[row.key] ?? ""}
+                            busy={busy}
+                            onKeep={() => handleKeep([row])}
+                            onUseGithub={() => handleUseGithub(row)}
+                            onDeleteEverywhere={() => setConfirmDeleteEverywhere(row)}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowModal(false)}>
@@ -1390,27 +1190,23 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
         onClose={() => setAdoptDetail(null)}
         detail={adoptDetail}
         user={user}
-        onResolved={handleAdoptResolved}
+        onResolved={(message) => settle(message)}
       />
 
       <ConfirmDialog
-        open={confirmDirect !== null}
-        title="Overwrite GitHub directly?"
-        description={
-          confirmDirect
-            ? `This immediately overwrites ${confirmDirect.workflow_filename} on branch `
-              + `${confirmDirect.branch} in ${confirmDirect.repo} with the `
-              + `ActionsManager-managed version. The current GitHub version is replaced `
-              + `now, with no pull request to review. This cannot be undone from here.`
-            : ""
-        }
-        confirmLabel="Overwrite directly"
-        destructive
-        onCancel={() => setConfirmDirect(null)}
+        open={confirmUseGithub !== null}
+        title="Use the GitHub version?"
+        description={confirmUseGithub ? githubVersionConfirmText(confirmUseGithub) : ""}
+        confirmLabel="Use GitHub version"
+        onCancel={() => setConfirmUseGithub(null)}
         onConfirm={() => {
-          const d = confirmDirect;
-          setConfirmDirect(null);
-          if (d) handleResolve(d, "restore_actionsmanager", "direct");
+          const picked = confirmUseGithub ?? [];
+          if (picked.some((row) => row.kind === "workflow")) {
+            setConfirmUseGithub(null);
+            handleBulkUseGithub();
+          } else {
+            handleUseGithubOfFiles(picked);
+          }
         }}
       />
 
@@ -1419,34 +1215,16 @@ const DriftDetection: React.FC<DriftDetectionProps> = ({
         title="Delete this workflow everywhere?"
         description={
           confirmDeleteEverywhere
-            ? `'${confirmDeleteEverywhere.workflow_filename}' will be deleted from `
-              + `${Array.from(new Set([confirmDeleteEverywhere.repo, ...(confirmDeleteEverywhere.affected_repos ?? [])])).join(", ")} `
-              + `and removed from ActionsManager, including its version history. `
-              + `This cannot be undone.`
+            ? `Pull requests will remove '${confirmDeleteEverywhere.name}' from `
+              + `${Array.from(new Set([confirmDeleteEverywhere.repo, ...(confirmDeleteEverywhere.workflow?.affected_repos ?? [])])).join(", ")}. `
+              + "It is removed from ActionsManager, version history included, when they merge."
             : ""
         }
-        confirmLabel={deletingEverywhere ? "Deleting…" : "Delete everywhere"}
+        confirmLabel={busy ? "Opening pull requests…" : "Delete everywhere"}
         destructive
         onCancel={() => setConfirmDeleteEverywhere(null)}
         onConfirm={() => {
           if (confirmDeleteEverywhere) handleDeleteEverywhere(confirmDeleteEverywhere);
-        }}
-      />
-
-      <ConfirmDialog
-        open={confirmBulkDirect}
-        title="Overwrite GitHub directly?"
-        description={
-          `This immediately overwrites ${selectedKeys.size} workflow(s) with the `
-          + `ActionsManager-managed version. The current GitHub versions are replaced `
-          + `now, with no pull request to review. This cannot be undone from here.`
-        }
-        confirmLabel="Overwrite directly"
-        destructive
-        onCancel={() => setConfirmBulkDirect(false)}
-        onConfirm={() => {
-          setConfirmBulkDirect(false);
-          handleBulkResolve("restore_actionsmanager", "direct");
         }}
       />
     </>

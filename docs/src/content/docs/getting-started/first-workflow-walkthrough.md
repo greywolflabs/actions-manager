@@ -17,7 +17,7 @@ This walkthrough covers the end-to-end happy path for a first-time self-hosted b
 1. Open the login screen
 2. Enter your Personal Access Token and sign in
 3. Meet the welcome screen and choose whether to take the guided tour
-4. View the empty Saved Projects dashboard
+4. View the empty Projects page
 5. Create a new project — Project Basics
 6. Create a new project — Select Repositories
 7. Create a new project — Review and confirm
@@ -87,13 +87,13 @@ You can start it again later from **Restart tour** in the user menu (top right).
 
 ---
 
-## Step 4 — Saved Projects Dashboard
+## Step 4 — The Projects Page
 
-After signing in you land on the **Saved Projects** dashboard. The header shows beta usage limits (for example, 4 Caller Workflow Projects and 2 Reusable Workflow Projects in the Self-Hosted Beta). The project list is empty until you create your first project.
+After signing in you land on the **Projects** page, the first of the three tabs in the app header beside **Managed Files** and **Managed Actions**. Your plan appears as a chip beside your avatar in the app header, on every page, with an **Upgrade** link when your plan has one. Your project usage shows beside **New Project** (for example, 0 of 4 Caller Workflow Projects and 0 of 2 Reusable Workflow Projects in the Self-Hosted Beta). The project list is empty until you create your first project, and a dashed **New project** box shows how many projects your plan still has room for.
 
-![Saved Projects dashboard showing an empty project list, beta usage limits in the header, and the New Project button](../assets/screenshots/walkthrough/03-empty-project-dashboard.png)
+![The Projects page with the Projects tab selected in the app header, the Self-Hosted Beta plan chip beside the avatar, an empty project list, the project usage beside the New Project button, and a dashed New project box reading "6 of 6 remaining"](../assets/screenshots/walkthrough/03-empty-project-dashboard.png)
 
-Click **New Project** to begin.
+Click **New Project**, or the dashed **New project** box, to begin.
 
 ---
 
@@ -108,7 +108,7 @@ The **Create Project** wizard opens on the **Project Basics** step. Enter a proj
 | **Caller Workflow Project** | Manages repositories whose workflows call reusable workflows. This is the most common starting point. |
 | **Reusable Workflow Project** | Manages a shared workflow producer repository. |
 
-Choose **Caller Workflow Project** for a typical first project and click **Next**.
+Choose **Caller Workflow Project** for a typical first project and click **Continue**.
 
 ---
 
@@ -118,7 +118,7 @@ Select whether the project covers **public** or **private** repositories, then p
 
 ![Create Project — Repository Visibility and Selection showing public/private toggle, repository selection list, and selected repository summary](../assets/screenshots/walkthrough/05-select-repositories.png)
 
-Click **Next** when all target repositories are selected.
+Click **Continue** when all target repositories are selected.
 
 ### Trying it on a throwaway repository
 
@@ -146,9 +146,9 @@ Confirm the project name, type, repositories, and prefix setting, then click **C
 
 ## Step 8 — Projects Dashboard After Creation
 
-After creating the project, you are returned to the **Saved Projects** dashboard. Your new project now appears in the project list with its identity color and type badge.
+After creating the project, you are returned to the **Projects** page. Your new project now appears as a card in the project list, with its identity color, its project type under the name, its status beside the menu, and a row showing its workflows, repository visibility and naming mode. The dashed **New project** box follows the last card.
 
-![Saved Projects dashboard showing the newly created project in the project list with its identity color and type badge](../assets/screenshots/walkthrough/07-project-dashboard-created.png)
+![The Projects page showing the newly created project as a card with its identity color, project type, status, workflow count, repository visibility and naming mode, followed by a dashed New project box](../assets/screenshots/walkthrough/07-project-dashboard-created.png)
 
 Click the project card to open the project workspace.
 
@@ -156,9 +156,9 @@ Click the project card to open the project workspace.
 
 ## Step 9 — Project Workspace: Overview
 
-The project workspace opens with an empty workflow state. The left sidebar shows the project and its repositories.
+The project workspace opens with an empty workflow state, under the same app header as every other page, with **Projects** marked as the current section. The left sidebar shows the project and its repositories.
 
-![Project workspace showing the project sidebar and the empty workflow state](../assets/screenshots/walkthrough/08-project-workspace-empty.png)
+![Project workspace under the app header, showing the project sidebar and the empty workflow state](../assets/screenshots/walkthrough/08-project-workspace-empty.png)
 
 ---
 
@@ -172,27 +172,28 @@ Click **Add Workflow** to create your first workflow.
 
 ---
 
-## Step 11 — Create New Workflow: Choose Type
+## Step 11 — Add Project File: Choose What to Add
 
-The **Create New Workflow** modal presents three workflow type options:
+The **Add Project File** dialog asks what to add:
 
-![Create New Workflow modal showing Regular Workflow, Reusable Workflow, and Link Reusable Workflow options](../assets/screenshots/walkthrough/10-create-workflow-type.png)
+![Add Project File dialog offering Workflow, Reusable Workflow, Link Reusable Workflow and Custom File](../assets/screenshots/walkthrough/10-create-workflow-type.png)
 
 | Option | Description |
 |--------|-------------|
-| **Regular Workflow** | A standard GitHub Actions workflow file for one or more repositories in the project. |
-| **Reusable Workflow** | A workflow defined once and called from other workflows. Available for Reusable Workflow Projects. |
+| **Workflow** | A standard GitHub Actions workflow file for one or more repositories in the project. |
+| **Reusable Workflow** | A workflow defined once and called from other workflows. Available once reusable workflows are enabled for the project. |
 | **Link Reusable Workflow** | Links this project's caller workflows to an existing reusable workflow in another project. |
+| **Custom File** | Any other file the project delivers to its repositories. CODEOWNERS is managed in [Managed Files](../features/managed-files.html) instead. |
 
-Choose **Regular Workflow** for a first workflow and click **Next**.
+Choose **Workflow** for a first workflow.
 
 ---
 
-## Step 12 — Regular Workflow Options
+## Step 12 — Workflow Options
 
 Enter a workflow name and choose how to create the initial YAML content:
 
-![Regular Workflow Options modal showing workflow name entry and options: Open Blank Workflow, Detect Build Types, and Generate Templates](../assets/screenshots/walkthrough/11-regular-workflow-options.png)
+![Workflow Options modal showing workflow name entry and options: Open Blank Workflow, Detect Build Types, and Generate Templates](../assets/screenshots/walkthrough/11-regular-workflow-options.png)
 
 | Option | Description |
 |--------|-------------|

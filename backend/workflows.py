@@ -33,6 +33,7 @@ from workflow_templates import generate_template_set
 from github_api_tracker import RateLimitExceeded, github_get, github_put, github_patch
 from error_detail import failure_kind
 import deliveries
+from file_kinds import refuse_unless_accepted
 from drift_notifications import (
     CODEOWNERS_NAME,
     DriftObservation,
@@ -335,6 +336,8 @@ class WorkflowDriftDetail(BaseModel):
 
 class CodeownersDriftDetail(BaseModel):
     """The project's CODEOWNERS on one (repo, branch); its WorkflowDriftDetail counterpart."""
+    # The drifted file's record, so the page can act on this row as it does on a workflow's.
+    file_id: Optional[int] = None
     file_path: str
     repo: str
     repo_id: Optional[int] = None
@@ -364,7 +367,7 @@ class AdoptGithubVersionRequest(BaseModel):
     branch: Optional[str] = None
     workflow_id: int
     resolution_mode: str  # adopt_project_and_sync | adopt_local_only | create_repo_override
-    delivery_mode: Optional[str] = "pr"  # "pr" or "direct" — only used with adopt_project_and_sync
+    delivery_mode: Optional[str] = "pr"  # only "pr": drift is never fixed by a direct commit
     target_repo_ids: Optional[List[int]] = None  # If None, default to all affected repos
 
 
@@ -412,11 +415,10 @@ class ResolveWorkflowDriftRequest(BaseModel):
     repo: str
     branch: str
     resolution: str  # "use_github" or "restore_actionsmanager"
-    delivery_mode: Optional[str] = "pr"  # "pr" or "direct" — only used for restore_actionsmanager
-    # The GitHub blob SHA the drift was computed against. When supplied, a
-    # direct push is refused with 409 if GitHub has moved on since, so a
-    # colleague's fix can't be silently reverted by a stale page. Optional so
-    # existing callers keep working; the UI always sends it.
+    delivery_mode: Optional[str] = "pr"  # only "pr": drift is never fixed by a direct commit
+    # The GitHub blob SHA the drift was computed against. When supplied, use_github
+    # is refused with 409 if GitHub has moved on since, so a stale page cannot
+    # adopt content the user never saw. Optional so existing callers keep working.
     expected_github_sha: Optional[str] = None
 
 
@@ -436,7 +438,7 @@ class BulkResolveDriftRequest(BaseModel):
     """
     items: List[BulkResolveDriftItem]
     resolution: str  # "use_github" or "restore_actionsmanager"
-    delivery_mode: Optional[str] = "pr"  # "pr" or "direct" — only used for restore_actionsmanager
+    delivery_mode: Optional[str] = "pr"  # only "pr": drift is never fixed by a direct commit
 
 
 class BulkResolveDriftItemResult(BaseModel):
@@ -1673,12 +1675,12 @@ class _CheckRun(NamedTuple):
 
 def _codeowners_file(record: Codeowners) -> _File:
     return _File(deliveries.CODEOWNERS, record.id, CODEOWNERS_NAME, record.file_path, record.content,
-                 CodeownersDriftDetail)
+                 functools.partial(CodeownersDriftDetail, file_id=record.id))
 
 
 def _custom_file(cf: CustomFile) -> _File:
     return _File(deliveries.CUSTOM_FILE, cf.id, cf.file_path, cf.file_path, cf.file_content or "",
-                 functools.partial(CustomFileDriftDetail, custom_file_id=cf.id), from_record=True)
+                 functools.partial(CustomFileDriftDetail, custom_file_id=cf.id, file_id=cf.id), from_record=True)
 
 
 def _single_files(db: Session, project: Project, kind: Optional[str] = None) -> List[_File]:
@@ -2891,6 +2893,8 @@ def save_workflows(
         # body), and it commits per workflow with no outer transaction — a 403
         # raised inside the loop would leave the workflows ahead of it written.
         _require_project_editor(db, github_user, project)
+        if payload.workflows or payload.rxworkflows:
+            refuse_unless_accepted(project, "workflows")
 
         # Each list is the kind the client shows the workflow as; the trigger
         # decides what it is saved as (#2318).
@@ -3171,7 +3175,9 @@ def _workflow_observations(details: List[WorkflowDriftDetail]) -> List[DriftObse
 
 
 NOT_AUTHORIZED_PROJECT_DETAIL = "Not authorized for this project"
-DELIVERY_MODE_ERROR_DETAIL = "delivery_mode must be 'pr' or 'direct'"
+DELIVERY_MODE_ERROR_DETAIL = (
+    "delivery_mode must be 'pr': drift is put right through a pull request, never a direct commit"
+)
 _ERR_INSUFFICIENT_PROJECT_ROLE = "Insufficient project permissions. Required: project_editor"
 _ERR_REPO_NOT_IN_PROJECT = "Repository is not part of this project"
 
@@ -3622,70 +3628,6 @@ def get_workflow_drift(
     )
 
 
-def _direct_push_workflow_to_branch(
-    owner: str,
-    repo: str,
-    branch: str,
-    path: str,
-    content_str: str,
-    commit_message: str,
-    headers: dict,
-    user: str,
-    db: Session,
-    expected_sha: Optional[str] = None,
-) -> dict:
-    """Push a single workflow file directly to a branch via the Contents API.
-
-    ``expected_sha`` is the blob SHA the caller's decision was based on. When
-    given and GitHub has moved on, the push is refused rather than overwriting
-    whatever landed in between — otherwise a stale drift view silently reverts
-    someone else's fix. Passing None keeps the previous last-write-wins
-    behaviour for callers that have no expectation to assert.
-
-    Returns a dict with keys: ``status_code`` (int) and, on success, ``sha`` (str).
-    """
-    encoded_content = base64.b64encode(content_str.encode()).decode()
-    file_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{path}?ref={quote(branch, safe='')}"
-    sha, unchanged = _check_existing_workflow_content(file_url, encoded_content, headers, user, db)
-
-    if expected_sha and sha and sha != expected_sha:
-        # Reported through the existing {status_code, error} contract rather than
-        # raised: this is a low-level push helper, and callers already branch on
-        # status_code. Bulk turns it into a per-item failure for free, and the
-        # resolve endpoint converts it to a 409 at the HTTP layer where that
-        # response is documented.
-        return {
-            "status_code": 409,
-            "error": (
-                f"{path} in {owner}/{repo}@{branch} changed since drift was checked. "
-                "Re-run the drift check and review the current difference before resolving."
-            ),
-        }
-
-    if unchanged:
-        # Identical content — pushing would create an empty commit, and a
-        # double-submit would create two. Report the existing blob as success.
-        return {"status_code": 200, "sha": sha, "unchanged": True}
-
-    payload = {
-        "message": commit_message,
-        "content": encoded_content,
-        "branch": branch,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    put_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{path}"
-    resp = github_put(put_url, user, db, json=payload, headers=headers)
-    if resp.status_code in (200, 201):
-        try:
-            new_sha = resp.json().get("content", {}).get("sha")
-        except Exception:
-            new_sha = None
-        return {"status_code": resp.status_code, "sha": new_sha}
-    return {"status_code": resp.status_code, "error": resp.text[:500]}
-
-
 def _apply_use_github_resolution(
     db: Session,
     github_user: str,
@@ -3860,8 +3802,14 @@ def _resolve_use_github_drift(db: Session, github_user: str, wf, project, payloa
         }
 
 
+def _require_pr_delivery(delivery_mode: Optional[str]) -> None:
+    """Refuse any drift fix that is not a pull request (the field is kept so old callers sending "pr" still work)."""
+    if (delivery_mode or "pr").lower() != "pr":
+        raise HTTPException(status_code=400, detail=DELIVERY_MODE_ERROR_DETAIL)
+
+
 def _campaign_selection(workflows) -> dict:
-    """The campaign selection that delivers ``workflows`` — a restore or a removal.
+    """The campaign selection that delivers ``workflows``, and nothing else — a restore or a removal.
 
     ``selected_workflows`` only ever selects regular rows, so a reusable one
     named there matched nothing and the campaign opened no pull request. A
@@ -3873,105 +3821,50 @@ def _campaign_selection(workflows) -> dict:
     return {
         "selected_workflows": regular or None,
         "selected_reusable_workflows": reusable or None,
+        # [] rather than None, which means every locally changed custom file:
+        # a pull request fixing one workflow must carry nothing else.
+        "selected_custom_file_ids": [],
     }
 
 
 def _resolve_restore_actionsmanager_drift(db: Session, github_user: str, wf, project,
-                                           payload: ResolveWorkflowDriftRequest, branch: str, workflow_id: int,
-                                           owner: str, repo: str, formatted_name: str, headers: dict) -> dict:
-    """Push local YAML back to GitHub via direct commit or the PR pipeline."""
-    delivery_mode = (payload.delivery_mode or "pr").lower()
-    print(f"🔄 Resolving drift for workflow {workflow_id} (restore_actionsmanager, {delivery_mode}): {payload.repo}@{payload.branch}")
+                                           payload: ResolveWorkflowDriftRequest, branch: str, workflow_id: int) -> dict:
+    """Put the managed version back on GitHub through a pull request, carrying only this workflow.
 
+    Drift is never restored by committing straight to a branch: every fix is a
+    reviewed pull request, for workflows as for the project's other files.
+    """
+    _require_pr_delivery(payload.delivery_mode)
+    print(f"🔄 Resolving drift for workflow {workflow_id} (restore_actionsmanager, pr): {payload.repo}@{payload.branch}")
     try:
-        if delivery_mode == "direct":
-            path = f".github/workflows/{formatted_name}"
-            commit_msg = (
-                f"Restore {formatted_name} from ActionsManager for "
-                f"{project.project_code} [skip ci]"
-            )
-            result = _direct_push_workflow_to_branch(
-                owner, repo, branch, path, wf.workflow_yaml or "",
-                commit_msg, headers, github_user, db,
-                expected_sha=payload.expected_github_sha,
-            )
-            if result.get("status_code") in (200, 201):
-                if result.get("sha"):
-                    wf.workflow_git_hash = result["sha"]
-                wf.last_modified_by = github_user
-                wf.workflow_status = "synced_with_github"
-                project.pr_state = "synced"
-                removal_error = _remove_superseded_on_target(
-                    db, deliveries.WORKFLOW, wf.workflow_id, payload.repo, branch, path,
-                    project.project_code, github_user, headers,
-                )
-                deliveries.record_delivered(db, deliveries.WORKFLOW, wf.workflow_id, payload.repo, branch,
-                                            path, result.get("sha"))
-                db.commit()
-                # GitHub now matches the managed version, so any persisted drift
-                # for this workflow/repo is stale.
-                clear_drift(db, project, deliveries.WORKFLOW, wf.workflow_id, payload.repo, branch)
-
-                print(f"  ✅ Direct push successful, new SHA: {result.get('sha')}")
-
-                return {
-                    "message": (f"Workflow '{wf.workflow_name}' restored to {payload.repo}@{branch} (direct commit)"
-                                + _superseded_copy_note(removal_error)),
-                    "action": "restore_actionsmanager",
-                    "delivery_mode": "direct",
-                    "workflow_id": wf.workflow_id,
-                    "repo": payload.repo,
-                    "branch": branch,
-                    "state": "synced",
-                    "github_sha": result.get("sha"),
-                }
-            if result.get("status_code") == 409:
-                # The file moved on since drift was computed — surface the
-                # conflict rather than reporting it as a GitHub push failure.
-                raise HTTPException(status_code=409, detail=result.get("error", ""))
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Failed to push workflow to GitHub: {result.get('status_code')} "
-                    f"{result.get('error', '')}"
-                ),
-            )
-
-        if delivery_mode == "pr":
-            # Reuse the create-pull-requests pipeline scoped to this one
-            # workflow + repo. create_pull_requests is a route function
-            # whose signature is (payload, background_tasks, db, ...) - when
-            # called directly (not via FastAPI routing) db has no injected
-            # default, so background_tasks must be supplied positionally and
-            # db passed explicitly. async_mode defaults False, so the
-            # BackgroundTasks instance is never used.
-            pr_payload = CreatePullRequestsRequest(
-                project_name=project.project_name,
-                project_id=project.project_id,
-                selected_repos=[payload.repo],
-                **_campaign_selection([wf]),
-            )
-            pr_result = create_pull_requests(
-                pr_payload, BackgroundTasks(), db, github_user=github_user
-            )
-
-            print("  ✅ PR created for restoring workflow")
-
-            return {
-                "message": f"PR opened to restore '{wf.workflow_name}' in {payload.repo}",
-                "action": "restore_actionsmanager",
-                "delivery_mode": "pr",
-                "workflow_id": wf.workflow_id,
-                "repo": payload.repo,
-                "branch": branch,
-                "state": "pr_pending",
-                "pr_result": pr_result,
-            }
-
-        raise HTTPException(status_code=400, detail=DELIVERY_MODE_ERROR_DETAIL)
+        # create_pull_requests is a route function whose signature is
+        # (payload, background_tasks, db, ...) - when called directly (not via
+        # FastAPI routing) db has no injected default, so background_tasks must
+        # be supplied positionally and db passed explicitly. async_mode
+        # defaults False, so the BackgroundTasks instance is never used.
+        pr_payload = CreatePullRequestsRequest(
+            project_name=project.project_name,
+            project_id=project.project_id,
+            selected_repos=[payload.repo],
+            **_campaign_selection([wf]),
+        )
+        pr_result = create_pull_requests(
+            pr_payload, BackgroundTasks(), db, github_user=github_user
+        )
+        print("  ✅ PR created for restoring workflow")
+        return {
+            "message": f"PR opened to restore '{wf.workflow_name}' in {payload.repo}",
+            "action": "restore_actionsmanager",
+            "delivery_mode": "pr",
+            "workflow_id": wf.workflow_id,
+            "repo": payload.repo,
+            "branch": branch,
+            "state": "pr_pending",
+            "pr_result": pr_result,
+        }
     except HTTPException:
-        # Already-shaped errors (GitHub 502, pipeline failures, bad input)
-        # carry a useful status + detail - let them through unchanged.
+        # Already-shaped errors (pipeline failures, bad input) carry a useful
+        # status + detail - let them through unchanged.
         raise
     except Exception as e:  # noqa: BLE001 - convert unexpected errors to a safe 500
         import traceback
@@ -3980,13 +3873,9 @@ def _resolve_restore_actionsmanager_drift(db: Session, github_user: str, wf, pro
         # Server-side context for diagnosis - never logs the token/headers.
         print(
             f"❌ Drift restore failed (workflow_id={workflow_id}, "
-            f"repo={payload.repo}, branch={branch}, delivery_mode={delivery_mode}): "
-            f"{type(e).__name__}: {e}"
+            f"repo={payload.repo}, branch={branch}): {type(e).__name__}: {e}"
         )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to restore workflow via {delivery_mode}",
-        )
+        raise HTTPException(status_code=500, detail="Failed to restore workflow via a pull request")
 
 
 @router.post(
@@ -4011,7 +3900,7 @@ def resolve_workflow_drift(
 
     Resolutions:
       * ``use_github``               – overwrite local YAML with GitHub YAML and refresh hash.
-      * ``restore_actionsmanager``   – push local YAML back to GitHub via PR or direct commit.
+      * ``restore_actionsmanager``   – put the local YAML back on GitHub through a pull request.
     """
     github_user = account.github_user
     if github_user not in user_tokens:
@@ -4032,28 +3921,19 @@ def resolve_workflow_drift(
     # caller's token happens to be able to write to.
     _require_repo_in_project(db, project, payload.repo, github_user)
 
-    owner, repo = payload.repo.strip().split("/", 1)
-    # No silent fallback: this force-pushes over the named branch, and
-    # defaulting to "main" because the caller omitted one would overwrite a
-    # branch the user never chose.
+    # No silent fallback: defaulting to "main" because the caller omitted a
+    # branch would act on a branch the user never chose.
     branch = (payload.branch or "").strip()
     if not branch:
         raise HTTPException(status_code=400, detail="branch is required to restore a workflow")
-    token = user_tokens[github_user]
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": ACCEPT_HEADER,
-        "X-GitHub-Api-Version": X_API_VERSION,
-    }
-    formatted_name = format_workflow_name(wf.workflow_name, project.project_code or "", project.use_prefix)
 
     if payload.resolution == "use_github":
-        return _resolve_use_github_drift(db, github_user, wf, project, payload, branch, workflow_id, formatted_name, token)
+        formatted_name = format_workflow_name(wf.workflow_name, project.project_code or "", project.use_prefix)
+        return _resolve_use_github_drift(db, github_user, wf, project, payload, branch, workflow_id, formatted_name,
+                                         user_tokens[github_user])
 
     if payload.resolution == "restore_actionsmanager":
-        return _resolve_restore_actionsmanager_drift(
-            db, github_user, wf, project, payload, branch, workflow_id, owner, repo, formatted_name, headers
-        )
+        return _resolve_restore_actionsmanager_drift(db, github_user, wf, project, payload, branch, workflow_id)
 
     raise HTTPException(
         status_code=400,
@@ -4119,98 +3999,6 @@ def _bulk_resolve_use_github(
                 workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
                 success=False, message=f"Failed to adopt GitHub version: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}",
             ))
-    return results
-
-
-def _bulk_resolve_restore_direct_push_result(
-    item, wf, push_result: dict, project: Project, github_user: str, db: Session, branch: str, path: str,
-    headers: dict,
-) -> BulkResolveDriftItemResult:
-    status_code = push_result.get("status_code")
-    if status_code in (200, 201):
-        if push_result.get("sha"):
-            wf.workflow_git_hash = push_result["sha"]
-        wf.last_modified_by = github_user
-        wf.workflow_status = "synced_with_github"
-        removal_error = _remove_superseded_on_target(
-            db, deliveries.WORKFLOW, wf.workflow_id, item.repo, branch, path,
-            project.project_code, github_user, headers,
-        )
-        deliveries.record_delivered(db, deliveries.WORKFLOW, wf.workflow_id, item.repo, branch,
-                                    path, push_result.get("sha"))
-        db.commit()
-        clear_drift(db, project, deliveries.WORKFLOW, wf.workflow_id, item.repo, branch)
-        return BulkResolveDriftItemResult(
-            workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
-            success=True,
-            message=(f"Workflow '{wf.workflow_name}' restored to {item.repo}@{branch} (direct commit)"
-                     + _superseded_copy_note(removal_error)),
-        )
-    if status_code == 409:
-        # Stale item: reported on its own row so the rest of the batch
-        # still applies, and not dressed up as a push failure.
-        return BulkResolveDriftItemResult(
-            workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
-            success=False, message=push_result.get("error", ""),
-        )
-    return BulkResolveDriftItemResult(
-        workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
-        success=False,
-        message=(
-            f"Failed to push workflow to GitHub: "
-            f"{status_code} {push_result.get('error', '')}"
-        ),
-    )
-
-
-def _bulk_resolve_restore_direct_item(
-    db: Session, github_user: str, project: Project, item, wf, headers: dict,
-) -> BulkResolveDriftItemResult:
-    owner, repo_short = item.repo.split("/", 1)
-    branch = (item.branch or "").strip()
-    formatted_name = format_workflow_name(wf.workflow_name, project.project_code or "", project.use_prefix)
-    if not branch:
-        # Fail this item rather than force-pushing over "main" by default.
-        return BulkResolveDriftItemResult(
-            workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
-            success=False, message="branch is required to restore a workflow",
-        )
-    path = f".github/workflows/{formatted_name}"
-    commit_msg = f"Restore {formatted_name} from ActionsManager for {project.project_code} [skip ci]"
-    try:
-        push_result = _direct_push_workflow_to_branch(
-            owner, repo_short, branch, path, wf.workflow_yaml or "",
-            commit_msg, headers, github_user, db,
-            expected_sha=item.expected_github_sha,
-        )
-        return _bulk_resolve_restore_direct_push_result(item, wf, push_result, project, github_user, db, branch, path,
-                                                        headers)
-    except Exception as e:  # noqa: BLE001 - convert unexpected errors to a per-item failure
-        db.rollback()
-        return BulkResolveDriftItemResult(
-            workflow_id=item.workflow_id, repo=item.repo, branch=item.branch,
-            success=False, message=f"Failed to restore workflow directly: {failure_kind(e, _SHOWN_GITHUB_ERRORS)}",
-        )
-
-
-def _bulk_resolve_restore_direct(
-    db: Session, github_user: str, project: Project, resolved_items: list, token: str
-) -> List[BulkResolveDriftItemResult]:
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": ACCEPT_HEADER,
-        "X-GitHub-Api-Version": X_API_VERSION,
-    }
-    results: List[BulkResolveDriftItemResult] = [
-        _bulk_resolve_restore_direct_item(db, github_user, project, item, wf, headers)
-        for item, wf in resolved_items
-    ]
-
-    # Mirrors _handle_sync_direct_push's all_ok aggregate pattern for
-    # the equivalent "push local content out to GitHub directly"
-    # action - results here contains only this branch's items.
-    project.pr_state = "synced" if all(r.success for r in results) else "draft"
-    db.commit()
     return results
 
 
@@ -4315,9 +4103,7 @@ def bulk_resolve_project_drift(
     """Resolve drift for multiple workflows in one request.
 
     All items must belong to workflows owned by ``project_id``. Partial
-    failure is supported - one bad item doesn't block the rest, matching the
-    existing per-repo loop-and-collect-results pattern already used by
-    ``_handle_sync_direct_push``.
+    failure is supported - one bad item doesn't block the rest.
     """
     github_user = account.github_user
     if github_user not in user_tokens:
@@ -4351,14 +4137,8 @@ def bulk_resolve_project_drift(
     if payload.resolution == "use_github":
         results = _bulk_resolve_use_github(db, github_user, project, resolved_items, token)
     else:  # restore_actionsmanager
-        delivery_mode = (payload.delivery_mode or "pr").lower()
-        if delivery_mode not in ("pr", "direct"):
-            raise HTTPException(status_code=400, detail=DELIVERY_MODE_ERROR_DETAIL)
-
-        if delivery_mode == "direct":
-            results = _bulk_resolve_restore_direct(db, github_user, project, resolved_items, token)
-        else:
-            results = _bulk_resolve_restore_pr(db, github_user, project, resolved_items)
+        _require_pr_delivery(payload.delivery_mode)
+        results = _bulk_resolve_restore_pr(db, github_user, project, resolved_items)
 
     return BulkResolveDriftResponse(success=all(r.success for r in results), results=results)
 
@@ -4398,6 +4178,8 @@ def _validate_adopt_github_request(
     if not (payload.branch or "").strip():
         raise HTTPException(status_code=400, detail=_ERR_ADOPT_NEEDS_BRANCH)
     payload.branch = payload.branch.strip()
+    # Before anything is adopted: a refused sync must not leave the project changed.
+    _require_pr_delivery(payload.delivery_mode)
 
     project = db.query(Project).filter_by(project_id=payload.project_id).first()
     if not project:
@@ -4621,7 +4403,7 @@ def _handle_adopt_local_only(
         "message": (
             f"Project workflow updated from GitHub version in "
             f"{source_repo.repo_name}. Other repositories using this "
-            f"shared workflow may now show drift until they are synced."
+            f"shared workflow keep the previous version until it is delivered to them."
         ),
         "resolution_mode": ADOPT_LOCAL_ONLY,
         "updated_project_workflow": True,
@@ -4647,136 +4429,6 @@ def _get_target_repos_for_sync(
     return list(affected_repos)
 
 
-def _direct_sync_to_branch(
-    db: Session,
-    project: Project,
-    workflow: Workflow,
-    repo_name: str,
-    branch: str,
-    path: str,
-    content: str,
-    commit_msg: str,
-    headers: dict,
-    github_user: str,
-) -> dict:
-    """Push one (repo, branch) for adopt_project_and_sync and report how it went.
-
-    A failure here is this target's result, not the request's: earlier targets
-    are already written, so the caller has to be able to say which (#2302).
-    """
-    owner, repo = repo_name.split("/", 1)
-    try:
-        result = _direct_push_workflow_to_branch(
-            owner, repo, branch, path, content, commit_msg, headers, github_user, db,
-        )
-    except Exception as e:
-        db.rollback()
-        print(f"❌ Direct sync to {repo_name}@{branch} failed: {e}")
-        return {"repo": repo_name, "branch": branch, "status": "failed", "github_sha": None,
-                "error": failure_kind(e, _SHOWN_GITHUB_ERRORS)}
-
-    ok = result.get("status_code") in (200, 201)
-    error = result.get("error")
-    if ok:
-        try:
-            # The removal's failure is this synced target's error: the old copy is still there.
-            error = _remove_superseded_on_target(db, deliveries.WORKFLOW, workflow.workflow_id, repo_name, branch,
-                                                 path, project.project_code, github_user, headers)
-            deliveries.record_delivered(db, deliveries.WORKFLOW, workflow.workflow_id, repo_name, branch,
-                                        path, result.get("sha"))
-            clear_drift(db, project, deliveries.WORKFLOW, workflow.workflow_id, repo_name, branch)
-        except Exception as e:
-            # The push landed, so this target is synced; the next drift check
-            # corrects the stale row.
-            db.rollback()
-            print(f"⚠️ Synced {repo_name}@{branch} but could not record it or clear its drift: {e}")
-    return {"repo": repo_name, "branch": branch, "status": "synced" if ok else "failed",
-            "github_sha": result.get("sha"), "error": error}
-
-
-def _failed_sync_targets(entries: list) -> str:
-    """Which targets failed and why, for the message the UI shows (#2302)."""
-    return "; ".join(
-        f"{e['repo']}@{e['branch']}: {e['error']}" if e["branch"] else f"{e['repo']}: {e['error']}"
-        for e in entries if e["status"] != "synced"
-    )
-
-
-def _handle_sync_direct_push(
-    db: Session,
-    project: Project,
-    workflow: Workflow,
-    source_repo: Repo,
-    target_repos: list,
-    formatted_name: str,
-    github_content: str,
-    token: str,
-    github_user: str,
-) -> dict:
-    """Handle direct push delivery mode for adopt_project_and_sync.
-
-    Returns:
-        dict: API response for the direct push sync
-    """
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": ACCEPT_HEADER,
-        "X-GitHub-Api-Version": X_API_VERSION,
-    }
-    sync_results: dict = {"delivery_mode": "direct", "repos": []}
-    all_ok = True
-    path = f".github/workflows/{formatted_name}"
-    commit_msg = (
-        f"Sync {formatted_name} from ActionsManager for "
-        f"{project.project_code} [skip ci]"
-    )
-
-    for r in target_repos:
-        t_owner, t_repo = r.repo_name.split("/", 1)
-        # The branches a PR Campaign would deliver to, not the repo's GitHub
-        # default: a project delivering to release/* never targets main (#2301).
-        branches, branch_error = _resolve_effective_target_branches(
-            r.repo_name, t_owner, t_repo, project, db,
-            project.branch_option or "default", project.branch_regex or "",
-            project.branch_max_age_days or 30, headers, github_user,
-        )
-        if branch_error:
-            all_ok = False
-            sync_results["repos"].append({
-                "repo": r.repo_name, "branch": None, "status": "failed", "github_sha": None,
-                "error": branch_error["error"],
-            })
-            continue
-
-        for t_branch in branches:
-            entry = _direct_sync_to_branch(
-                db, project, workflow, r.repo_name, t_branch, path, github_content,
-                commit_msg, headers, github_user,
-            )
-            sync_results["repos"].append(entry)
-            all_ok = all_ok and entry["status"] == "synced"
-
-    project.pr_state = "synced" if all_ok else "draft"
-    db.commit()
-
-    return {
-        "success": all_ok,
-        "message": (
-            f"Project workflow adopted from {source_repo.repo_name} and "
-            f"directly pushed to {len(target_repos)} repo(s)."
-            if all_ok else
-            f"Project workflow adopted from {source_repo.repo_name}, but "
-            f"some targets failed to sync: {_failed_sync_targets(sync_results['repos'])}"
-        ),
-        "resolution_mode": ADOPT_PROJECT_AND_SYNC,
-        "updated_project_workflow": True,
-        "created_or_updated_override": None,
-        "affected_repos": [r.repo_name for r in target_repos],
-        "sync_results": sync_results,
-        "new_drift_status": "synced" if all_ok else "partial_failure",
-    }
-
-
 def _handle_sync_pr_mode(
     db: Session,
     project: Project,
@@ -4794,7 +4446,7 @@ def _handle_sync_pr_mode(
         project_name=project.project_name,
         project_id=project.project_id,
         selected_repos=[r.repo_name for r in target_repos],
-        selected_workflows=[workflow.workflow_name],
+        **_campaign_selection([workflow]),
     )
     # create_pull_requests is a route function (payload, background_tasks, db,
     # ...); called directly it needs background_tasks supplied and db passed
@@ -4835,23 +4487,13 @@ def _handle_adopt_project_and_sync(
     workflow: Workflow,
     source_repo: Repo,
     affected_repos: list,
-    formatted_name: str,
-    github_content: str,
-    token: str,
     github_user: str,
 ) -> dict:
-    """Handle ADOPT_PROJECT_AND_SYNC resolution mode.
+    """Handle ADOPT_PROJECT_AND_SYNC: open pull requests carrying the adopted workflow to the other repos.
 
     Returns:
         dict: API response for the sync operation
-
-    Raises:
-        HTTPException: If delivery_mode is invalid
     """
-    delivery_mode = (payload.delivery_mode or "pr").lower()
-    if delivery_mode not in ("pr", "direct"):
-        raise HTTPException(status_code=400, detail=DELIVERY_MODE_ERROR_DETAIL)
-
     target_repos = _get_target_repos_for_sync(payload, affected_repos)
 
     if not target_repos:
@@ -4865,15 +4507,9 @@ def _handle_adopt_project_and_sync(
             "updated_project_workflow": True,
             "created_or_updated_override": None,
             "affected_repos": [],
-            "sync_results": {"delivery_mode": delivery_mode, "repos": []},
+            "sync_results": {"delivery_mode": "pr", "repos": []},
             "new_drift_status": "synced",
         }
-
-    if delivery_mode == "direct":
-        return _handle_sync_direct_push(
-            db, project, workflow, source_repo, target_repos, formatted_name,
-            github_content, token, github_user,
-        )
 
     return _handle_sync_pr_mode(
         db, project, workflow, source_repo, target_repos, github_user,
@@ -4902,10 +4538,10 @@ def adopt_github_version(
 
       * ``adopt_project_and_sync`` – Use the GitHub version from the source repo
         as the new project workflow content, then sync the other repos in the
-        project (via PR or direct commit) so they don't silently drift.
-      * ``adopt_local_only``       – Update only the local project workflow
-        (legacy behaviour). The caller must accept that other repos sharing the
-        workflow may now show drift.
+        project through pull requests.
+      * ``adopt_local_only``       – Update only the local project workflow.
+        Other repos sharing it keep the previous version until it is delivered
+        to them; they still hold what was delivered, so they are not drift.
       * ``create_repo_override``   – Record a per-repo override so the source
         repo can intentionally diverge from the shared project workflow without
         re-triggering drift on every detection cycle.
@@ -4945,10 +4581,7 @@ def adopt_github_version(
         return _handle_adopt_local_only(db, project, source_repo, affected_repos)
 
     # Handle ADOPT_PROJECT_AND_SYNC mode
-    return _handle_adopt_project_and_sync(
-        db, payload, project, workflow, source_repo, affected_repos,
-        formatted_name, github_content, token, github_user,
-    )
+    return _handle_adopt_project_and_sync(db, payload, project, workflow, source_repo, affected_repos, github_user)
 
 
 def _get_project_and_token(payload: "CreatePullRequestsRequest", db: Session, github_user: str = None):
@@ -5127,21 +4760,28 @@ def _ensure_preflight_allows_campaign(project: Project, *, github_user: str, tok
         )
 
 
+def _custom_file_has_local_change():
+    """A custom file with a change no campaign has delivered yet: an edit, or its removal."""
+    return CustomFile.pending_delete.is_(True) | (CustomFile.file_status != "synced_with_github")
+
+
 def _build_custom_files_for_delivery(project: Project, payload: "CreatePullRequestsRequest", db: Session) -> List[dict]:
     """Return custom files to include in this PR Campaign.
 
     ``payload.selected_custom_file_ids = None``  → all changed/pending files.
     ``payload.selected_custom_file_ids = []``     → none (user deselected all).
-    ``payload.selected_custom_file_ids = [1,2]``  → only those specific files.
+    ``payload.selected_custom_file_ids = [1,2]``  → only those specific files,
+    whatever their status, as for CODEOWNERS: so a campaign can also put a
+    synced file back where it drifted, or deliver it to a repository it never
+    reached. ``synced`` marks such a file, for _upsert_custom_file_to_am_branch.
     """
     if payload.selected_custom_file_ids == []:
         return []
-    query = db.query(CustomFile).filter(
-        CustomFile.project_id == project.project_id,
-        (CustomFile.pending_delete.is_(True)) | (CustomFile.file_status != "synced_with_github"),
-    )
+    query = db.query(CustomFile).filter(CustomFile.project_id == project.project_id)
     if payload.selected_custom_file_ids:
         query = query.filter(CustomFile.id.in_(payload.selected_custom_file_ids))
+    else:
+        query = query.filter(_custom_file_has_local_change())
     files = query.all()
     return [
         {
@@ -5149,6 +4789,7 @@ def _build_custom_files_for_delivery(project: Project, payload: "CreatePullReque
             "file_path": f.file_path,
             "file_content": f.file_content,
             "pending_delete": f.pending_delete,
+            "synced": f.file_status == "synced_with_github" and not f.pending_delete,
         }
         for f in files
     ]
@@ -5918,6 +5559,7 @@ def run_preflight_validation(
         # Preflight opens a pull request in the validation repository, so it is a
         # GitHub write and needs the same gate as the campaign it validates.
         _require_project_editor(db, github_user, project)
+        refuse_unless_accepted(project, "validation_repo")
         validation_repo = _get_validation_repo_name(project, db)
         if not validation_repo:
             raise HTTPException(status_code=400, detail="Preflight validation is not configured.")
@@ -9174,11 +8816,17 @@ def _campaign_view_url(user: Optional[str], project_name: Optional[str]) -> Opti
     return f"{auth_module.FRONTEND_URL}/project/{quote(user)}/{quote(project_name)}"
 
 
-def _pr_body_heading(project_code: str, campaign_meta: Optional[dict]) -> List[str]:
+def _delivered_noun(workflows_committed: List[str]) -> str:
+    """What a PR says it updates: its workflows, or its files when it carries no workflow."""
+    return "workflows" if workflows_committed else "files"
+
+
+def _pr_body_heading(project_code: str, campaign_meta: Optional[dict], workflows_committed: List[str]) -> List[str]:
     """Open with the campaign's own name when the user gave it one."""
     name = (campaign_meta or {}).get("name")
     if not name:
-        return [f"This PR updates ActionsManager workflows for project **{project_code}**."]
+        noun = _delivered_noun(workflows_committed)
+        return [f"This PR updates ActionsManager {noun} for project **{project_code}**."]
     lines = [f"## {name}", ""]
     description = (campaign_meta or {}).get("description")
     if description:
@@ -9245,7 +8893,7 @@ def _campaign_pr_body(db: Session, project_code: str, user: Optional[str],
                 if (db and project and workflows_committed) else {}
             )
 
-    lines = _pr_body_heading(project_code, campaign_meta)
+    lines = _pr_body_heading(project_code, campaign_meta, workflows_committed)
     lines.append("")
     lines += _pr_body_workflow_table(workflows_committed, policy)
     lines += _pr_body_delivery_lines(target_branch, base_sha, custom_files_result)
@@ -9321,7 +8969,7 @@ def _create_pull_request(owner: str, repo: str, am_branch: str,
 """
 
     pr_payload = {
-        "title": title or f"[Actions Manager] Update {project_code} workflows",
+        "title": title or f"[Actions Manager] Update {project_code} {_delivered_noun(workflows_committed)}",
         "body": pr_body,
         "head": am_branch,
         "base": target_branch
@@ -9736,24 +9384,6 @@ def _remove_superseded_copy(entry: dict, target: Optional[tuple], branch: str, w
     return outcome
 
 
-def _remove_superseded_on_target(db: Session, kind: str, file_id, repo_name: str, branch: str, path: str,
-                                 project_code: str, user: str, headers: dict) -> Optional[str]:
-    """For a direct write of *path* to (repo, branch), before it is recorded: remove the copy it supersedes there.
-
-    Returns why the removal failed, or None.
-    """
-    owner, repo = repo_name.split("/", 1)
-    errors: list = []
-    _remove_superseded_copy(_carried_entry(kind, file_id, path), (repo_name, branch), branch, frozenset(),
-                            owner, repo, project_code, user, db, headers, errors)
-    return errors[0] if errors else None
-
-
-def _superseded_copy_note(removal_error: Optional[str]) -> str:
-    """What a direct write's message adds when the copy it superseded could not be removed."""
-    return f"; the copy it replaces could not be removed ({removal_error})" if removal_error else ""
-
-
 def _paths_written(workflows: List[dict], custom_files: List[dict], codeowners: Optional[dict],
                    project_code: str, use_prefix: bool) -> frozenset:
     """Every path a campaign writes on each of its targets, lowercased (see _remove_superseded_copy)."""
@@ -9909,6 +9539,10 @@ def _upsert_custom_file_to_am_branch(owner: str, repo: str, cf: dict, am_branch:
     A commit removes the delivered copy it supersedes, as for a workflow
     (``target`` and ``written`` are _commit_workflows_to_branch's). Its
     failure is the error of a write that succeeded.
+
+    A synced file (one a campaign carries only to put it back where it
+    drifted, or to a repository it never reached) is not written where the
+    branch already holds it, as for CODEOWNERS: that target gets no pull request.
     """
     cf_path = cf.get("file_path", "")
     cf_url_path = quote(cf_path, safe="/")
@@ -9919,6 +9553,9 @@ def _upsert_custom_file_to_am_branch(owner: str, repo: str, cf: dict, am_branch:
         params={"ref": am_branch},
     )
     existing_sha = sha_resp.json().get("sha") if sha_resp.status_code == 200 else None
+    if cf.get("synced") and existing_sha == deliveries.blob_sha(cf["file_content"]):
+        print(f"📌 Custom file '{cf_path}' already on {am_branch}")
+        return False, None
     put_body: dict = {
         "message": f"Update {cf_path} via ActionsManager [{project_code}] [skip ci]",
         "content": base64.b64encode(cf["file_content"].encode()).decode(),
@@ -10478,11 +10115,26 @@ def _deliver_to_target(target: _DeliveryTarget, commit: Callable, run: _Delivery
         run.results[result_key] = _nothing_delivered(target, am_branch, branch_created, delivery, run, result_key)
         return
     run.progress(result_key, PROGRESS_OPENING_PR, "running")
-    run.results[result_key] = _finalize_pr_result(
+    result = _finalize_pr_result(
         target.owner, target.repo, am_branch, target.branch, run.headers, run.user, run.db,
         run.project_code, run.progress_callback, result_key,
         delivery={**delivery, "base_sha": run.base_commits.get(result_key), "campaign_meta": run.campaign_meta},
     )
+    if branch_created and _holds_everything_already(result):
+        # A workflow the target branch already holds is "committed" unchanged,
+        # so only GitHub's refusal shows the branch this run cut carries
+        # nothing new: the target is up to date, as a file found already there
+        # is, not failed. A restore campaign meets this on every other branch of
+        # the repository it puts drift right in.
+        result = _nothing_delivered(
+            target, am_branch, branch_created, {**delivery, "workflows_committed": []}, run, result_key,
+        )
+    run.results[result_key] = result
+
+
+def _holds_everything_already(result: dict) -> bool:
+    """Whether GitHub refused a pull request because its branch adds nothing to the target."""
+    return result.get("status") == "error" and "No commits between" in (result.get("error") or "")
 
 
 class _ProjectFiles(NamedTuple):
@@ -10711,6 +10363,16 @@ def update_project_files(
     _require_project_editor(db, user, project)
     repo_names, skipped_repos = _only_project_repos(db, project, payload.repo_names)
     names_files = bool(payload.custom_file_ids or payload.include_codeowners)
+    # A push carries local changes only. A campaign delivers a custom file it
+    # names whatever its status, so a synced one named here (a display-name
+    # edit) would otherwise be re-sent over copies changed on GitHub.
+    custom_file_ids = [
+        cid for (cid,) in db.query(CustomFile.id).filter(
+            CustomFile.project_id == project.project_id,
+            CustomFile.id.in_(payload.custom_file_ids or []),
+            _custom_file_has_local_change(),
+        )
+    ]
     campaign = CreatePullRequestsRequest(
         project_name=project.project_name,
         project_id=project.project_id,
@@ -10719,7 +10381,7 @@ def update_project_files(
         # selecting a workflow; None there would select every one.
         selected_workflows=_pushed_names(payload.workflows) or ([] if names_files else None),
         selected_reusable_workflows=_pushed_names(payload.rxworkflows),
-        selected_custom_file_ids=payload.custom_file_ids,
+        selected_custom_file_ids=custom_file_ids,
         include_codeowners=payload.include_codeowners,
     )
     if campaign.selected_workflows is None and campaign.selected_reusable_workflows is None:

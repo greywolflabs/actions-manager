@@ -2,27 +2,30 @@ import React from "react";
 import { Button } from "./ui/button";
 
 interface PendingDeliveryNoticeProps {
-  /** Repositories that have never received any of the project's workflows. */
+  /** Repositories that have never received any of the project's workflows (or its CODEOWNERS, when it has none). */
   repos: string[];
+  /** What they are waiting for: "workflows", or "CODEOWNERS" for a project with none. */
+  deliverable?: string;
   /** Opens the PR campaign scoped to `repos`. Omitted for a read-only viewer. */
   onCreatePullRequests?: () => void;
 }
 
 /**
  * Reminds the user that repositories they added are still waiting for the
- * project's workflows.
+ * project's workflows, or its CODEOWNERS when it has none.
  *
  * Deliberately not a warning. Nothing is broken — the repo simply hasn't been
  * delivered to yet, which is also why drift stays silent about it (see
  * `_delivery_confirmed_on_branch`). So this uses the blue informational palette
  * rather than the amber the drift banner owns, and the copy carries no urgency.
- * It clears itself once the workflows land.
+ * It clears itself once they land.
  *
  * Anatomy mirrors the drift status row so the top of a project reads as one
  * consistent channel rather than a stack of unrelated bars.
  */
 const PendingDeliveryNotice: React.FC<PendingDeliveryNoticeProps> = ({
   repos,
+  deliverable = "workflows",
   onCreatePullRequests,
 }) => {
   if (repos.length === 0) return null;
@@ -52,8 +55,8 @@ const PendingDeliveryNotice: React.FC<PendingDeliveryNoticeProps> = ({
       <span className="flex-1 flex flex-col gap-0.5">
         <span className="text-sm font-medium">
           {single
-            ? `${repos[0]} doesn't have this project's workflows yet`
-            : `${repos.length} repositories don't have this project's workflows yet`}
+            ? `${repos[0]} doesn't have this project's ${deliverable} yet`
+            : `${repos.length} repositories don't have this project's ${deliverable} yet`}
         </span>
         <span className="text-xs leading-[17px] text-blue-700 dark:text-blue-300">
           {single ? "It was" : `${repos.join(", ")} were`} saved to the project.

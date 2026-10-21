@@ -43,6 +43,7 @@ from database import get_db
 from github_api_tracker import RateLimitExceeded, github_get
 from models import Codeowners, CustomFile, Project, ProjectPRCampaign, ProjectPullRequest, ProjectWorkflow, Workflow
 from error_detail import failure_kind
+from file_kinds import project_accepts
 
 router = APIRouter()
 
@@ -268,6 +269,8 @@ def _invert_one_pr(pr: ProjectPullRequest, user: str, db: Session, headers: dict
         "invertible": False,
         "reason": None,
         "files": [],
+        # Paths the PR changed that a Managed Files project manages now: never rolled back here.
+        "left_alone": [],
     }
 
     base_sha, reason = _pre_merge_base_sha(pr.repo_name, pr.pr_number, user, db, headers)
@@ -280,8 +283,16 @@ def _invert_one_pr(pr: ProjectPullRequest, user: str, db: Session, headers: dict
         target["reason"] = reason
         return target
 
+    project = db.get(Project, pr.project_id)
     files = []
+    left_alone = target["left_alone"]
     for entry in changed:
+        path = entry.get("filename") or ""
+        # A kind's file belongs to a Managed Files project of that kind (#2367);
+        # rolling back an older campaign of another project must not rewrite it.
+        if project is not None and project_accepts(project, path=path):
+            left_alone.append(path)
+            continue
         inverted, reason = _invert_one_file(
             pr.repo_name, entry, pr.target_branch, base_sha, user, db, headers
         )
@@ -293,7 +304,11 @@ def _invert_one_pr(pr: ProjectPullRequest, user: str, db: Session, headers: dict
         files.append(inverted)
 
     if not files:
-        target["reason"] = "This pull request changed no files, so there is nothing to roll back."
+        target["reason"] = (
+            f"This pull request changed only {', '.join(left_alone)}, which Managed Files manages now, "
+            "so there is nothing here to roll back."
+            if left_alone else "This pull request changed no files, so there is nothing to roll back."
+        )
         return target
 
     target["invertible"] = True
@@ -380,13 +395,14 @@ def _deliver_one_target(target: dict, project: Project, campaign_meta: dict,
             "custom_file_errors": errors,
         }
 
+    # Carried over from the source PR row so the rollback campaign renders the
+    # same workflows, and so apply_rollback_am_action has names to act on.
+    workflows_committed = wf._split_workflow_names(target.get("workflow_names"))
     return result_key, wf._finalize_pr_result(
         owner, repo, am_branch, branch, headers, user, db,
         project.project_code, None, result_key,
         delivery={
-            # Carried over from the source PR row so the rollback campaign renders
-            # the same workflows, and so apply_rollback_am_action has names to act on.
-            "workflows_committed": wf._split_workflow_names(target.get("workflow_names")),
+            "workflows_committed": workflows_committed,
             "workflow_errors": [],
             "deliveries": carried,
             "custom_files_result": {
@@ -396,7 +412,9 @@ def _deliver_one_target(target: dict, project: Project, campaign_meta: dict,
             },
             "base_sha": branch_shas.get(branch),
             "campaign_meta": campaign_meta,
-            "pr_title": f"[Actions Manager] Roll back {project.project_code} workflows",
+            "pr_title": (
+                f"[Actions Manager] Roll back {project.project_code} {wf._delivered_noun(workflows_committed)}"
+            ),
         },
     )
 

@@ -4,7 +4,6 @@ import { ChevronDown, ChevronLeft, ChevronRight, Plus } from 'lucide-react';
 import { UnifiedWorkflowItem } from '../types/workflow';
 import { normalizeWorkflowFilename, workflowDisplayFilename } from '../utils/workflowFilename';
 import { CustomFile } from '../api/customFiles';
-import type { CodeownersRecord } from '../api/codeowners';
 import {
   PANEL_DEFAULT_WIDTH,
   PANEL_MAX_WIDTH,
@@ -27,7 +26,7 @@ interface UnifiedWorkflowListProps {
   projectType?: 'standard' | 'rwx';
   setIsCollapsed: (collapsed: boolean) => void;
   handleSelectWorkflow: (workflowId: string) => void;
-  /** Opens the Add Project File dialog (Workflow / Reusable Workflow / Link Reusable Workflow / Custom File / CODEOWNERS). */
+  /** Opens the Add Project File dialog (Workflow / Reusable Workflow / Link Reusable Workflow / Custom File). */
   addWorkflowFn?: () => void;
   /** Set of workflow names currently drifted on GitHub (renders a small warning icon). */
   driftedWorkflowNames?: Set<string>;
@@ -37,11 +36,11 @@ interface UnifiedWorkflowListProps {
   onSelectCustomFile?: (id: number) => void;
   /** Ids of the custom files currently drifted on GitHub. */
   driftedCustomFileIds?: Set<number>;
-  // Project Files: the project's CODEOWNERS file, listed once the project has a repository
-  codeowners?: CodeownersRecord | null;
-  codeownersSelected?: boolean;
-  codeownersDrifted?: boolean;
-  onSelectCodeowners?: () => void;
+  /**
+   * Opens the Managed Files section. Where the project's CODEOWNERS row was, a
+   * note points there once the project has a repository (#2367).
+   */
+  onOpenManagedFiles?: () => void;
 }
 
 const WORKFLOW_STATUS_LABELS: Record<string, { label: string; className: string }> = {
@@ -58,7 +57,9 @@ const SECTION_WORKFLOWS = 'workflows';
 const SECTION_REUSABLE = 'reusable';
 const SECTION_LINKED = 'linked';
 const SECTION_CUSTOM = 'custom';
-const SECTION_CODEOWNERS = 'codeowners';
+// Not 'codeowners', the editor's old section: closing that one must not hide
+// the note saying where CODEOWNERS went (#2367).
+const SECTION_CODEOWNERS = 'codeowners-moved';
 
 const SECTION_ICONS: Record<string, string> = {
   [SECTION_WORKFLOWS]: '📝',
@@ -304,10 +305,7 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
   selectedCustomFileId,
   onSelectCustomFile,
   driftedCustomFileIds,
-  codeowners,
-  codeownersSelected = false,
-  codeownersDrifted = false,
-  onSelectCodeowners,
+  onOpenManagedFiles,
 }) => {
   const [panelWidth, setPanelWidth] = React.useState(readStoredPanelWidth);
   const [closedSections, setClosedSections] = React.useState<Set<string>>(readStoredClosedSections);
@@ -357,7 +355,7 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
   // A caller project can hold reusable workflows, but they belong in a Reusable
   // Workflow Project - flag them so the row says so at a glance.
   const flagsReusable = projectType !== 'rwx';
-  const showCodeownersSection = !!onSelectCodeowners && selectedRepos.length > 0;
+  const showCodeownersSection = !!onOpenManagedFiles && selectedRepos.length > 0;
 
   /**
    * The project prefix the file will carry on GitHub, or '' in no-prefix mode.
@@ -451,27 +449,19 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
     );
   };
 
-  const renderCodeownersRow = () => {
-    const path = codeowners?.file_path ?? '.github/CODEOWNERS';
-    const status = getRowStatus(codeowners?.status);
-    const repoCount = `${selectedRepos.length} repo${selectedRepos.length !== 1 ? 's' : ''}`;
-    const stateParts = buildStateParts({ status: status.label, drifted: codeownersDrifted });
-
-    return (
-      <FileRow
-        icon={SECTION_ICONS[SECTION_CODEOWNERS]}
-        name={path}
-        title={[path, repoCount, ...stateParts].join(DETAIL_SEPARATOR)}
-        ariaLabel={[path, ...stateParts].join(', ')}
-        statusLabel={status.label}
-        statusClassName={status.className}
-        selected={codeownersSelected}
-        onSelect={() => onSelectCodeowners?.()}
-        drifted={codeownersDrifted}
-        testId="codeowners-row"
-      />
-    );
-  };
+  // CODEOWNERS is managed in Managed Files now, one project per repository.
+  const renderCodeownersPointer = () => (
+    <p className="empty-section-hint" data-testid="codeowners-pointer">
+      CODEOWNERS is now managed in{' '}
+      <button
+        type="button"
+        onClick={onOpenManagedFiles}
+        className="font-medium text-blue-600 underline hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
+      >
+        Managed Files
+      </button>
+    </p>
+  );
 
   if (isCollapsed) {
     const railSections = [
@@ -624,7 +614,7 @@ const UnifiedWorkflowList: React.FC<UnifiedWorkflowListProps> = ({
               closed={closedSections.has(SECTION_CODEOWNERS)}
               onToggle={toggleSection}
             >
-              <ul className="pf-rows">{renderCodeownersRow()}</ul>
+              {renderCodeownersPointer()}
             </PanelSection>
           )}
         </div>

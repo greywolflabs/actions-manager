@@ -253,6 +253,9 @@ def test_adopt_github_local_only_updates_project_only(_g, db_state):
     # Other repo (test2) should be in affected list, signalling a warning
     assert "whatsupdawg/test2" in body["affected_repos"]
     assert body["new_drift_status"] == "drifted_on_other_repos"
+    # They still hold what was delivered, which is not drift.
+    assert "keep the previous version until it is delivered to them" in body["message"]
+    assert "drift" not in body["message"]
 
     db = TestingSessionLocal()
     try:

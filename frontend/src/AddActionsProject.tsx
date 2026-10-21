@@ -55,7 +55,7 @@ export default function AddActionsProject({ user }: AddActionsProjectProps): Rea
   };
 
   return (
-    <div className="w-full max-w-3xl mx-auto px-6 lg:px-8" data-testid="add-actions-project">
+    <div className="w-full max-w-3xl" data-testid="add-actions-project">
       <div className="mb-6">
         <p className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-slate-400">
           Add Managed Action

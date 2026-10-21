@@ -558,6 +558,8 @@ export interface CustomFilePanelProps {
   onReposDelivered?: (repos: string[]) => void;
   /** Each (repo, branch) where the last drift check found this file changed on GitHub. */
   drift?: CustomFileDriftDetail[];
+  /** "Keep the ActionsManager version" of the drifted file: a PR campaign carrying only it. */
+  onKeepActionsManagerVersion?: (fileId: number, repos: string[]) => void;
 }
 
 const LOCKED_TITLE = "Locked while its pull request is open. Unlock the file below to edit it.";
@@ -569,10 +571,12 @@ interface CustomFileDriftNoticeProps {
   readonly canLoad: boolean;
   /** Called with a drifted GitHub copy the user chose to load into the editor. */
   readonly onLoaded?: (content: string) => void;
+  /** "Keep the ActionsManager version": a PR campaign carrying only this file to the repositories it drifted in. */
+  readonly onKeep?: (repos: string[]) => void;
 }
 
 /** The file's drift banner, loading a drifted GitHub copy into the editor on request. */
-const CustomFileDriftNotice: React.FC<CustomFileDriftNoticeProps> = ({ projectId, cf, drift, canLoad, onLoaded }) => {
+const CustomFileDriftNotice: React.FC<CustomFileDriftNoticeProps> = ({ projectId, cf, drift, canLoad, onLoaded, onKeep }) => {
   const [loadingFrom, setLoadingFrom] = useState<string | null>(null);
   if (drift.length === 0) return null;
 
@@ -603,6 +607,7 @@ const CustomFileDriftNotice: React.FC<CustomFileDriftNoticeProps> = ({ projectId
         canLoad={canLoad}
         loadingFrom={loadingFrom}
         onLoad={load}
+        onKeep={onKeep && (() => onKeep([...new Set(drift.map(d => d.repo))]))}
         testId="custom-file-drift-banner"
       />
     </div>
@@ -684,6 +689,7 @@ export const CustomFilePanel: React.FC<CustomFilePanelProps> = ({
   selectedRepos = [],
   onReposDelivered,
   drift = [],
+  onKeepActionsManagerVersion,
 }) => {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -909,7 +915,8 @@ export const CustomFilePanel: React.FC<CustomFilePanelProps> = ({
           </div>
         )}
       </div>
-      <CustomFileDriftNotice projectId={projectId} cf={cf} drift={drift} canLoad={!saving} onLoaded={loadIntoForm} />
+      <CustomFileDriftNotice projectId={projectId} cf={cf} drift={drift} canLoad={!saving} onLoaded={loadIntoForm}
+        onKeep={onKeepActionsManagerVersion && ((repos) => onKeepActionsManagerVersion(cf.id, repos))} />
       <div className="workflow-editor-content" style={{ overflow: 'auto' }}>
         <FileForm
           ref={formRef}

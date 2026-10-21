@@ -105,7 +105,9 @@ export interface ProjectStub {
   project_code: string;
   github_user: string;
   pr_state?: "new" | "draft" | "open" | "synced";
-  project_type?: "standard" | "rwx";
+  project_type?: "standard" | "rwx" | "managed_files";
+  /** The file a Managed Files project manages; null for every other type. */
+  file_kind?: string | null;
   repository_visibility_scope?: "public" | "private";
   selected_repos?: string[];
   workflows?: any[];
@@ -128,6 +130,22 @@ export interface ProjectStub {
    * by GET /api/projects/{name}. Drives the pending-delivery reminder.
    */
   pending_delivery_repos?: string[];
+  /**
+   * Rows of GET /api/projects/?section=managed_files only: the owner, the
+   * repository count, the file's path and the repositories it drifted in.
+   */
+  owner?: string;
+  repo_count?: number;
+  file_path?: string | null;
+  drifted_repos?: string[];
+  /** Every list row's cached drift summary. */
+  drift_status?: string;
+  last_drift_check_at?: string;
+}
+
+/** Whether *project* is listed in *section* of GET /api/projects/, as the server decides. */
+function inListSection(project: ProjectStub, section: string): boolean {
+  return section === "all" || (section === "managed_files") === (project.project_type === "managed_files");
 }
 
 export function makeProject(overrides: Partial<ProjectStub> = {}): ProjectStub {
@@ -505,7 +523,8 @@ export async function installApiMocks(
         if (state.failProjectsList) {
           return jsonResponse(route, { detail: "boom" }, 500);
         }
-        return jsonResponse(route, state.projects);
+        const section = new URL(route.request().url()).searchParams.get("section") ?? "workflows";
+        return jsonResponse(route, state.projects.filter((project) => inListSection(project, section)));
       }
       if (method === "POST") {
         if (state.failNextSave) {
@@ -520,6 +539,7 @@ export async function installApiMocks(
           project_name: payload.project_name,
           project_code: (payload.custom_project_key || payload.project_name || "PROJ").toUpperCase().slice(0, MOCK_PROJECT_CODE_MAX_LENGTH),
           project_type: payload.project_type ?? "standard",
+          file_kind: payload.file_kind ?? null,
           repository_visibility_scope: payload.repository_visibility_scope ?? "public",
           selected_repos: payload.selected_repos ?? [],
           // Carried from the payload: a project created in prefix mode has to
