@@ -46,7 +46,7 @@ import { getProjectPRStatus } from "./api/pullRequests";
 import { getProjectCodeowners, saveProjectCodeowners, type CodeownersRecord } from "./api/codeowners";
 import { campaignSelectionOf, fileGithubCopy, oneRowPerFile, type DriftRow } from "./utils/driftRows";
 import type { GitHubTokenStatus, Plan } from "./api/user";
-import { ProjectPRState } from "./types/workflow";
+import { DraftWorkflow, ProjectPRState } from "./types/workflow";
 import "./styles/projectMgmt.css";
 import "./styles/driftDetection.css";
 import "./styles/prTracking.css";
@@ -246,6 +246,12 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const navProjectId = toNumericProjectId((location.state as { projectId?: number | string } | null)?.projectId);
+  // Set by Action Usage's "Update and review": an updated workflow to load into the editor, unsaved.
+  const navDraft = (location.state as { draftWorkflow?: DraftWorkflow } | null)?.draftWorkflow ?? null;
+  const handleDraftApplied = useCallback(() => {
+    // Gone from the history entry, so a refresh does not load it again.
+    navigate(location.pathname, { replace: true, state: { projectId: navProjectId } });
+  }, [navigate, location.pathname, navProjectId]);
   const [projectName, setProjectName] = useState<string>(urlProjectName || "");
   const [repos, setRepos] = useState<Repository[]>([]);
   const [selectedRepos, setSelectedRepos] = useState<string[]>([]);
@@ -2011,6 +2017,8 @@ function RepoSelector({ userDetails, onLogout }: RepoSelectorProps) {
             onAddWorkflow={handleAddWorkflowCallback}
             onClearModifiedStates={handleClearWorkflowModifiedStatesCallback}
             onRegisterSelectionFollower={handleRegisterSelectionFollowerCallback}
+            draftWorkflow={navDraft}
+            onDraftApplied={handleDraftApplied}
             rxworkflows={rxworkflows as any}
             setRXWorkflows={setRXWorkflows as any}
             addWorkflowToMain={addWorkflowToMain}

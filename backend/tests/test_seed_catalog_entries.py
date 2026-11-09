@@ -8,6 +8,7 @@ Covers:
 - Deleting a back-filled entry and re-running does NOT recreate it
 - A default deleted before the marker table existed is NOT resurrected
 - An entry the user imported themselves is marked, not duplicated
+- A default offered under a slug it has since moved from is not offered again
 """
 
 import json
@@ -27,7 +28,7 @@ from models import SEED_ACCOUNT_GITHUB_USER  # noqa: E402
 import migrate_seed_default_actions_projects as seed_migration  # noqa: E402
 import migrate_seed_catalog_entries as backfill  # noqa: E402
 
-NEW_SLUG = "dawg-io/am-build-vars"
+NEW_SLUG = "greywolflabs/am-build-vars"
 
 
 def _fresh_sqlite_db(tmp_path):
@@ -67,6 +68,31 @@ def _seeded_install(tmp_path, only_original=True):
         seed_migration.run_migration(database_url=db_url)
     finally:
         seed_migration.SEED_ACTIONS = saved
+    return db_url, engine
+
+
+OLD_OWNER = "dawg-io"
+
+
+def _upgraded_from_dawg_io(tmp_path, delete_old_row=False):
+    """An install the previous release offered am-build-vars to as dawg-io, now upgraded."""
+    db_url, engine = _seeded_install(tmp_path)
+    saved = seed_migration.SEED_ACTIONS
+    try:
+        seed_migration.SEED_ACTIONS = [
+            {**a, "owner": OLD_OWNER} if a["repo"] == "am-build-vars" else a for a in saved
+        ]
+        backfill.SEED_ACTIONS = seed_migration.SEED_ACTIONS
+        backfill.run_migration(database_url=db_url)
+    finally:
+        seed_migration.SEED_ACTIONS = saved
+        backfill.SEED_ACTIONS = saved
+
+    if delete_old_row:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM actions_projects WHERE repo = 'am-build-vars'"))
+
+    backfill.run_migration(database_url=db_url)
     return db_url, engine
 
 
@@ -197,6 +223,31 @@ class TestBackfillCatalogEntries:
             )).fetchall()]
             assert names == ["My own import"]
             assert NEW_SLUG in _markers(db)
+        finally:
+            db.close()
+
+    def test_install_offered_the_old_slug_gets_no_second_copy(self, tmp_path):
+        _, engine = _upgraded_from_dawg_io(tmp_path)
+
+        db = sessionmaker(bind=engine)()
+        try:
+            owners = [r[0] for r in db.execute(text(
+                "SELECT owner FROM actions_projects WHERE repo = 'am-build-vars'"
+            )).fetchall()]
+            assert owners == [OLD_OWNER]
+            assert NEW_SLUG in _markers(db)
+        finally:
+            db.close()
+
+    def test_old_slug_deleted_by_the_user_is_not_recreated_under_the_new_one(self, tmp_path):
+        _, engine = _upgraded_from_dawg_io(tmp_path, delete_old_row=True)
+
+        db = sessionmaker(bind=engine)()
+        try:
+            count = db.execute(text(
+                "SELECT COUNT(*) FROM actions_projects WHERE repo = 'am-build-vars'"
+            )).scalar()
+            assert count == 0
         finally:
             db.close()
 

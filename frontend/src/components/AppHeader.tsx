@@ -1,6 +1,6 @@
 import React from "react";
 import { Link, NavLink } from "react-router";
-import { FileStack, FolderKanban, type LucideIcon, Package } from "lucide-react";
+import { FileStack, FolderKanban, ListTree, type LucideIcon, Package } from "lucide-react";
 import type { UserDetails } from "../api/user";
 import { cn } from "../lib/utils";
 import BrandLogo from "./BrandLogo";
@@ -18,7 +18,7 @@ const APP_CONTAINER_CLASS = "w-full max-w-[1400px] mx-auto px-6 lg:px-8";
  */
 const HEADER_ROW_CLASS = "w-full px-6 lg:px-8";
 
-export type PrimarySection = "projects" | "managed-files" | "managed-actions";
+export type PrimarySection = "projects" | "managed-files" | "managed-actions" | "action-usage";
 
 interface PrimaryTab {
   readonly key: PrimarySection;
@@ -34,6 +34,7 @@ const PRIMARY_TABS: readonly PrimaryTab[] = [
   { key: "projects", label: "Projects", icon: FolderKanban, testId: "projects-nav-button", path: (user) => `/project/${user}`, end: true },
   { key: "managed-files", label: "Managed Files", icon: FileStack, testId: "managed-files-nav-button", path: (user) => `/project/${user}/managed-files`, end: false },
   { key: "managed-actions", label: "Managed Actions", icon: Package, testId: "actions-projects-nav-button", path: (user) => `/project/${user}/actions-projects`, end: false },
+  { key: "action-usage", label: "Action Usage", icon: ListTree, testId: "action-usage-nav-button", path: (user) => `/project/${user}/action-usage`, end: false },
 ];
 
 const FOCUS_RING = "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring";

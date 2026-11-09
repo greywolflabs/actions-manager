@@ -15,6 +15,7 @@ ActionsManager provides a comprehensive set of tools for managing GitHub Actions
 - [Drift Detection](features/drift-detection.html): find repositories that diverge from their managed workflows, and resolve it.
 - [Managed Actions](features/managed-actions.html): a shared catalog of third-party actions with their inputs ready to use.
 - [Managed Files](features/managed-files.html): one project owns a repository file, such as CODEOWNERS, for each of its repositories.
+- [Action Usage](features/action-usage.html): which actions your managed workflows use and at which version, and update them to the latest release, a workflow at a time or all at once.
 - [Environment Rulesets](features/rulesets.html): keep one repository ruleset and apply it across a project.
 - [Backup & Restore](features/backup-restore.html): copy your installation before an upgrade and restore it if needed.
 - [Permissions](features/permissions.html): who can see a project, and who can change it.

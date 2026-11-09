@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   closePullRequest,
+  dismissPullRequest,
   getPRCampaigns,
   mergePullRequest,
   PRCampaign,
@@ -30,9 +31,39 @@ type CampaignTab = "active" | "completed" | "activity";
 type PendingAction =
   | { type: "merge"; pr: PRCampaignPRItem }
   | { type: "close"; pr: PRCampaignPRItem }
+  | { type: "dismiss"; pr: PRCampaignPRItem }
   | { type: "mergeCampaign"; campaign: PRCampaign }
   | { type: "closeCampaign"; campaign: PRCampaign }
   | null;
+
+const CLOSE_COPY = {
+  title: "Close open pull request(s)?",
+  description: "This will close open pull requests without merging. Workflow changes will not be applied to those repositories.",
+  confirmLabel: "Close Open PRs",
+};
+
+const MERGE_COPY = {
+  title: "Merge open pull request(s)?",
+  description: "This will merge open pull requests in this PR Campaign.",
+  confirmLabel: "Merge Open PRs",
+};
+
+const DISMISS_COPY = {
+  title: "Remove this pull request from the campaign?",
+  description:
+    "GitHub no longer has this pull request: its repository or the pull request was deleted, or you can no longer see it. This removes it here only and settles it as closed. Nothing changes on GitHub.",
+  confirmLabel: "Remove from campaign",
+};
+
+const confirmCopy = (type: Exclude<PendingAction, null>["type"]) => {
+  if (type === "dismiss") return DISMISS_COPY;
+  return type === "close" || type === "closeCampaign" ? CLOSE_COPY : MERGE_COPY;
+};
+
+const settledVerb = (merging: boolean, type: Exclude<PendingAction, null>["type"]): string => {
+  if (merging) return "merged";
+  return type === "dismiss" ? "removed" : "closed";
+};
 
 const statusLabels: Record<string, string> = {
   open: "Open",
@@ -138,7 +169,22 @@ const PRRow: React.FC<PRRowProps> = ({ pr, includeActions, processingKey, setPen
           </div>
         </div>
         <div className="pr-campaign-row-actions">
-          {includeActions && pr.pr_state === "open" && (
+          {includeActions && pr.pr_state === "open" && pr.not_found_on_github && (
+            <>
+              <span className="pr-campaign-muted" data-testid="pr-not-found">Not found on GitHub</span>
+              <Button
+                data-testid="pr-dismiss-button"
+                size="sm"
+                variant="destructive"
+                disabled={isProcessing}
+                title="GitHub no longer has this pull request. Remove it from the campaign; nothing changes on GitHub."
+                onClick={() => setPendingAction({ type: "dismiss", pr })}
+              >
+                {isProcessing ? "Working..." : "Remove"}
+              </Button>
+            </>
+          )}
+          {includeActions && pr.pr_state === "open" && !pr.not_found_on_github && (
             <>
               {pr.can_merge === false && pr.merge_block_reason && (
                 <span className="pr-campaign-muted">Merge unavailable: {pr.merge_block_reason}</span>
@@ -364,11 +410,30 @@ const PRHistoryPanel: React.FC<PRCampaignsPanelProps> = ({ user, projectName, on
   // request of a project being deleted, which is gone with it.
   const resolvePR = async (pr: PRCampaignPRItem, merge: boolean): Promise<boolean> => {
     if (!merge) {
-      await closePullRequest(user, projectName, pr.repo_name, pr.pr_number);
+      // A pull request GitHub no longer has cannot be closed there; closing the campaign removes it here.
+      if (pr.not_found_on_github) await dismissPullRequest(user, projectName, pr.repo_name, pr.pr_number);
+      else await closePullRequest(user, projectName, pr.repo_name, pr.pr_number);
       return false;
     }
     const result = await mergePullRequest(user, projectName, pr.repo_name, pr.pr_number);
     return Boolean(result?.project_deleted);
+  };
+
+  const reportPRActionFailure = async (err: any, merging: boolean) => {
+    const message = err?.message || "PR campaign action failed";
+    // GitHub answering 404 to a close may mean it no longer has the pull request. Ask it
+    // again so the row is flagged and offers Remove, without a manual refresh. A toast,
+    // not the error banner: the banner hides the campaigns, Remove included.
+    if (!merging && err?.status === 404) {
+      try {
+        await refreshProjectCampaignState(true);
+        toast.error(message);
+        return;
+      } catch (refreshError) {
+        console.warn("⚠️ Could not refresh PR campaigns after a failed close:", refreshError);
+      }
+    }
+    setError(message);
   };
 
   const runPRAction = async (action: Exclude<PendingAction, null>) => {
@@ -379,7 +444,7 @@ const PRHistoryPanel: React.FC<PRCampaignsPanelProps> = ({ user, projectName, on
     const merging = action.type === "merge" || action.type === "mergeCampaign";
     const actionablePRs = merging
       ? prs.filter((pr) => pr.can_merge !== false)
-      : prs.filter((pr) => pr.can_close !== false);
+      : prs.filter((pr) => pr.can_close !== false || pr.not_found_on_github);
     if (actionablePRs.length === 0) return;
 
     setError(null);
@@ -401,7 +466,7 @@ const PRHistoryPanel: React.FC<PRCampaignsPanelProps> = ({ user, projectName, on
         onProjectDeleted();
         return;
       }
-      const verb = merging ? "merged" : "closed";
+      const verb = settledVerb(merging, action.type);
       try {
         await refreshProjectCampaignState(false);
         const message = `${actionablePRs.length} pull request${actionablePRs.length === 1 ? "" : "s"} ${verb}.`;
@@ -413,7 +478,7 @@ const PRHistoryPanel: React.FC<PRCampaignsPanelProps> = ({ user, projectName, on
         toast.warning(REFRESH_WARNING);
       }
     } catch (err: any) {
-      setError(err.message || "PR campaign action failed");
+      await reportPRActionFailure(err, merging);
     } finally {
       setProcessingKey(null);
     }
@@ -670,7 +735,7 @@ const PRHistoryPanel: React.FC<PRCampaignsPanelProps> = ({ user, projectName, on
               <Button
                 variant="destructive"
                 onClick={() => setPendingAction({ type: "closeCampaign", campaign })}
-                disabled={openPRs.length === 0 || processingKey !== null || !openPRs.some((pr) => pr.can_close !== false)}
+                disabled={openPRs.length === 0 || processingKey !== null || !openPRs.some((pr) => pr.can_close !== false || pr.not_found_on_github)}
               >
                 Close Open PRs
               </Button>
@@ -829,18 +894,10 @@ const PRHistoryPanel: React.FC<PRCampaignsPanelProps> = ({ user, projectName, on
       {pendingAction && (
         <ConfirmDialog
           open={true}
-          title={
-            pendingAction.type === "close" || pendingAction.type === "closeCampaign"
-              ? "Close open pull request(s)?"
-              : "Merge open pull request(s)?"
-          }
-          description={
-            pendingAction.type === "close" || pendingAction.type === "closeCampaign"
-              ? "This will close open pull requests without merging. Workflow changes will not be applied to those repositories."
-              : "This will merge open pull requests in this PR Campaign."
-          }
-          confirmLabel={pendingAction.type === "close" || pendingAction.type === "closeCampaign" ? "Close Open PRs" : "Merge Open PRs"}
-          destructive={pendingAction.type === "close" || pendingAction.type === "closeCampaign"}
+          title={confirmCopy(pendingAction.type).title}
+          description={confirmCopy(pendingAction.type).description}
+          confirmLabel={confirmCopy(pendingAction.type).confirmLabel}
+          destructive={pendingAction.type !== "merge" && pendingAction.type !== "mergeCampaign"}
           onCancel={() => setPendingAction(null)}
           onConfirm={() => {
             const action = pendingAction;

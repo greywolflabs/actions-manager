@@ -35,7 +35,9 @@ Every install starts with 8 pre-seeded, commonly used actions:
 - `actions/cache`
 - `actions/upload-artifact`
 - `actions/download-artifact`
-- `dawg-io/am-build-vars` — reads per-repository build variables from a committed `am-build-vars.yml`, exports them as env vars, and shares them across jobs, workflows and runs
+- `greywolflabs/am-build-vars` — reads per-repository build variables from a committed `am-build-vars.yml`, exports them as env vars, and shares them across jobs, workflows and runs
+
+An install that already had AM Build Vars keeps its entry under the previous owner, `dawg-io/am-build-vars`. GitHub redirects that path to `greywolflabs/am-build-vars`.
 
 Any user can remove entries they don't want. Removal is **permanent** — deleted defaults are not re-seeded and won't reappear on restart.
 

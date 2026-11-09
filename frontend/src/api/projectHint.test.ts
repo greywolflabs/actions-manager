@@ -1,9 +1,11 @@
 import apiClient from "./apiClient";
 import { projectHintHeaders, setProjectHint } from "./projectHint";
 
-// apiClient's request interceptor, as registered on the axios mock.
+// apiClient's request interceptor, as registered on the axios mock. Read once at
+// load: clearMocks wipes the registration call before each test.
+const [onRequest] = vi.mocked(apiClient.interceptors.request.use).mock.calls[0];
+
 const sendThroughApiClient = (): Record<string, string> => {
-  const [onRequest] = vi.mocked(apiClient.interceptors.request.use).mock.calls[0];
   const sent: Record<string, string> = {};
   onRequest!({ headers: { set: (name: string, value: string) => { sent[name] = value; } } } as never);
   return sent;

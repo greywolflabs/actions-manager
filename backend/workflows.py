@@ -180,6 +180,10 @@ class PRHistoryItemResponse(BaseModel):
     merge_block_reason: Optional[str] = None
     can_close: Optional[bool] = None
     close_block_reason: Optional[str] = None
+    # GitHub answered 404 for this PR on the last refresh: it was deleted, its
+    # repository was, or the caller can no longer see it. It can be neither merged
+    # nor closed, so the only way out of its campaign is to remove it here.
+    not_found_on_github: bool = False
 
 class PRCampaignPRResponse(PRHistoryItemResponse):
     """A pull request row included in a derived PR Campaign."""
@@ -3180,6 +3184,7 @@ DELIVERY_MODE_ERROR_DETAIL = (
 )
 _ERR_INSUFFICIENT_PROJECT_ROLE = "Insufficient project permissions. Required: project_editor"
 _ERR_REPO_NOT_IN_PROJECT = "Repository is not part of this project"
+_ERR_REPO_FORMAT = "Invalid repository name format. Expected 'owner/repo'"
 
 
 def _require_project_editor(db: Session, github_user: str, project: Project, *, settling: bool = False) -> None:
@@ -3314,28 +3319,37 @@ def _require_owned_repo(db: Session, project: Project, repo_name: str) -> None:
 
 
 def _require_recorded_pull_request(
-    db: Session, project: Project, repo_name: str, pr_number: int
+    db: Session, github_user: str, project: Project, repo_name: str, pr_number: int
 ) -> ProjectPullRequest:
-    """Require that this project actually opened *pr_number* in *repo_name*.
+    """Require that *pr_number* in *repo_name* is a pull request this project's campaigns list; returns its record.
 
     Merge and close took both straight from the request and checked neither
     against the project, so the target was caller-chosen. Every legitimate
-    caller works from the project's own PR list, and _handle_merged_pull_request
-    already looks this row up - it just tolerated the row being absent while
-    still running the "no open PRs left" transitions afterwards, so merging an
-    unrecorded pull request could move project and workflow state off the back
-    of an unrelated merge.
+    caller works from the project's PR list, which is not only the project's own:
+    a Reusable Workflow Project lists its callers' pull requests, because a
+    reusable workflow goes under review through a caller's campaign, and a
+    caller lists the ones its linked projects opened (_get_pr_visibility_project_map).
+    Matching only the project's own rows made those impossible to merge or close,
+    and a campaign waiting on one could never finish. The project's own row wins
+    when both record it.
+
+    The PR is settled as the project that recorded it, so editing that project is
+    required as well when it is not this one.
     """
-    pr_record = db.query(ProjectPullRequest).filter_by(
-        project_id=project.project_id,
-        repo_name=repo_name.strip(),
-        pr_number=pr_number,
-    ).first()
-    if not pr_record:
+    visible = _get_pr_visibility_project_map(db, project)
+    rows = db.query(ProjectPullRequest).filter(
+        ProjectPullRequest.project_id.in_(visible.keys()),
+        ProjectPullRequest.repo_name == repo_name.strip(),
+        ProjectPullRequest.pr_number == pr_number,
+    ).all()
+    pr_record = next((row for row in rows if row.project_id == project.project_id), rows[0] if rows else None)
+    if pr_record is None:
         raise HTTPException(
             status_code=404,
             detail=f"No pull request #{pr_number} is recorded for this project in {repo_name}",
         )
+    if pr_record.project_id != project.project_id:
+        _require_project_editor(db, github_user, db.get(Project, pr_record.project_id), settling=True)
     return pr_record
 
 
@@ -6308,6 +6322,9 @@ def merge_preflight_validation_pr(
         raise HTTPException(status_code=500, detail="Failed to merge validation PR.")
 
 
+_PR_NOT_ON_GITHUB = "GitHub no longer has this pull request."
+
+
 def _fetch_pr_state_from_github(pr, github_user: str, token: str, db: Session) -> str:
     """Fetch the current state of a single PR from GitHub and persist any change to the DB.
 
@@ -6324,6 +6341,15 @@ def _fetch_pr_state_from_github(pr, github_user: str, token: str, db: Session) -
 
     try:
         response = github_get(pr_url, github_user, db, headers=headers)
+        if response.status_code == 404:
+            pr._github_action_capabilities = {
+                "can_merge": False,
+                "merge_block_reason": _PR_NOT_ON_GITHUB,
+                "can_close": False,
+                "close_block_reason": _PR_NOT_ON_GITHUB,
+                "not_found_on_github": True,
+            }
+            return pr.pr_state
         if response.status_code != 200:
             pr._github_action_capabilities = {
                 "can_merge": False,
@@ -7241,19 +7267,17 @@ def _apply_rollback_campaign_action(db: Session, pr_record, github_user: Optiona
     handle_rollback_pr_merged(db, pr_record, github_user)
 
 
-def _handle_merged_pull_request(*, response, project, repo_name, pr_number, owner, repo, github_user, db, merge_method):
+def _handle_merged_pull_request(*, response, project, pr_record, repo_name, pr_number, owner, repo, github_user, db,
+                                merge_method):
     """Persist database state and clean up after a successful PR merge; returns the response dict."""
     merge_data = response.json()
     print(f"✅ Successfully merged PR #{pr_number} in {repo_name}")
 
-    pr_record = db.query(ProjectPullRequest).filter_by(
-        project_id=project.project_id,
-        repo_name=repo_name,
-        pr_number=pr_number
-    ).first()
     # Read before the outcome: the last removal PR of a deletion takes its row with the project.
-    branch_name, target_branch = (pr_record.branch_name, pr_record.target_branch) if pr_record else (None, None)
-    project_deleted = bool(pr_record) and apply_pr_outcome(db, pr_record, "merged", github_user=github_user)
+    branch_name, target_branch = pr_record.branch_name, pr_record.target_branch
+    recorded_here = pr_record.project_id == project.project_id
+    # A linked project's last removal PR finishes that project's deletion, not the viewed one's.
+    project_deleted = apply_pr_outcome(db, pr_record, "merged", github_user=github_user) and recorded_here
 
     # Attempt to delete the source branch (best-effort; never fails the merge)
     branch_deleted = False
@@ -7313,12 +7337,13 @@ def merge_pull_request(
         
         # Validate repo_name format
         if "/" not in repo_name:
-            raise HTTPException(status_code=400, detail="Invalid repository name format. Expected 'owner/repo'")
+            raise HTTPException(status_code=400, detail=_ERR_REPO_FORMAT)
 
         # Merging or closing a removal pull request is how a deletion finishes
         # or is called off, so it stays open to editors while the project is read-only.
         _require_project_editor(db, github_user, project, settling=True)
-        _require_recorded_pull_request(db, project, repo_name, pr_number)
+        pr_record = _require_recorded_pull_request(db, github_user, project, repo_name, pr_number)
+        repo_name = pr_record.repo_name
 
         owner, repo = repo_name.split("/", 1)
         
@@ -7343,6 +7368,7 @@ def merge_pull_request(
             return _handle_merged_pull_request(
                 response=response,
                 project=project,
+                pr_record=pr_record,
                 repo_name=repo_name,
                 pr_number=pr_number,
                 owner=owner,
@@ -7409,12 +7435,13 @@ def close_pull_request(
         
         # Validate repo_name format
         if "/" not in repo_name:
-            raise HTTPException(status_code=400, detail="Invalid repository name format. Expected 'owner/repo'")
+            raise HTTPException(status_code=400, detail=_ERR_REPO_FORMAT)
 
         # Merging or closing a removal pull request is how a deletion finishes
         # or is called off, so it stays open to editors while the project is read-only.
         _require_project_editor(db, github_user, project, settling=True)
-        _require_recorded_pull_request(db, project, repo_name, pr_number)
+        pr_record = _require_recorded_pull_request(db, github_user, project, repo_name, pr_number)
+        repo_name = pr_record.repo_name
 
         owner, repo = repo_name.split("/", 1)
         
@@ -7437,13 +7464,7 @@ def close_pull_request(
             pr_data = response.json()
             print(f"✅ Successfully closed PR #{pr_number} in {repo_name}")
             
-            pr_record = db.query(ProjectPullRequest).filter_by(
-                project_id=project.project_id,
-                repo_name=repo_name,
-                pr_number=pr_number
-            ).first()
-            if pr_record:
-                apply_pr_outcome(db, pr_record, "closed", github_user=github_user)
+            apply_pr_outcome(db, pr_record, "closed", github_user=github_user)
 
             return {
                 "message": "Pull request closed successfully",
@@ -7453,7 +7474,10 @@ def close_pull_request(
                 "closed": True
             }
         elif response.status_code == 404:
-            raise HTTPException(status_code=404, detail="Pull request not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Pull request not found on GitHub. If it no longer exists, remove it from the campaign instead.",
+            )
         else:
             # Other errors
             raise HTTPException(
@@ -7468,6 +7492,61 @@ def close_pull_request(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Error closing pull request")
+
+
+def _github_pull_request_status(db: Session, github_user: str, token: str, repo_name: str, pr_number: int) -> int:
+    """The status GitHub answers for pull request *pr_number* in *repo_name*, as the caller."""
+    owner, repo = repo_name.split("/", 1)
+    headers = {"Accept": ACCEPT_HEADER, "X-GitHub-Api-Version": X_API_VERSION, "Authorization": f"token {token}"}
+    try:
+        return github_get(f"{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pr_number}", github_user, db, headers=headers).status_code
+    except RateLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=f"GitHub API rate limit reached: {exc}") from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach GitHub: {failure_kind(exc)}.") from exc
+
+
+@router.post("/api/dismiss-pull-request", responses=_responses(400, 401, 403, 404, 409, 429, 500, 502))
+def dismiss_pull_request(
+    payload: ClosePullRequestRequest,
+    db: Annotated[Session, Depends(get_db)],
+    account: auth_module.CurrentAccount,
+):
+    """Remove an open pull request GitHub no longer has from its campaign, settling it as closed.
+
+    A deleted repository or pull request can be neither merged nor closed, so the
+    campaign waiting on it would stay open for good. Nothing is sent to GitHub:
+    this only changes ActionsManager's record. It first asks GitHub for the pull
+    request, and refuses while GitHub still has it (close it instead) or when
+    GitHub cannot say, so a live pull request is never dropped from a campaign.
+    """
+    github_user = account.github_user
+    if github_user not in user_tokens:
+        raise HTTPException(status_code=401, detail=NOT_AUTHENTICATED_DETAIL)
+    project = _find_project_by_name(db, github_user, payload.project_name)
+    if not project:
+        raise HTTPException(status_code=404, detail=PROJECT_ERROR)
+    if "/" not in payload.repo_name:
+        raise HTTPException(status_code=400, detail=_ERR_REPO_FORMAT)
+    _require_project_editor(db, github_user, project, settling=True)
+    pr_record = _require_recorded_pull_request(db, github_user, project, payload.repo_name, payload.pr_number)
+    if pr_record.pr_state != "open":
+        raise HTTPException(status_code=409, detail=f"This pull request is already {pr_record.pr_state}.")
+    # The record matched the request's name with its whitespace stripped, so GitHub is asked about
+    # the stored name: a 404 for a name that is not exactly the PR's would read as "gone".
+    repo_name = pr_record.repo_name
+    status = _github_pull_request_status(db, github_user, user_tokens[github_user], repo_name, payload.pr_number)
+    if status == 200:
+        raise HTTPException(status_code=409, detail="GitHub still has this pull request. Close it instead of removing it.")
+    if status != 404:
+        raise HTTPException(status_code=502, detail=f"Could not check the pull request on GitHub (it answered {status}). Try again.")
+    apply_pr_outcome(db, pr_record, "closed", github_user=github_user)
+    return {
+        "message": "Pull request removed from the campaign",
+        "pr_number": payload.pr_number,
+        "repo_name": repo_name,
+        "dismissed": True,
+    }
 
 
 @router.get("/api/project-pr-campaigns", responses=_responses(401, 404, 409, 500))

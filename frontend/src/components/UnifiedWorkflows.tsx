@@ -45,6 +45,8 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   onAddWorkflow,
   onClearModifiedStates,
   onRegisterSelectionFollower,
+  draftWorkflow,
+  onDraftApplied,
   rxworkflows,
   setRXWorkflows,
   addWorkflowToMain,
@@ -289,6 +291,29 @@ const UnifiedWorkflows: React.FC<UnifiedWorkflowsProps> = ({
   useEffect(() => {
     operations.fetchWorkflowsCount();
   }, []);
+
+  // An update made from Action Usage arrives as an unsaved edit: the new YAML goes into the
+  // workflow and it is selected, marked Unsaved, until the user commits it. Matched by name once
+  // the project's workflows have loaded, so it waits if they have not.
+  useEffect(() => {
+    if (!draftWorkflow) return;
+    const stem = (name: string) => name.trim().replace(/\.ya?ml$/i, '').toLowerCase();
+    const list = draftWorkflow.reusable ? rxworkflows : workflows;
+    const index = list.findIndex(w => stem(w.name) === stem(draftWorkflow.name));
+    if (index < 0) return;
+    const withDraft = <T extends { content?: string; isModified?: boolean }>(items: T[]): T[] =>
+      items.map((w, i) => (i === index ? { ...w, content: draftWorkflow.content, isModified: true } : w));
+    if (draftWorkflow.reusable) {
+      setRXWorkflows(withDraft);
+      state.setModifiedRXWorkflows(prev => new Set(prev).add(index));
+    } else {
+      setWorkflows(withDraft);
+      state.setModifiedWorkflows(prev => new Set(prev).add(index));
+    }
+    state.setSelectedWorkflowId(`${draftWorkflow.reusable ? 'reusable' : 'regular'}-${index}`);
+    toast.info(`Loaded the update into ${draftWorkflow.name}. Review it, then choose Commit Locally to save it.`);
+    onDraftApplied?.();
+  }, [draftWorkflow, workflows, rxworkflows]);
 
   // Initialize GUI state when a workflow is selected
   // This ensures that when createBlankWorkflow sets selectedWorkflowId,

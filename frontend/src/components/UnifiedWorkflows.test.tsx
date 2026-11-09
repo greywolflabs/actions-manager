@@ -554,3 +554,89 @@ describe('UnifiedWorkflows – where CODEOWNERS went (#2367)', () => {
     expect(onOpenManagedFiles).toHaveBeenCalledTimes(1);
   });
 });
+
+
+describe('UnifiedWorkflows draft handed over from Action Usage', () => {
+  const DRAFT_YAML = 'name: Build\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@abc\n';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  test('puts the new YAML into the workflow, marks it unsaved and selects it', async () => {
+    const onDraftApplied = vi.fn();
+    const { setWorkflows, props } = renderSubject({
+      workflows: [{ name: 'other', content: ORIGINAL_YAML }, { name: 'build', content: ORIGINAL_YAML, isModified: false }],
+      draftWorkflow: { name: 'build', content: DRAFT_YAML, reusable: false },
+      onDraftApplied,
+    });
+
+    await waitFor(() => expect(onDraftApplied).toHaveBeenCalledTimes(1));
+
+    const written = lastWrite(setWorkflows, props.workflows);
+    expect(written[1]).toMatchObject({ name: 'build', content: DRAFT_YAML, isModified: true });
+    expect(written[0]).toEqual({ name: 'other', content: ORIGINAL_YAML });
+    expect(screen.getByTestId('select-regular-1')).toHaveAttribute('aria-pressed', 'true');
+    expect(toast.info).toHaveBeenCalledWith(expect.stringContaining('Commit Locally'));
+  });
+
+  test('applies it to a reusable workflow in the reusable section', async () => {
+    const onDraftApplied = vi.fn();
+    const setRXWorkflows = vi.fn();
+    const { setWorkflows } = renderSubject({
+      workflows: [],
+      rxworkflows: [{ name: 'deploy', content: ORIGINAL_YAML }],
+      setRXWorkflows,
+      draftWorkflow: { name: 'deploy', content: DRAFT_YAML, reusable: true },
+      onDraftApplied,
+    });
+
+    await waitFor(() => expect(onDraftApplied).toHaveBeenCalledTimes(1));
+
+    const written = lastWrite(setRXWorkflows, [{ name: 'deploy', content: ORIGINAL_YAML }]);
+    expect(written[0]).toMatchObject({ content: DRAFT_YAML, isModified: true });
+    expect(setWorkflows).not.toHaveBeenCalled();
+    expect(screen.getByTestId('select-reusable-0')).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  test('finds the workflow whatever the case or file extension of its name', async () => {
+    const onDraftApplied = vi.fn();
+    const { setWorkflows, props } = renderSubject({
+      workflows: [{ name: 'Build', content: ORIGINAL_YAML }],
+      draftWorkflow: { name: 'build.yml', content: DRAFT_YAML, reusable: false },
+      onDraftApplied,
+    });
+
+    await waitFor(() => expect(onDraftApplied).toHaveBeenCalledTimes(1));
+    expect(lastWrite(setWorkflows, props.workflows)[0].content).toBe(DRAFT_YAML);
+  });
+
+  test('waits for the project\'s workflows to load, then applies it', async () => {
+    const onDraftApplied = vi.fn();
+    const { rerender, setWorkflows, props } = renderSubject({
+      workflows: [],
+      draftWorkflow: { name: 'build', content: DRAFT_YAML, reusable: false },
+      onDraftApplied,
+    });
+    expect(onDraftApplied).not.toHaveBeenCalled();
+    expect(setWorkflows).not.toHaveBeenCalled();
+
+    rerender(<UnifiedWorkflows {...props} workflows={[{ name: 'build', content: ORIGINAL_YAML }]} />);
+
+    await waitFor(() => expect(onDraftApplied).toHaveBeenCalledTimes(1));
+  });
+
+  test('does nothing for a workflow the project does not have, or when there is no draft', async () => {
+    const onDraftApplied = vi.fn();
+    const { setWorkflows } = renderSubject({
+      draftWorkflow: { name: 'missing', content: DRAFT_YAML, reusable: false },
+      onDraftApplied,
+    });
+    renderSubject({ onDraftApplied });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(onDraftApplied).not.toHaveBeenCalled();
+    expect(setWorkflows).not.toHaveBeenCalled();
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+});
