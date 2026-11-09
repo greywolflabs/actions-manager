@@ -16,7 +16,8 @@ Three cases, per SEED_ACTIONS entry:
 
   * marker present            -> nothing to do, whether or not the row still exists
   * shipped in the original   -> mark only; the original seed already offered it,
-    seed batch                   and re-inserting would resurrect a deleted default
+    seed batch, or offered       and re-inserting would resurrect a deleted default
+    under a previous slug        or add a second copy of a moved one
   * a row already exists      -> mark only; a fresh install just seeded it, or the
                                  user imported the same action themselves
   * otherwise                 -> insert it and mark it
@@ -47,6 +48,13 @@ ORIGINAL_SEED_SLUGS = frozenset({
     "actions/upload-artifact",
     "actions/download-artifact",
 })
+
+# A default whose repository moved, mapped to the slug it was offered under. An
+# install marked with the old slug was already offered it; the row keeps the old
+# owner, which GitHub's transfer redirect still serves (decision #2383).
+PREVIOUS_SLUGS = {
+    "greywolflabs/am-build-vars": "dawg-io/am-build-vars",
+}
 
 
 def _create_marker_table(engine, db_url: str) -> None:
@@ -106,7 +114,8 @@ def run_migration(database_url: str | None = None):
             if slug in marked:
                 continue
 
-            if slug not in ORIGINAL_SEED_SLUGS and slug not in present:
+            offered = slug in ORIGINAL_SEED_SLUGS or PREVIOUS_SLUGS.get(slug) in marked
+            if not offered and slug not in present:
                 db.add(build_seed_row(action, seed_account[0]))
                 added += 1
                 print(f"🔧 Adding new default action: {slug}")

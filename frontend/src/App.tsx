@@ -7,6 +7,7 @@ import ActionsProjectsList from "./ActionsProjectsList";
 import AddActionsProject from "./AddActionsProject";
 import ActionsProjectDetail from "./ActionsProjectDetail";
 import ManagedFilesList from "./ManagedFilesList";
+import ActionUsageList from "./ActionUsageList";
 import { AppShell } from "./components/AppHeader";
 import DarkModeToggle from "./components/DarkModeToggle";
 import BrandLogo from "./components/BrandLogo";
@@ -360,6 +361,10 @@ function App(): React.ReactElement {
                   path="/project/:user/managed-files"
                   element={<ManagedFilesListWrapper userDetails={userDetails} onLogout={handleLogout} />}
                 />
+                <Route
+                  path="/project/:user/action-usage"
+                  element={<ActionUsageListWrapper userDetails={userDetails} onLogout={handleLogout} />}
+                />
                 <Route path="*" element={<Navigate to={`/project/${user}`} replace />} />
               </Routes>
             </>
@@ -517,6 +522,15 @@ function ActionsProjectsListWrapper({ userDetails, onLogout }: ShellPageProps): 
   return (
     <AppShell user={user || ""} userDetails={userDetails} onLogout={onLogout}>
       <ActionsProjectsList user={user || ""} />
+    </AppShell>
+  );
+}
+
+function ActionUsageListWrapper({ userDetails, onLogout }: ShellPageProps): React.ReactElement {
+  const { user } = useParams<{ user: string }>();
+  return (
+    <AppShell user={user || ""} userDetails={userDetails} onLogout={onLogout}>
+      <ActionUsageList user={user || ""} />
     </AppShell>
   );
 }

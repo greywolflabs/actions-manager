@@ -111,6 +111,8 @@ export interface PRHistoryItem {
 
 export interface PRCampaignPRItem extends PRHistoryItem {
   pr_state: "open" | "merged" | "closed" | string;
+  /** GitHub answered 404 for it on the last refresh: it can be neither merged nor closed, only removed. */
+  not_found_on_github?: boolean;
   actor?: string | null;
   file_names?: string | null;
   is_reusable_workflow_pr?: boolean;
@@ -562,12 +564,50 @@ export async function closePullRequest(
 
     if (!response.ok) {
       const errorData = await response.json();
-      throw new Error(errorData.detail || `Failed to close pull request: ${response.status}`);
+      // The panel reads the status: a 404 may mean GitHub no longer has the pull request.
+      throw Object.assign(new Error(errorData.detail || `Failed to close pull request: ${response.status}`), {
+        status: response.status,
+      });
     }
 
     return await response.json();
   } catch (error) {
     console.error("Error closing pull request:", error);
+    throw error;
+  }
+}
+
+/**
+ * Remove an open pull request GitHub no longer has (a deleted repository or pull
+ * request) from its campaign. Only ActionsManager's record changes: the server
+ * checks GitHub first and refuses while it still has the pull request.
+ */
+export async function dismissPullRequest(
+  githubUser: string,
+  projectName: string,
+  repoName: string,
+  prNumber: number
+): Promise<any> {
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/dismiss-pull-request`, {
+      method: "POST",
+      credentials: "include",
+      headers: writeHeaders(),
+      body: JSON.stringify({
+        project_name: projectName,
+        repo_name: repoName,
+        pr_number: prNumber,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.detail || `Failed to remove pull request: ${response.status}`);
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error("Error removing pull request:", error);
     throw error;
   }
 }

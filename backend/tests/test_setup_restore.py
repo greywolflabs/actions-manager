@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import time
+from unittest.mock import patch
 from pathlib import Path
 from datetime import datetime
 
@@ -67,12 +68,12 @@ def db_session(tmp_path, monkeypatch):
     # the endpoint reports the outcome.
     monkeypatch.setattr(backup_engine, "_run_migrations", lambda say: True)
     # The write-protection middleware counts members through its own session
-    # factory; point it at the same in-memory database.
-    monkeypatch.setattr(app.state, "middleware_db_factory", TestingSessionLocal)
-
+    # factory; point it at the same in-memory database. Not monkeypatch: its undo
+    # looks for the old value in __dict__, State keeps it elsewhere, so it deletes it.
     db = TestingSessionLocal()
     try:
-        yield db
+        with patch.object(app.state, "middleware_db_factory", TestingSessionLocal):
+            yield db
     finally:
         db.close()
         app.dependency_overrides.pop(get_db, None)

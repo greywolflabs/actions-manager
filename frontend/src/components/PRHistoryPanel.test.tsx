@@ -3,7 +3,7 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import PRHistoryPanel from './PRHistoryPanel';
-import { createCampaignRollback, getPRCampaigns, mergePullRequest, previewCampaignRollback, type PRCampaign } from '../api/pullRequests';
+import { closePullRequest, createCampaignRollback, dismissPullRequest, getPRCampaigns, mergePullRequest, previewCampaignRollback, type PRCampaign } from '../api/pullRequests';
 import { tour } from '../utils/tour';
 import { TOUR_STEPS } from './OnboardingTour';
 
@@ -12,6 +12,7 @@ vi.mock('../api/pullRequests', () => ({
   getPRCampaigns: vi.fn(),
   mergePullRequest: vi.fn(),
   closePullRequest: vi.fn(),
+  dismissPullRequest: vi.fn(),
   previewCampaignRollback: vi.fn(),
   createCampaignRollback: vi.fn(),
 }));
@@ -1282,5 +1283,159 @@ describe('rollback result reporting', () => {
     });
 
     expect(await screen.findByText(/Delivery stopped early at org\/other/)).toBeInTheDocument();
+  });
+});
+
+
+describe('a pull request GitHub no longer has', () => {
+  const gonePR = { ...openPR, not_found_on_github: true, can_close: false, can_merge: false, close_block_reason: 'GitHub no longer has this pull request.' };
+  const activeResponse = (pullRequests: any[], openCount: number) => ({
+    ...baseResponse,
+    campaigns: [{
+      ...makeCampaign(1),
+      campaign_status: 'open',
+      completed_at: null,
+      open_count: openCount,
+      merged_count: 0,
+      completion_percentage: 0,
+      pull_requests: pullRequests,
+    }],
+    pull_requests: pullRequests,
+    total_campaigns: 1,
+    active_campaigns: 1,
+    open_prs: openCount,
+    repositories_affected: 1,
+  });
+
+  beforeEach(() => {
+    mockGetPRCampaigns.mockReset();
+    (closePullRequest as Mock).mockReset();
+    (dismissPullRequest as Mock).mockReset();
+  });
+
+  test('offers Remove instead of Merge and Close', async () => {
+    mockGetPRCampaigns.mockResolvedValue(activeResponse([gonePR], 1));
+
+    render(<PRHistoryPanel user="historyuser" projectName="history_project" />);
+
+    expect(await screen.findByTestId('pr-not-found')).toHaveTextContent('Not found on GitHub');
+    expect(screen.getByTestId('pr-dismiss-button')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Merge' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Close' })).not.toBeInTheDocument();
+  });
+
+  test('a pull request GitHub still has keeps Merge and Close, and no Remove', async () => {
+    mockGetPRCampaigns.mockResolvedValue(activeResponse([openPR], 1));
+
+    render(<PRHistoryPanel user="historyuser" projectName="history_project" />);
+
+    expect(await screen.findByRole('button', { name: 'Close' })).toBeInTheDocument();
+    expect(screen.queryByTestId('pr-dismiss-button')).not.toBeInTheDocument();
+  });
+
+  test('removing it asks first, says nothing changes on GitHub, and the campaign finishes without a reload', async () => {
+    const onCampaignStateRefresh = vi.fn().mockResolvedValue(undefined);
+    (dismissPullRequest as Mock).mockResolvedValue({ dismissed: true });
+    mockGetPRCampaigns
+      .mockResolvedValueOnce(activeResponse([gonePR], 1))
+      .mockResolvedValueOnce({
+        ...activeResponse([{ ...gonePR, pr_state: 'closed', closed_at: '2026-05-21T06:10:00+00:00' }], 0),
+        campaigns: [{
+          ...makeCampaign(1),
+          campaign_status: 'cancelled',
+          open_count: 0,
+          merged_count: 0,
+          closed_count: 1,
+          pull_requests: [{ ...gonePR, pr_state: 'closed', closed_at: '2026-05-21T06:10:00+00:00' }],
+        }],
+        active_campaigns: 0,
+        completed_campaigns: 1,
+        open_prs: 0,
+        closed_prs: 1,
+      });
+
+    render(<PRHistoryPanel user="historyuser" projectName="history_project" onCampaignStateRefresh={onCampaignStateRefresh} />);
+
+    await userEvent.click(await screen.findByTestId('pr-dismiss-button'));
+    expect(screen.getByText('Remove this pull request from the campaign?')).toBeInTheDocument();
+    expect(screen.getByText(/Nothing changes on GitHub/)).toBeInTheDocument();
+    expect(dismissPullRequest).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Remove from campaign' }));
+
+    await waitFor(() => expect(dismissPullRequest).toHaveBeenCalledWith('historyuser', 'history_project', 'org/repo', 42));
+    expect(closePullRequest).not.toHaveBeenCalled();
+    await waitFor(() => expect(onCampaignStateRefresh).toHaveBeenCalledWith(false));
+    expect(await screen.findByText(/1 pull request removed\./)).toBeInTheDocument();
+    expect(screen.queryByTestId('pr-dismiss-button')).not.toBeInTheDocument();
+  });
+
+  test('Close Open PRs removes the missing ones and closes the rest', async () => {
+    (dismissPullRequest as Mock).mockResolvedValue({ dismissed: true });
+    (closePullRequest as Mock).mockResolvedValue({ closed: true });
+    const livePR = { ...openPR, pr_id: 2, pr_number: 43, repo_name: 'org/other', pr_url: 'https://github.com/org/other/pull/43' };
+    mockGetPRCampaigns.mockResolvedValue(activeResponse([gonePR, livePR], 2));
+
+    render(<PRHistoryPanel user="historyuser" projectName="history_project" />);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Close Open PRs' }));
+    await userEvent.click(screen.getAllByRole('button', { name: 'Close Open PRs' }).pop()!);
+
+    await waitFor(() => expect(dismissPullRequest).toHaveBeenCalledTimes(1));
+    expect(dismissPullRequest).toHaveBeenCalledWith('historyuser', 'history_project', 'org/repo', 42);
+    expect(closePullRequest).toHaveBeenCalledTimes(1);
+    expect(closePullRequest).toHaveBeenCalledWith('historyuser', 'history_project', 'org/other', 43);
+  });
+
+  test('Close Open PRs is available when the only open pull request is one GitHub no longer has', async () => {
+    mockGetPRCampaigns.mockResolvedValue(activeResponse([gonePR], 1));
+
+    render(<PRHistoryPanel user="historyuser" projectName="history_project" />);
+
+    expect(await screen.findByRole('button', { name: 'Close Open PRs' })).toBeEnabled();
+  });
+
+  test('says why when GitHub still has it and the server refuses', async () => {
+    (dismissPullRequest as Mock).mockRejectedValue(new Error('GitHub still has this pull request. Close it instead of removing it.'));
+    mockGetPRCampaigns.mockResolvedValue(activeResponse([gonePR], 1));
+
+    render(<PRHistoryPanel user="historyuser" projectName="history_project" />);
+
+    await userEvent.click(await screen.findByTestId('pr-dismiss-button'));
+    await userEvent.click(screen.getByRole('button', { name: 'Remove from campaign' }));
+
+    expect(await screen.findByText(/GitHub still has this pull request/)).toBeInTheDocument();
+  });
+
+  test('a close GitHub answers 404 to flags the row and offers Remove without a manual refresh', async () => {
+    (closePullRequest as Mock).mockRejectedValue(Object.assign(
+      new Error('Pull request not found on GitHub. If it no longer exists, remove it from the campaign instead.'),
+      { status: 404 },
+    ));
+    mockGetPRCampaigns
+      .mockResolvedValueOnce(activeResponse([openPR], 1))
+      .mockResolvedValueOnce(activeResponse([gonePR], 1));
+
+    render(<PRHistoryPanel user="historyuser" projectName="history_project" />);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Close' }));
+    await userEvent.click(screen.getAllByRole('button', { name: 'Close Open PRs' }).pop()!);
+
+    expect(await screen.findByTestId('pr-dismiss-button')).toBeInTheDocument();
+    expect(mockGetPRCampaigns).toHaveBeenLastCalledWith('historyuser', 'history_project', true);
+    expect(screen.getByTestId('pr-not-found')).toHaveTextContent('Not found on GitHub');
+  });
+
+  test('a close that fails for another reason does not ask GitHub again', async () => {
+    (closePullRequest as Mock).mockRejectedValue(Object.assign(new Error('Insufficient project permissions'), { status: 403 }));
+    mockGetPRCampaigns.mockResolvedValue(activeResponse([openPR], 1));
+
+    render(<PRHistoryPanel user="historyuser" projectName="history_project" />);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Close' }));
+    await userEvent.click(screen.getAllByRole('button', { name: 'Close Open PRs' }).pop()!);
+
+    expect(await screen.findByText(/Insufficient project permissions/)).toBeInTheDocument();
+    expect(mockGetPRCampaigns).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('pr-dismiss-button')).not.toBeInTheDocument();
   });
 });

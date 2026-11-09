@@ -86,7 +86,24 @@ From the campaign dashboard you can:
 
 Merging and closing require **editor** access, like the campaign itself, and reach only
 the pull requests ActionsManager opened for this project — a pull request it has no
-record of is refused rather than acted on.
+record of is refused rather than acted on. A Reusable Workflow Project's campaigns also list
+the pull requests its callers opened in its repository, and you can merge or close those from
+there, if you can edit the project that opened them.
+
+### A pull request GitHub no longer has
+
+If a repository or a pull request is deleted, GitHub answers that the pull request isn't
+found, so it can be neither merged nor closed, and the campaign waiting on it would stay open
+for good. When a status refresh finds that, or **Close** is answered that the pull request isn't
+found (ActionsManager then asks GitHub again on its own), the pull request is marked **Not found on GitHub**
+and its **Merge** and **Close** buttons are replaced by **Remove**. **Remove** asks you to
+confirm, then settles the pull request as closed in ActionsManager, so the campaign can finish.
+**Close Open PRs** does the same for such a pull request while closing the rest.
+
+Nothing changes on GitHub. ActionsManager asks GitHub again first, and refuses to remove a
+pull request GitHub still has (close it instead) or one GitHub can't answer for (try again). GitHub
+also answers "not found" for a repository you can no longer see, and the pull request is treated
+the same way: it is not one you can act on.
 
 ## PR Metadata
 

@@ -56,6 +56,7 @@ export default defineConfig({
 						'features/drift-detection',
 						'features/managed-actions',
 						'features/managed-files',
+						'features/action-usage',
 						'features/rulesets',
 						'features/backup-restore',
 						'features/permissions',

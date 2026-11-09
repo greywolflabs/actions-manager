@@ -92,7 +92,7 @@ import ProjectMgmt from "./ProjectMgmt";
 import { loadProject } from "./api/projects";
 import type { UserDetails } from "./api/user";
 
-const TAB_IDS = ["projects-nav-button", "managed-files-nav-button", "actions-projects-nav-button"];
+const TAB_IDS = ["projects-nav-button", "managed-files-nav-button", "actions-projects-nav-button", "action-usage-nav-button"];
 
 const userDetails: UserDetails = {
   avatar_url: "https://example.com/avatar.png",

@@ -83,7 +83,17 @@ export interface UnifiedWorkflowItem {
 /** 'deleting': the project's removal pull requests are open, and it is read-only until they merge. */
 export type ProjectPRState = 'new' | 'draft' | 'open' | 'synced' | 'deleting';
 
+/** An updated workflow handed to the project page to load into its editor, unsaved, until Commit Locally. */
+export interface DraftWorkflow {
+  name: string;
+  content: string;
+  reusable: boolean;
+}
+
 export interface UnifiedWorkflowsProps {
+  /** Loaded into the editor as an unsaved edit as soon as the project's workflows have loaded. */
+  draftWorkflow?: DraftWorkflow | null;
+  onDraftApplied?: () => void;
   // Common props
   user: string;
   projectName: string;

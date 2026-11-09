@@ -2,7 +2,7 @@
 // allows you to do things like:
 // expect(element).toHaveTextContent(/react/i)
 // learn more: https://github.com/testing-library/jest-dom
-import '@testing-library/jest-dom';
+import '@testing-library/jest-dom/vitest';
 
 // Mock axios for all tests, with the stand-in in src/__mocks__: vitest only finds
 // a manual mock by itself in the project root, and the automock it used instead

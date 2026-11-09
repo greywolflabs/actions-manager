@@ -122,7 +122,7 @@ SEED_ACTIONS = [
     {
         "name": "AM Build Vars",
         "description": "Share build variables across jobs, workflows and runs",
-        "owner": "dawg-io", "repo": "am-build-vars", "ref": "v1.0.0",
+        "owner": "greywolflabs", "repo": "am-build-vars", "ref": "v1.0.0",
         "branding_icon": "shield", "branding_color": "purple",
         "inputs": [
             {"name": "config-file", "description": "Explicit path to the build variables file (empty auto-discovers am-build-vars.yml)", "required": False, "default": ""},

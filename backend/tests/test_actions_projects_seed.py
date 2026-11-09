@@ -60,7 +60,7 @@ class TestSeedDefaultActionsProjects:
                 ("actions", "cache"),
                 ("actions", "upload-artifact"),
                 ("actions", "download-artifact"),
-                ("dawg-io", "am-build-vars"),
+                ("greywolflabs", "am-build-vars"),
             }
         finally:
             db.close()
@@ -79,7 +79,7 @@ class TestSeedDefaultActionsProjects:
             )).fetchone()
             assert (row.branding_icon, row.branding_color) == ("shield", "purple")
             assert row.ref == "v1.0.0"
-            assert row.source_url == "https://github.com/dawg-io/am-build-vars/blob/v1.0.0/action.yml"
+            assert row.source_url == "https://github.com/greywolflabs/am-build-vars/blob/v1.0.0/action.yml"
             assert "load-shared" in {i["name"] for i in json.loads(row.inputs_json)}
 
             unbranded = db.execute(text(

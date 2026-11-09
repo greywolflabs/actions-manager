@@ -1342,6 +1342,130 @@ test.describe("docs screenshots", () => {
     await waitForAppHeader(page);
     await page.screenshot({ path: "../docs/src/content/docs/assets/screenshots/build-metrics/build-metrics-by-workflow.png" });
   });
+
+  const ACTION_SHA = "3d3c42e1b0c4d0b6c3f7a2f6c4a9d7a53b1c8e90";
+  const OLD_SHA = "949feb2d3c1a4b8e7f6a5d4c3b2a1908f7e6d5c4";
+  const NODE_REPOS = ["acme-corp/node-api", "acme-corp/node-worker", "acme-corp/ledger-service"];
+  const WEB_REPOS = ["acme-corp/storefront", "acme-corp/checkout-web"];
+
+  /** One workflow of a project on an action, as Action Usage lists it. */
+  const actionUsageEntry = (project: string, id: number, file: string, repos: string[], extra: object = {}) => ({
+    project_id: project === "Node services" ? 1 : 2, project_name: project, workflow_id: id,
+    workflow_name: file.replace(/^AM_[A-Z]+_/, "").replace(/\.yml$/, ""), workflow_file: file,
+    workflow_status: "synced_with_github", reusable: false, project_type: "standard", editable: true,
+    repos, override: false, paths: [], ...extra,
+  });
+
+  const mockActionUsage = async (page: Page) => {
+    await installApiMocks(page, createMockState());
+    await seedDocsUserProfile(page);
+    await page.route((url) => url.pathname === "/api/action-usage", (route) => fulfillJson(route, {
+      actions: [
+        {
+          action: "acme-corp/shared-workflows", workflow_count: 2, unpinned_workflow_count: 2,
+          versions: [{ ref: "main", kind: "branch", pinned: false, workflow_count: 2, repo_count: 3, usages: [
+            actionUsageEntry("Node services", 10, "AM_NODE_ci.yml", NODE_REPOS, { paths: [".github/workflows/shared-workflow.yml"] }),
+            actionUsageEntry("Web apps", 20, "AM_WEB_build.yml", WEB_REPOS, { paths: [".github/workflows/shared-workflow.yml"] }),
+          ] }],
+        },
+        {
+          action: "actions/checkout", workflow_count: 3, unpinned_workflow_count: 2,
+          versions: [
+            { ref: "v7", kind: "tag", pinned: false, workflow_count: 2, repo_count: 3, usages: [
+              actionUsageEntry("Node services", 10, "AM_NODE_ci.yml", NODE_REPOS),
+              actionUsageEntry("Node services", 11, "AM_NODE_release.yml", NODE_REPOS, { workflow_status: "under_review" }),
+            ] },
+            { ref: OLD_SHA, kind: "sha", pinned: true, workflow_count: 1, repo_count: 2, usages: [
+              actionUsageEntry("Web apps", 21, "AM_WEB_deploy.yml", WEB_REPOS),
+            ] },
+          ],
+        },
+        {
+          action: "actions/setup-node", workflow_count: 2, unpinned_workflow_count: 0,
+          versions: [{ ref: ACTION_SHA, kind: "sha", pinned: true, workflow_count: 2, repo_count: 5, usages: [
+            actionUsageEntry("Node services", 10, "AM_NODE_ci.yml", NODE_REPOS),
+            actionUsageEntry("Web apps", 20, "AM_WEB_build.yml", WEB_REPOS),
+          ] }],
+        },
+      ],
+      other: { local: 2, docker: 1 },
+      summary: { action_count: 3, workflows_read: 5, unpinned_workflows: 4 },
+    }));
+    // The latest release of each action; the shared repository publishes none.
+    await page.route((url) => url.pathname === "/api/action-usage/latest", (route) => {
+      const action = new URL(route.request().url()).searchParams.get("action");
+      if (action === "acme-corp/shared-workflows") {
+        return route.fulfill({
+          status: 404, contentType: "application/json",
+          body: JSON.stringify({ detail: "acme-corp/shared-workflows has no release or version tag to default to." }),
+        });
+      }
+      return fulfillJson(route, { action, ref: "v7.1.0", sha: ACTION_SHA, comment: "v7.1.0" });
+    });
+    await page.goto(`/project/${DOCS_USER}/action-usage`);
+    await page.getByTestId("action-usage-summary").waitFor({ timeout: 15000 });
+    await waitForAppHeader(page);
+  };
+
+  test("action usage — the inventory", async ({ page }) => {
+    await mockActionUsage(page);
+    await page.getByTestId("action-usage-toggle").nth(0).click();
+    await page.getByTestId("action-usage-toggle").nth(1).click();
+    await page.getByTestId("action-usage-no-release").waitFor({ timeout: 15000 });
+    await page.getByTestId("action-usage-update").first().waitFor({ timeout: 15000 });
+    await page.waitForTimeout(300);
+
+    await page.screenshot({
+      path: "../docs/src/content/docs/assets/screenshots/action-usage/inventory.png",
+      fullPage: true,
+    });
+  });
+
+  test("action usage — update a workflow", async ({ page }) => {
+    await mockActionUsage(page);
+    await page.getByTestId("action-usage-toggle").nth(1).click();
+    await page.getByTestId("action-usage-update").first().waitFor({ timeout: 15000 });
+    await page.getByTestId("action-usage-update").first().click();
+    await page.getByTestId("action-usage-update-commit").waitFor({ timeout: 15000 });
+    await page.waitForTimeout(300);
+
+    await page.screenshot({
+      path: "../docs/src/content/docs/assets/screenshots/action-usage/update-workflow.png",
+    });
+  });
+
+  test("action usage — update all", async ({ page }) => {
+    const line = { line: 7, before: "      - uses: actions/checkout@v3", after: `      - uses: actions/checkout@${ACTION_SHA} # v7.1.0` };
+    const change = (id: number, name: string, file: string, blocked: string | null = null) => ({
+      workflow_id: id, workflow_name: name, workflow_file: file, reusable: false, lines: [line], blocked,
+    });
+    await mockActionUsage(page);
+    await page.route((url) => url.pathname === "/api/action-usage/preview", (route) => fulfillJson(route, {
+      action: "actions/checkout", ref: "v7.1.0", source: "latest release", sha: ACTION_SHA, comment: "v7.1.0",
+      projects: [
+        {
+          project_id: 1, project_name: "Node services", project_type: "standard", editable: true,
+          skipped_repos: ["acme-corp/ledger-service"],
+          workflows: [
+            change(10, "ci", "AM_NODE_ci.yml"),
+            change(11, "release", "AM_NODE_release.yml", "Under review: it has an open pull request. Close or merge that first."),
+          ],
+        },
+        {
+          project_id: 2, project_name: "Web apps", project_type: "standard", editable: true, skipped_repos: [],
+          workflows: [change(20, "build", "AM_WEB_build.yml")],
+        },
+      ],
+    }));
+    await page.getByTestId("action-usage-pin").first().click();
+    await page.getByTestId("pin-apply").waitFor({ timeout: 15000 });
+    await page.getByTestId("pin-show-changes").first().click();
+    await page.waitForTimeout(300);
+
+    await page.screenshot({
+      path: "../docs/src/content/docs/assets/screenshots/action-usage/update-all.png",
+    });
+  });
 });
 
 /**

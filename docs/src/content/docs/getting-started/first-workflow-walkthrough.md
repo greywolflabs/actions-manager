@@ -89,7 +89,7 @@ You can start it again later from **Restart tour** in the user menu (top right).
 
 ## Step 4 — The Projects Page
 
-After signing in you land on the **Projects** page, the first of the three tabs in the app header beside **Managed Files** and **Managed Actions**. Your plan appears as a chip beside your avatar in the app header, on every page, with an **Upgrade** link when your plan has one. Your project usage shows beside **New Project** (for example, 0 of 4 Caller Workflow Projects and 0 of 2 Reusable Workflow Projects in the Self-Hosted Beta). The project list is empty until you create your first project, and a dashed **New project** box shows how many projects your plan still has room for.
+After signing in you land on the **Projects** page, the first of the four tabs in the app header beside **Managed Files**, **Managed Actions** and **Action Usage**. Your plan appears as a chip beside your avatar in the app header, on every page, with an **Upgrade** link when your plan has one. Your project usage shows beside **New Project** (for example, 0 of 4 Caller Workflow Projects and 0 of 2 Reusable Workflow Projects in the Self-Hosted Beta). The project list is empty until you create your first project, and a dashed **New project** box shows how many projects your plan still has room for.
 
 ![The Projects page with the Projects tab selected in the app header, the Self-Hosted Beta plan chip beside the avatar, an empty project list, the project usage beside the New Project button, and a dashed New project box reading "6 of 6 remaining"](../assets/screenshots/walkthrough/03-empty-project-dashboard.png)
 

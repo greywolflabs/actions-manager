@@ -34,7 +34,7 @@ docker run -d \
 
 Then open `http://localhost:8080`, choose **Sign in with Personal Access Token**, and paste a fine-grained or classic PAT. Do **not** put personal PATs in Docker command lines, shell history, screenshots, or committed environment files.
 
-**→ [Documentation](https://actionsmanager.io)** &nbsp;·&nbsp; **→ [First workflow walkthrough](https://actionsmanager.io/getting-started/first-workflow-walkthrough)** &nbsp;·&nbsp; **→ [Demo video](https://youtu.be/8TrgE9YDGXA)**
+**→ [Documentation](https://actionsmanager.io)** &nbsp;·&nbsp; **→ [First workflow walkthrough](https://actionsmanager.io/getting-started/first-workflow-walkthrough)** &nbsp;·&nbsp; **→ [Demo video](https://youtu.be/K28soPdoNXw)**
 
 ActionsManager is in a free, self-hosted beta. See the [Beta Notes](BETA.md) for its limits and your responsibilities as an operator.
 

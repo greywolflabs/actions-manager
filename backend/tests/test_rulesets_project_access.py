@@ -11,7 +11,7 @@ it; anyone who can edit one can apply and remove it. A ruleset attached to no
 project stays with the account that added it.
 """
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,13 +35,15 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def write_protection(monkeypatch):
+def write_protection():
     """Let WriteProtectionMiddleware see this test's workspace, as it would in production.
 
     It reads its own session factory, which otherwise points at a database with
-    no workspace members, and with none it enforces nothing.
+    no workspace members, and with none it enforces nothing. Not monkeypatch: its
+    undo looks for the old value in __dict__, State keeps it elsewhere, so it deletes it.
     """
-    monkeypatch.setattr(app.state, "middleware_db_factory", TestingSessionLocal)
+    with patch.object(app.state, "middleware_db_factory", TestingSessionLocal):
+        yield
 
 
 def _ruleset(db, name, creator):

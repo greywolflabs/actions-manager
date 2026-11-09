@@ -16,7 +16,7 @@ vi.mock("./UserAvatar", () => ({
   },
 }));
 
-const TAB_IDS = ["projects-nav-button", "managed-files-nav-button", "actions-projects-nav-button"];
+const TAB_IDS = ["projects-nav-button", "managed-files-nav-button", "actions-projects-nav-button", "action-usage-nav-button"];
 
 const DETAILS: UserDetails = {
   avatar_url: "https://example.com/alice.png",
@@ -63,7 +63,7 @@ describe("AppHeader", () => {
     vi.clearAllMocks();
   });
 
-  test("shows Projects, Managed Files and Managed Actions, in that order, as the primary navigation", () => {
+  test("shows Projects, Managed Files, Managed Actions and Action Usage, in that order, as the primary navigation", () => {
     renderHeaderAt("/project/alice");
 
     const nav = screen.getByRole("navigation", { name: "Primary" });
@@ -71,6 +71,7 @@ describe("AppHeader", () => {
       "Projects",
       "Managed Files",
       "Managed Actions",
+      "Action Usage",
     ]);
     expect(within(nav).getAllByRole("link").map((link) => link.dataset.testid)).toEqual(TAB_IDS);
   });
@@ -79,6 +80,7 @@ describe("AppHeader", () => {
     ["/project/alice", ["projects-nav-button"]],
     ["/project/alice/managed-files", ["managed-files-nav-button"]],
     ["/project/alice/actions-projects", ["actions-projects-nav-button"]],
+    ["/project/alice/action-usage", ["action-usage-nav-button"]],
     ["/project/alice/actions-projects/new", ["actions-projects-nav-button"]],
     ["/project/alice/actions-projects/7", ["actions-projects-nav-button"]],
     ["/workspace/members", []],
@@ -95,6 +97,7 @@ describe("AppHeader", () => {
     ["projects-nav-button", "/project/alice"],
     ["managed-files-nav-button", "/project/alice/managed-files"],
     ["actions-projects-nav-button", "/project/alice/actions-projects"],
+    ["action-usage-nav-button", "/project/alice/action-usage"],
   ])("clicking %s opens %s", async (testId, path) => {
     renderHeaderAt("/workspace/members");
 

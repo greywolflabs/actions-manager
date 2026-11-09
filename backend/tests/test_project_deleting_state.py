@@ -55,6 +55,7 @@ WORKFLOW_NAME = "ci"
 WORKFLOW_YAML = "on: push\n"
 PROJECT_URL = f"/api/projects/{PROJECT}"
 PROJECT_BODY = {"project_name": PROJECT}
+SHARED = "shared"
 
 engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -328,15 +329,12 @@ def test_a_refresh_that_finds_the_last_removal_merged_says_deleted(client):
         db.close()
 
 
-def test_a_linked_projects_deletion_leaves_the_reusable_workflow_project_standing(client):
-    """An RWX project lists the PRs of the caller projects linking it, so its refresh
-    can be the one that finds a caller's last removal PR merged. That deletion is
-    the caller's: the RWX project's own status comes back."""
-    _seed()
+def _link_to_shared():
+    """A Reusable Workflow Project, ``shared``, that *PROJECT* links, so it lists PROJECT's PRs."""
     db = TestingSessionLocal()
     try:
         owner = db.query(Account).filter_by(github_user=OWNER).one()
-        shared = Project(project_name="shared", project_code="SHR", user_id=owner.user_id,
+        shared = Project(project_name=SHARED, project_code="SHR", user_id=owner.user_id,
                          project_type="rwx", pr_state="synced")
         reusable = Workflow(workflow_name="build", workflow_yaml="on: workflow_call\n", reusable_workflow=True)
         db.add_all([shared, reusable])
@@ -347,11 +345,19 @@ def test_a_linked_projects_deletion_leaves_the_reusable_workflow_project_standin
         db.commit()
     finally:
         db.close()
+
+
+def test_a_linked_projects_deletion_leaves_the_reusable_workflow_project_standing(client):
+    """An RWX project lists the PRs of the caller projects linking it, so its refresh
+    can be the one that finds a caller's last removal PR merged. That deletion is
+    the caller's: the RWX project's own status comes back."""
+    _seed()
+    _link_to_shared()
     assert _merge(client, REPO_A, 1).status_code == 200
     merged = _response(200, {"number": 2, "state": "closed", "merged": True, "merged_at": "2026-10-01T12:00:00Z"})
 
     with _signed_in_to_github(), patch("workflows.github_get", return_value=merged):
-        response = client.get("/api/project-pr-status", params={"project_name": "shared", "refresh_from_github": "true"})
+        response = client.get("/api/project-pr-status", params={"project_name": SHARED, "refresh_from_github": "true"})
 
     assert response.status_code == 200, response.text
     assert response.json()["project_state"] == "synced"
@@ -359,6 +365,29 @@ def test_a_linked_projects_deletion_leaves_the_reusable_workflow_project_standin
     db = TestingSessionLocal()
     try:
         assert _project(db) is None
+    finally:
+        db.close()
+
+
+def test_merging_a_callers_last_removal_pr_from_the_reusable_workflow_project_does_not_say_it_was_deleted(client):
+    """The panel leaves a project whose merge says deleted; here the caller went, and shared stands."""
+    _seed()
+    _link_to_shared()
+    assert _merge(client, REPO_A, 1).status_code == 200
+
+    with _signed_in_to_github(), \
+            patch("workflows._merge_pull_request_with_fallback",
+                  return_value=(_response(200, {"sha": "m"}), "merge", None)), \
+            patch("workflows._delete_actions_manager_branch", MagicMock(return_value=(True, None))):
+        response = client.put("/api/merge-pull-request",
+                              json={"project_name": SHARED, "repo_name": REPO_B, "pr_number": 2})
+
+    assert response.status_code == 200, response.text
+    assert _says_deleted(response) is False
+    db = TestingSessionLocal()
+    try:
+        assert _project(db) is None, "the caller's deletion still finished"
+        assert db.query(Project).filter_by(project_name=SHARED).first() is not None
     finally:
         db.close()
 
